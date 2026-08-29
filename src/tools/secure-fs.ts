@@ -37,6 +37,7 @@ const native = dlopen("/usr/lib/libSystem.B.dylib", {
 const errnoNames: Record<number, string> = {
   1: "EPERM",
   2: "ENOENT",
+  5: "EIO",
   6: "ENXIO",
   13: "EACCES",
   17: "EEXIST",
@@ -49,7 +50,7 @@ const errnoNames: Record<number, string> = {
 };
 
 type NativeError = Error & { code?: string; errno?: number };
-type DirectoryOpenError = NativeError & { created?: string[] };
+type DirectoryOpenError = NativeError & { created?: SecureCreatedDirectory[] };
 
 const DIRENT_HEADER_BYTES = 21;
 const DIRENT_MIN_RECORD_BYTES = 24;
@@ -62,8 +63,8 @@ function errno(): number {
   return new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true);
 }
 
-function nativeError(operation: string, path: string): NativeError {
-  const number = errno();
+function nativeError(operation: string, path: string, errorNumber = errno()): NativeError {
+  const number = errorNumber;
   const name = errnoNames[number] ?? "ERRNO";
   const detail = native.symbols.strerror(number) ?? "native filesystem error";
   const error = new Error(`${operation} ${path}: ${name} (${detail})`) as NativeError;
@@ -74,6 +75,12 @@ function nativeError(operation: string, path: string): NativeError {
 
 function throwNative(operation: string, path: string): never {
   throw nativeError(operation, path);
+}
+
+function setErrno(value: number): void {
+  const pointer = native.symbols.__error();
+  if (pointer === null) throw new Error("could not access native errno");
+  new DataView(toArrayBuffer(pointer, 0, 4)).setInt32(0, value, true);
 }
 
 function openAt(directoryFd: number, name: string, flags: number, mode = 0o600): number {
@@ -119,11 +126,24 @@ function openRoot(root: string): number {
   }
 }
 
-function openDirectory(workspace: string, path: string, create: boolean): { fd: number; created: string[] } {
+export type SecureIdentity = { dev: bigint; ino: bigint };
+
+export type SecureCreatedDirectory = { path: string; identity: SecureIdentity };
+
+export function secureFileIdentity(fd: number): SecureIdentity {
+  const stat = fstatSync(fd, { bigint: true });
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+export function sameSecureIdentity(left: SecureIdentity | null, right: SecureIdentity | null): boolean {
+  return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
+function openDirectory(workspace: string, path: string, create: boolean): { fd: number; created: SecureCreatedDirectory[] } {
   const { root, components } = componentsFor(workspace, path);
   let currentFd = openRoot(root);
   let currentPath = root;
-  const created: string[] = [];
+  const created: SecureCreatedDirectory[] = [];
   try {
     for (const component of components) {
       let nextFd: number | null = null;
@@ -136,10 +156,12 @@ function openDirectory(workspace: string, path: string, create: boolean): { fd: 
           const made = native.symbols.mkdirat(currentFd, component, 0o755);
           createdNow = made >= 0;
           if (!createdNow && errnoNames[errno()] !== "EEXIST") throwNative("mkdir", component);
-          if (createdNow) created.push(`${currentPath}${sep}${component}`);
           nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
         }
-        if (createdNow) fchmodSync(nextFd, 0o755);
+        if (createdNow) {
+          created.push({ path: `${currentPath}${sep}${component}`, identity: secureFileIdentity(nextFd) });
+          fchmodSync(nextFd, 0o755);
+        }
         const previousFd = currentFd;
         currentFd = nextFd;
         nextFd = null;
@@ -190,6 +212,12 @@ export function validateNativeDirentHeader(header: Uint8Array): NativeDirentHead
   return { recordLength, nameLength, type: view.getUint8(20) };
 }
 
+export function validateNativeReaddirResult(path: string, entry: unknown, errorNumber: number): boolean {
+  if (entry !== null) return false;
+  if (errorNumber !== 0) throw nativeError("readdir", path, errorNumber);
+  return true;
+}
+
 export function safeDirectoryEntries(workspace: string, path: string): SecureEntry[] {
   const { fd } = openDirectory(workspace, path, false);
   const directory = native.symbols.fdopendir(fd);
@@ -200,8 +228,12 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
   const entries: SecureEntry[] = [];
   try {
     while (true) {
+      setErrno(0);
       const entry = native.symbols.readdir(directory);
-      if (!entry) break;
+      if (entry === null) {
+        if (validateNativeReaddirResult(path, entry, errno())) break;
+        throw new ToolExecutionError("directory read did not return an entry or EOF");
+      }
       const header = new Uint8Array(toArrayBuffer(entry, 0, DIRENT_HEADER_BYTES));
       const { recordLength, nameLength, type } = validateNativeDirentHeader(header);
       const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
@@ -242,14 +274,18 @@ function requireRegular(fd: number, operation: string): void {
 export function readWorkspaceText(workspace: string, path: string): { content: string; truncated: boolean } {
   const fd = openFileAt(workspace, path, READ_FLAGS);
   try {
-    requireRegular(fd, "read");
-    const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
-    const bytesRead = readSync(fd, buffer, 0, buffer.byteLength, 0);
-    const content = buffer.subarray(0, bytesRead).toString("utf8");
-    return { content: truncateUtf8(content, MAX_READ_BYTES), truncated: bytesRead > MAX_READ_BYTES };
+    return readSecureFileText(fd);
   } finally {
     closeFd(fd);
   }
+}
+
+export function readSecureFileText(fd: number): { content: string; truncated: boolean } {
+  requireRegular(fd, "read");
+  const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
+  const bytesRead = readSync(fd, buffer, 0, buffer.byteLength, 0);
+  const content = buffer.subarray(0, bytesRead).toString("utf8");
+  return { content: truncateUtf8(content, MAX_READ_BYTES), truncated: bytesRead > MAX_READ_BYTES };
 }
 
 export function workspacePathInfo(workspace: string, path: string): { isFile(): boolean; isDirectory(): boolean } {
@@ -292,7 +328,7 @@ export function writeWorkspaceText(workspace: string, path: string, content: str
   }
 }
 
-export type SecureParent = { fd: number; name: string; created: string[] };
+export type SecureParent = { fd: number; name: string; created: SecureCreatedDirectory[] };
 
 export function openSecureParent(workspace: string, path: string, create: boolean): SecureParent {
   const { root, components } = componentsFor(workspace, path);
@@ -307,9 +343,9 @@ export function closeSecureParent(parent: SecureParent): void {
   closeFd(parent.fd);
 }
 
-export function openPatchTarget(parent: SecureParent): number | null {
+export function openPatchTarget(parent: SecureParent, name = parent.name): number | null {
   try {
-    const fd = openAt(parent.fd, parent.name, PATCH_READ_FLAGS, 0);
+    const fd = openAt(parent.fd, name, PATCH_READ_FLAGS, 0);
     try {
       requireRegular(fd, "patch");
       return fd;
@@ -328,21 +364,44 @@ export function closeSecureFile(fd: number): void {
   closeFd(fd);
 }
 
-export function createPatchTemp(parent: SecureParent, name: string, content: string): void {
+export function openSecureDirectory(parent: SecureParent): number {
+  const fd = openAt(parent.fd, parent.name, DIRECTORY_FLAGS, 0);
+  try {
+    if (!fstatSync(fd).isDirectory()) throw new ToolExecutionError("target is not a directory");
+    return fd;
+  } catch (error) {
+    closeFd(fd);
+    throw error;
+  }
+}
+
+export function createPatchTemp(parent: SecureParent, name: string, content: string): SecureIdentity {
   let fd: number | null = null;
+  let identity: SecureIdentity | null = null;
   try {
     fd = openAt(parent.fd, name, CREATE_FLAGS, 0o600);
+    identity = secureFileIdentity(fd);
     fchmodSync(fd, 0o600);
     requireRegular(fd, "patch temporary");
     const bytes = Buffer.from(content, "utf8");
     let offset = 0;
     while (offset < bytes.byteLength) offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
     fsyncSync(fd);
+    return identity;
   } catch (error) {
-    try {
-      native.symbols.unlinkat(parent.fd, name, 0);
-    } catch {
-      // Preserve the original staging failure.
+    if (identity !== null) {
+      try {
+        const current = openPatchTarget(parent, name);
+        if (current !== null) {
+          try {
+            if (sameSecureIdentity(identity, secureFileIdentity(current))) unlinkAt(parent, name);
+          } finally {
+            closeFd(current);
+          }
+        }
+      } catch {
+        // Preserve the original staging failure and any uncertain artifact.
+      }
     }
     throw error;
   } finally {

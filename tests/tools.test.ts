@@ -18,7 +18,7 @@ import { createFilesystemTools, resolveWorkspacePath } from "../src/tools/filesy
 import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
 import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES, boundToolResult } from "../src/tools/types";
 import type { ToolContext } from "../src/tools/types";
-import { validateNativeDirentHeader } from "../src/tools/secure-fs";
+import { validateNativeDirentHeader, validateNativeReaddirResult } from "../src/tools/secure-fs";
 
 const libc = dlopen("/usr/lib/libSystem.B.dylib", {
   mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
@@ -431,6 +431,41 @@ test("patch retains the only backup when restoration fails", async () => {
   });
 });
 
+test("patch rollback does not unlink a replacement installed after the transaction", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "safe.txt"), "original\n");
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("safe.txt")) {
+            unlinkSync(path);
+            writeFileSync(path, "replacement\n");
+            throw new Error("force rollback");
+          }
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "replacement-rollback",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "safe.txt"), "utf8")).toBe("replacement\n");
+    const backups = readdirSync(workspace).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(workspace, backups[0]!), "utf8")).toBe("original\n");
+    expect(result.content).toContain("recovery backup retained");
+  });
+});
+
 test("patch rolls back earlier files when a later commit operation fails", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "safe.txt"), "original\n");
@@ -587,6 +622,12 @@ test("rejects a native dirent record length above the bounded Darwin record size
   view.setUint16(18, 1, true);
 
   expect(() => validateNativeDirentHeader(header)).toThrow("invalid entry");
+});
+
+test("native directory reads distinguish an error from EOF", () => {
+  expect(() => validateNativeReaddirResult("workspace", null, 5)).toThrow("EIO");
+  expect(validateNativeReaddirResult("workspace", null, 0)).toBe(true);
+  expect(validateNativeReaddirResult("workspace", {}, 5)).toBe(false);
 });
 
 test("direct search honors ignored directories and rejects special files", async () => {

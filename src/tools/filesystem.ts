@@ -12,11 +12,17 @@ import {
   closeSecureFile,
   closeSecureParent,
   createPatchTemp,
+  openSecureDirectory,
   openPatchTarget,
   openSecureParent,
+  readSecureFileText,
   readWorkspaceText,
   renameAt,
   safeDirectoryEntries,
+  sameSecureIdentity,
+  secureFileIdentity,
+  type SecureCreatedDirectory,
+  type SecureIdentity,
   unlinkAt,
   workspacePathInfo,
   writeWorkspaceText,
@@ -137,8 +143,8 @@ function result(content: string, data?: unknown): ToolResult {
   return { ok: true, content, ...(data === undefined ? {} : { data }) };
 }
 
-async function readWorkspaceTextForPatch(workspace: string, path: string): Promise<string> {
-  const read = readWorkspaceText(workspace, path);
+function readPatchTarget(fd: number): string {
+  const read = readSecureFileText(fd);
   if (read.truncated) throw new ToolExecutionError("patch target exceeds the bounded read limit");
   return read.content;
 }
@@ -209,7 +215,7 @@ const writeTool: Tool = {
 type HunkLine = { marker: " " | "+" | "-"; text: string; noNewline: boolean };
 type Hunk = { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: HunkLine[] };
 type FilePatch = { oldPath: string | null; newPath: string | null; hunks: Hunk[] };
-type DirectoryOpenFailure = Error & { created?: string[] };
+type DirectoryOpenFailure = Error & { created?: SecureCreatedDirectory[] };
 
 function patchPath(value: string): string | null {
   const token = value.slice(4).split("\t", 1)[0];
@@ -379,10 +385,16 @@ export type PatchHooks = {
   afterInstall?: (path: string) => void | Promise<void>;
 };
 
-function removeCreatedDirectory(workspace: string, path: string): void {
+function removeCreatedDirectory(workspace: string, created: SecureCreatedDirectory): void {
   try {
-    const parent = openSecureParent(workspace, path, false);
+    const parent = openSecureParent(workspace, created.path, false);
     try {
+      const directory = openSecureDirectory(parent);
+      try {
+        if (!sameSecureIdentity(created.identity, secureFileIdentity(directory))) return;
+      } finally {
+        closeSecureFile(directory);
+      }
       unlinkAt(parent, parent.name, true);
     } finally {
       closeSecureParent(parent);
@@ -390,6 +402,38 @@ function removeCreatedDirectory(workspace: string, path: string): void {
   } catch {
     // A directory is removed only when the secure parent handle proves it is empty.
   }
+}
+
+function targetIdentity(parent: ReturnType<typeof openSecureParent>, name = parent.name): SecureIdentity | null {
+  const target = openPatchTarget(parent, name);
+  if (target === null) return null;
+  try {
+    return secureFileIdentity(target);
+  } finally {
+    closeSecureFile(target);
+  }
+}
+
+function requireTargetIdentity(
+  parent: ReturnType<typeof openSecureParent>,
+  name: string,
+  expected: SecureIdentity,
+  description: string,
+): void {
+  const actual = targetIdentity(parent, name);
+  if (!sameSecureIdentity(expected, actual)) {
+    throw new ToolExecutionError(`${description} identity changed`);
+  }
+}
+
+function unlinkIfIdentity(
+  parent: ReturnType<typeof openSecureParent>,
+  name: string,
+  expected: SecureIdentity,
+  description: string,
+): void {
+  requireTargetIdentity(parent, name, expected, description);
+  unlinkAt(parent, name);
 }
 
 function patchTool(hooks: PatchHooks = {}): Tool {
@@ -412,6 +456,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       path: string;
       isDelete: boolean;
       existed: boolean;
+      preconditionIdentity: SecureIdentity | null;
       content: string | null;
     }>;
     for (const { file, path } of resolved) {
@@ -421,12 +466,21 @@ function patchTool(hooks: PatchHooks = {}): Tool {
 
       const isDelete = file.newPath === null;
       let existed = false;
+      let preconditionIdentity: SecureIdentity | null = null;
+      let original = "";
       try {
         const parent = openSecureParent(context.workspace, path, false);
         try {
           const target = openPatchTarget(parent);
           existed = target !== null;
-          if (target !== null) closeSecureFile(target);
+          if (target !== null) {
+            try {
+              preconditionIdentity = secureFileIdentity(target);
+              original = readPatchTarget(target);
+            } finally {
+              closeSecureFile(target);
+            }
+          }
         } finally {
           closeSecureParent(parent);
         }
@@ -437,24 +491,26 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         throw new ValidationError(isDelete ? "cannot delete a missing file" : "patch target already exists or is missing");
       }
 
-      const original = existed ? await readWorkspaceTextForPatch(context.workspace, path) : "";
       const patched = applyHunks(original, file.hunks);
       if (isDelete && patched !== "") {
         throw new ValidationError("deletion patch must match and remove the entire file");
       }
-      changes.push({ file, path, isDelete, existed, content: isDelete ? null : patched });
+      changes.push({ file, path, isDelete, existed, preconditionIdentity, content: isDelete ? null : patched });
     }
 
     const staged: Array<{
       change: (typeof changes)[number];
       parent: ReturnType<typeof openSecureParent>;
       tempName: string | null;
+      tempIdentity: SecureIdentity | null;
       backupName: string | null;
+      backupIdentity: SecureIdentity | null;
       backupMade: boolean;
       installed: boolean;
+      installedIdentity: SecureIdentity | null;
       backupRetained: boolean;
     }> = [];
-    const createdDirectories = new Set<string>();
+    const createdDirectories = new Map<string, SecureCreatedDirectory>();
     let transactionCommitted = false;
     try {
       for (const change of changes) {
@@ -462,17 +518,31 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         try {
           parent = openSecureParent(context.workspace, change.path, true);
         } catch (error) {
-          for (const directory of (error as DirectoryOpenFailure).created ?? []) createdDirectories.add(directory);
+          for (const directory of (error as DirectoryOpenFailure).created ?? []) {
+            createdDirectories.set(directory.path, directory);
+          }
           throw error;
         }
-        for (const directory of parent.created) createdDirectories.add(directory);
+        for (const directory of parent.created) createdDirectories.set(directory.path, directory);
         let tempName: string | null = null;
+        let tempIdentity: SecureIdentity | null = null;
         try {
           if (!change.isDelete) {
             tempName = `.kestrel-patch-${randomUUID()}.tmp`;
-            createPatchTemp(parent, tempName, change.content ?? "");
+            tempIdentity = createPatchTemp(parent, tempName, change.content ?? "");
           }
-          staged.push({ change, parent, tempName, backupName: null, backupMade: false, installed: false, backupRetained: false });
+          staged.push({
+            change,
+            parent,
+            tempName,
+            tempIdentity,
+            backupName: null,
+            backupIdentity: null,
+            backupMade: false,
+            installed: false,
+            installedIdentity: null,
+            backupRetained: false,
+          });
         } catch (error) {
           closeSecureParent(parent);
           throw error;
@@ -481,28 +551,38 @@ function patchTool(hooks: PatchHooks = {}): Tool {
 
       for (const item of staged) {
         const { change } = item;
-        const current = openPatchTarget(item.parent);
-        if (current !== null) closeSecureFile(current);
-        if (change.existed !== (current !== null)) {
+        const currentIdentity = targetIdentity(item.parent);
+        if (change.existed !== (currentIdentity !== null)) {
           throw new ToolExecutionError("patch target changed during staging");
+        }
+        if (change.existed && !sameSecureIdentity(change.preconditionIdentity, currentIdentity)) {
+          throw new ToolExecutionError("patch target identity changed during staging");
         }
 
         if (change.existed) {
           item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
           renameAt(item.parent, item.parent.name, item.backupName);
           item.backupMade = true;
+          item.backupIdentity = change.preconditionIdentity;
+          if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
+          requireTargetIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
         }
         if (item.tempName !== null) {
           renameAt(item.parent, item.tempName, item.parent.name);
           item.installed = true;
+          if (item.tempIdentity === null) throw new ToolExecutionError("patch temporary identity is missing");
+          item.installedIdentity = item.tempIdentity;
+          requireTargetIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
           await hooks.afterInstall?.(change.path);
+          requireTargetIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
         }
       }
       transactionCommitted = true;
       for (const item of staged) {
         if (item.backupMade && item.backupName !== null) {
           try {
-            unlinkAt(item.parent, item.backupName);
+            if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
+            unlinkIfIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
             item.backupMade = false;
           } catch (error) {
             item.backupRetained = true;
@@ -519,13 +599,21 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       for (const item of [...staged].reverse()) {
         if (item.installed) {
           try {
-            unlinkAt(item.parent, item.parent.name);
+            if (item.installedIdentity === null) throw new ToolExecutionError("patch installed identity is missing");
+            unlinkIfIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
+            item.installed = false;
           } catch (rollbackError) {
             rollbackFailures.push(`${relativePath(context.workspace, item.change.path)}: ${String(rollbackError)}`);
           }
         }
         if (item.backupMade && item.backupName !== null) {
           try {
+            if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
+            requireTargetIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
+            if (item.installed) throw new ToolExecutionError("patch target identity changed during rollback");
+            if (targetIdentity(item.parent) !== null) {
+              throw new ToolExecutionError("patch target identity changed during rollback");
+            }
             renameAt(item.parent, item.backupName, item.parent.name);
             item.backupMade = false;
           } catch (rollbackError) {
@@ -548,16 +636,18 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       throw error;
     } finally {
       for (const item of staged) {
-        if (item.tempName !== null) {
+        if (item.tempName !== null && !item.installed && item.tempIdentity !== null) {
           try {
-            unlinkAt(item.parent, item.tempName);
+            unlinkIfIdentity(item.parent, item.tempName, item.tempIdentity, "patch temporary");
           } catch {
-            // The temporary file was already installed or was never created.
+            // Retain the temporary artifact if its pathname was replaced.
           }
         }
         closeSecureParent(item.parent);
       }
-      for (const directory of [...createdDirectories].reverse()) removeCreatedDirectory(context.workspace, directory);
+      for (const directory of [...createdDirectories.values()].reverse()) {
+        removeCreatedDirectory(context.workspace, directory);
+      }
     }
 
     const paths = changes.map((change) => relativePath(context.workspace, change.path));
