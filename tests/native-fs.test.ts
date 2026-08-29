@@ -52,6 +52,21 @@ test("rejects unsupported native filesystem platforms", () => {
   expect(() => loadNativeFsForPlatform("win32")).toThrow(/unsupported platform/i);
 });
 
+test("preserves bounded platform context when loading an adapter fails", () => {
+  if (!isSupportedPlatform(process.platform)) return;
+
+  const unavailablePlatform = process.platform === "darwin" ? "linux" : "darwin";
+  let error: unknown;
+  try {
+    loadNativeFsForPlatform(unavailablePlatform);
+  } catch (caught) {
+    error = caught;
+  }
+
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toBe(`could not load ${unavailablePlatform} native filesystem adapter`);
+});
+
 test("exposes portable native filesystem constants and errno names", () => {
   if (!isSupportedPlatform(process.platform)) return;
 

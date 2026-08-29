@@ -19,6 +19,11 @@ const direntParsers = {
   linux: createDirentParser(LINUX_DIRENT_LAYOUT),
 } satisfies Record<NativePlatform, ReturnType<typeof createDirentParser>>;
 
+const nativeFsLoadErrors = {
+  darwin: "could not load darwin native filesystem adapter",
+  linux: "could not load linux native filesystem adapter",
+} satisfies Record<NativePlatform, string>;
+
 export function decodeDirent(platform: NativePlatform | string, record: Uint8Array): NativeDirentEntry {
   if (platform !== "darwin" && platform !== "linux") {
     throw new ToolExecutionError("unsupported platform for native filesystem");
@@ -34,7 +39,7 @@ export function loadNativeFsForPlatform(platform: string): NativeFs {
   try {
     return platform === "darwin" ? createDarwinNativeFs() : createLinuxNativeFs();
   } catch {
-    throw new ToolExecutionError("could not load native filesystem adapter");
+    throw new ToolExecutionError(nativeFsLoadErrors[platform]);
   }
 }
 
