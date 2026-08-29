@@ -22,7 +22,7 @@ function makeDarwinDirent(name: string, type: number): Uint8Array {
 
 function makeLinuxDirent(name: string, type: number): Uint8Array {
   const nameBytes = new TextEncoder().encode(name);
-  const recordLength = 24;
+  const recordLength = 32;
   const record = new Uint8Array(recordLength);
   const view = new DataView(record.buffer);
   view.setUint16(16, recordLength, true);
@@ -80,9 +80,11 @@ test("rejects oversized and unterminated native dirent records", () => {
     const oversized = fixture.bytes.slice();
     const missingNul = fixture.bytes.slice();
     const view = new DataView(oversized.buffer);
+    const missingNulOffset = fixture.nameOffset + "entry".length;
 
     view.setUint16(16, 0xffff, true);
-    missingNul.fill(0x78, fixture.nameOffset + "entry".length);
+    missingNul[missingNulOffset] = 0x78;
+    expect(missingNul[missingNulOffset]).toBe(0x78);
 
     expect(() => decodeDirent(platform, oversized)).toThrow(/invalid|record/i);
     expect(() => decodeDirent(platform, missingNul)).toThrow(/invalid|NUL|terminat/i);
