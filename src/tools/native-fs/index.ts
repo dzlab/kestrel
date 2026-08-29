@@ -23,7 +23,7 @@ export function decodeDirent(platform: NativePlatform | string, record: Uint8Arr
   if (platform !== "darwin" && platform !== "linux") {
     throw new ToolExecutionError("unsupported platform for native filesystem");
   }
-  return direntParsers[platform].decode(record);
+  return direntParsers[platform].decodeDirent(record);
 }
 
 export function loadNativeFsForPlatform(platform: string): NativeFs {

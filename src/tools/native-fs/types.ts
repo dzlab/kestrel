@@ -38,6 +38,7 @@ export type NativeConstants = {
 };
 
 export type NativeDirentEntry = {
+  recordLength: number;
   name: string;
   type: number;
 };
@@ -55,7 +56,7 @@ export type NativeDirentLayout = {
 };
 
 export type NativeDirent = NativeDirentLayout & {
-  decode(record: Uint8Array): NativeDirentEntry;
+  decodeDirent(record: Uint8Array): NativeDirentEntry;
 };
 
 export type NativeErrnoNames = Readonly<Record<number, string>>;
@@ -109,7 +110,7 @@ function decodeUtf8(bytes: Uint8Array): string {
 export function createDirentParser(layout: NativeDirentLayout): NativeDirent {
   return {
     ...layout,
-    decode(record: Uint8Array): NativeDirentEntry {
+    decodeDirent(record: Uint8Array): NativeDirentEntry {
       if (!(record instanceof Uint8Array) || record.byteLength < layout.headerBytes) return invalidDirent();
 
       const view = new DataView(record.buffer, record.byteOffset, record.byteLength);
@@ -142,7 +143,7 @@ export function createDirentParser(layout: NativeDirentLayout): NativeDirent {
 
       const nameBytes = record.subarray(layout.nameOffset, layout.nameOffset + nameLength);
       if (nameBytes.includes(0)) return invalidDirent();
-      return { name: decodeUtf8(nameBytes), type: view.getUint8(layout.typeOffset) };
+      return { recordLength, name: decodeUtf8(nameBytes), type: view.getUint8(layout.typeOffset) };
     },
   };
 }
