@@ -366,28 +366,50 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   approvals: ["call_id", "arguments_hash", "capability", "risk_level", "decision", "requested_at"],
 };
 
-type ForeignKeyDefinition = { table: string; from: string; to: string };
+type ForeignKeyDefinition = {
+  table: string;
+  from: string;
+  to: string;
+  onDelete: string;
+  onUpdate: string;
+  match: string;
+};
+
+const defaultForeignKeyActions = {
+  onDelete: "NO ACTION",
+  onUpdate: "NO ACTION",
+  match: "NONE",
+} as const;
+
+function foreignKey(table: string, from: string, to: string): ForeignKeyDefinition {
+  return { table, from, to, ...defaultForeignKeyActions };
+}
 
 const requiredForeignKeys: Readonly<Record<string, readonly ForeignKeyDefinition[]>> = {
   schema_migrations: [],
   tasks: [],
-  runs: [{ table: "tasks", from: "task_id", to: "id" }],
-  messages: [{ table: "runs", from: "run_id", to: "id" }],
-  tool_calls: [{ table: "runs", from: "run_id", to: "id" }],
+  runs: [foreignKey("tasks", "task_id", "id")],
+  messages: [foreignKey("runs", "run_id", "id")],
+  tool_calls: [foreignKey("runs", "run_id", "id")],
   events: [
-    { table: "tasks", from: "task_id", to: "id" },
-    { table: "runs", from: "run_id", to: "id" },
+    foreignKey("tasks", "task_id", "id"),
+    foreignKey("runs", "run_id", "id"),
   ],
   memories: [
-    { table: "tasks", from: "task_id", to: "id" },
-    { table: "runs", from: "run_id", to: "id" },
+    foreignKey("tasks", "task_id", "id"),
+    foreignKey("runs", "run_id", "id"),
   ],
-  schedules: [{ table: "tasks", from: "task_id", to: "id" }],
+  schedules: [foreignKey("tasks", "task_id", "id")],
   approvals: [
-    { table: "tasks", from: "task_id", to: "id" },
-    { table: "runs", from: "run_id", to: "id" },
+    foreignKey("tasks", "task_id", "id"),
+    foreignKey("runs", "run_id", "id"),
   ],
 };
+
+const requiredTableUniqueConstraints = [
+  { table: "runs", columns: ["task_id", "idempotency_key"] },
+  { table: "messages", columns: ["run_id", "sequence_number"] },
+] as const;
 
 const requiredIndexes = [
   {
@@ -640,13 +662,59 @@ function assertForeignKeys(database: Database, table: string, expected: readonly
       table: string;
       from: string;
       to: string;
+      on_delete: string;
+      on_update: string;
+      match: string;
     }>
   )
-    .map((foreignKey) => `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}`)
+    .map(
+      (foreignKey) =>
+        `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}:${foreignKey.on_delete}:${foreignKey.on_update}:${foreignKey.match}`,
+    )
     .sort();
-  const required = expected.map((foreignKey) => `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}`).sort();
+  const required = expected
+    .map(
+      (foreignKey) =>
+        `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}:${foreignKey.onDelete}:${foreignKey.onUpdate}:${foreignKey.match}`,
+    )
+    .sort();
   if (JSON.stringify(actual) !== JSON.stringify(required)) {
     fail(`required foreign-key relationships are missing or altered on ${table}`);
+  }
+}
+
+function indexColumns(database: Database, indexName: string): string[] {
+  return (database.query(`PRAGMA index_info('${indexName}')`).all() as Array<{ name: string; seqno: number }>)
+    .sort((left, right) => left.seqno - right.seqno)
+    .map((column) => column.name);
+}
+
+function assertTableUniqueConstraints(database: Database): void {
+  for (const table of new Set(requiredTableUniqueConstraints.map((constraint) => constraint.table))) {
+    const required = requiredTableUniqueConstraints
+      .filter((constraint) => constraint.table === table)
+      .map((constraint) => constraint.columns.join(","))
+      .sort();
+    const actual = (
+      database.query(`PRAGMA index_list('${table}')`).all() as Array<{
+        name: string;
+        unique: number;
+        origin: string;
+        partial: number;
+      }>
+    )
+      .filter(
+        (index) =>
+          Number(index.unique) === 1 &&
+          String(index.origin).toLowerCase() === "u" &&
+          Number(index.partial) === 0,
+      )
+      .map((index) => indexColumns(database, index.name).join(","))
+      .sort();
+
+    if (JSON.stringify(actual) !== JSON.stringify(required)) {
+      fail(`required table-level uniqueness is missing or altered on ${table}`);
+    }
   }
 }
 
@@ -753,6 +821,7 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
       assertTableColumns(database, table, columns);
       assertForeignKeys(database, table, requiredForeignKeys[table]);
     }
+    assertTableUniqueConstraints(database);
   }
 
   for (const table of ["tasks", "runs"]) {
@@ -815,9 +884,42 @@ const requiredTriggerDefinitions = [
   },
 ] as const;
 
-const requiredTableChecks = [
-  { table: "schedules", fragment: "check (enabled in (0, 1))" },
-  { table: "approvals", fragment: "check (decision in ('pending', 'approved', 'denied'))" },
+const requiredTableDefinitions = [
+  {
+    table: "schedules",
+    sql: normalizedSql(`
+      CREATE TABLE "schedules" (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        lease_token TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `),
+  },
+  {
+    table: "approvals",
+    sql: normalizedSql(`
+      CREATE TABLE "approvals" (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      )
+    `),
+  },
 ] as const;
 
 function assertRequiredSchema(database: Database): void {
@@ -829,14 +931,16 @@ function assertRequiredSchema(database: Database): void {
     assertForeignKeys(database, table, requiredForeignKeys[table]);
   }
 
-  for (const requiredCheck of requiredTableChecks) {
+  for (const requiredTable of requiredTableDefinitions) {
     const actual = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
-      .get(requiredCheck.table) as { sql: string } | null;
-    if (actual === null || !normalizedSql(actual.sql).includes(requiredCheck.fragment)) {
-      fail(`required table constraint is missing or altered: ${requiredCheck.table}`);
+      .get(requiredTable.table) as { sql: string } | null;
+    if (actual === null || normalizedSql(actual.sql) !== requiredTable.sql) {
+      fail(`required table constraint is missing or altered: ${requiredTable.table}`);
     }
   }
+
+  assertTableUniqueConstraints(database);
 
   for (const index of requiredIndexes) {
     const indexes = database.query(`PRAGMA index_list('${index.table}')`).all() as Array<{

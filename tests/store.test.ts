@@ -909,6 +909,140 @@ test("migration rejects a same-name table with a missing foreign key", () => {
   });
 });
 
+test("migration rejects a messages table missing its composite uniqueness constraint", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_messages_run_sequence");
+    database.exec("ALTER TABLE messages RENAME TO messages_original");
+    database.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    database.exec("DROP TABLE messages_original");
+    database.exec("CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence_number)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/unique|messages|schema/i);
+  });
+});
+
+test("migration rejects a runs table with an altered composite uniqueness constraint", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("ALTER TABLE runs RENAME TO runs_original");
+    database.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, started_at)
+      )
+    `);
+    database.exec("DROP TABLE runs_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/unique|runs|schema/i);
+  });
+});
+
+test("migration rejects a schedule table with a tautological enabled CHECK", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_schedules_due");
+    database.exec("ALTER TABLE schedules RENAME TO schedules_original");
+    database.exec(`
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1) OR 1 = 1),
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        lease_token TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    database.exec("DROP TABLE schedules_original");
+    database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/constraint|schedule|schema/i);
+  });
+});
+
+test("migration rejects an approval table with an altered decision CHECK", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_approvals_call_hash");
+    database.exec("ALTER TABLE approvals RENAME TO approvals_original");
+    database.exec(`
+      CREATE TABLE approvals (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied') OR 1 = 1),
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      )
+    `);
+    database.exec("DROP TABLE approvals_original");
+    database.exec("CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/constraint|approval|schema/i);
+  });
+});
+
+test("migration rejects altered foreign-key actions", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_events_task_created");
+    database.exec("DROP INDEX idx_events_run_created");
+    database.exec("ALTER TABLE events RENAME TO events_original");
+    database.exec(`
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    database.exec("DROP TABLE events_original");
+    database.exec("CREATE INDEX idx_events_task_created ON events(task_id, created_at)");
+    database.exec("CREATE INDEX idx_events_run_created ON events(run_id, created_at)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/foreign key|events|schema/i);
+  });
+});
+
 test("migration rejects a missing status guard", () => {
   withDatabase((path, open) => {
     open().close();
