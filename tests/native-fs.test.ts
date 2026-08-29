@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { getNativeFs, loadNativeFsForPlatform } from "../src/tools/native-fs";
+import { decodeDirent, getNativeFs, loadNativeFsForPlatform } from "../src/tools/native-fs";
 
 const supportedPlatforms = ["darwin", "linux"] as const;
 type SupportedPlatform = (typeof supportedPlatforms)[number];
@@ -32,9 +32,9 @@ function makeLinuxDirent(name: string, type: number): Uint8Array {
 }
 
 const fixtures = {
-  darwin: makeDarwinDirent("entry", 4),
-  linux: makeLinuxDirent("entry", 4),
-} satisfies Record<SupportedPlatform, Uint8Array>;
+  darwin: { bytes: makeDarwinDirent("entry", 4), nameOffset: 21 },
+  linux: { bytes: makeLinuxDirent("entry", 4), nameOffset: 19 },
+} satisfies Record<SupportedPlatform, { bytes: Uint8Array; nameOffset: number }>;
 
 test("loads the native filesystem adapter on supported platforms", () => {
   if (!isSupportedPlatform(process.platform)) return;
@@ -65,24 +65,26 @@ test("exposes portable native filesystem constants and errno names", () => {
 test("decodes Darwin and Linux dirent fixtures with the same name and type", () => {
   if (!isSupportedPlatform(process.platform)) return;
 
-  const nativeFs = getNativeFs();
-  const fixture = fixtures[nativeFs.platform];
-
-  expect(nativeFs.dirent.decode(fixture)).toEqual({ name: "entry", type: 4 });
+  for (const platform of supportedPlatforms) {
+    expect(decodeDirent(platform, fixtures[platform].bytes)).toMatchObject({ name: "entry", type: 4 });
+  }
 });
 
 test("rejects oversized and unterminated native dirent records", () => {
   if (!isSupportedPlatform(process.platform)) return;
 
   const nativeFs = getNativeFs();
-  const fixture = fixtures[nativeFs.platform];
-  const oversized = fixture.slice();
-  const missingNul = fixture.slice();
-  const view = new DataView(oversized.buffer);
 
-  view.setUint16(16, nativeFs.dirent.maxRecordBytes + 1, true);
-  missingNul.fill(0x78, nativeFs.platform === "darwin" ? 26 : 24);
+  for (const platform of supportedPlatforms) {
+    const fixture = fixtures[platform];
+    const oversized = fixture.bytes.slice();
+    const missingNul = fixture.bytes.slice();
+    const view = new DataView(oversized.buffer);
 
-  expect(() => nativeFs.dirent.decode(oversized)).toThrow(/invalid|record/i);
-  expect(() => nativeFs.dirent.decode(missingNul)).toThrow(/invalid|NUL|terminat/i);
+    view.setUint16(16, 0xffff, true);
+    missingNul.fill(0x78, fixture.nameOffset + "entry".length);
+
+    expect(() => decodeDirent(platform, oversized)).toThrow(/invalid|record/i);
+    expect(() => decodeDirent(platform, missingNul)).toThrow(/invalid|NUL|terminat/i);
+  }
 });
