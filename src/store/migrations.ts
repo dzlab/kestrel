@@ -511,6 +511,7 @@ function prepareVersionTwo(database: Database): void {
 }
 
 function prepareVersionThree(database: Database): void {
+  assertHistoricalLineageTables(database, schemaLineageFor(database, true));
   assertScheduleLeaseTuples(database);
   const toolCallsSequence = database
     .query("SELECT seq FROM sqlite_sequence WHERE name = 'tool_calls'")
@@ -543,7 +544,10 @@ function prepareVersionThree(database: Database): void {
       lease_token TEXT,
       last_error TEXT,
       created_at INTEGER NOT NULL,
-      CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
+      CHECK (
+        (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+        OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
+      )
     );
     INSERT INTO schedules_v3
       (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
@@ -603,6 +607,7 @@ function prepareVersionThree(database: Database): void {
 }
 
 function prepareVersionFour(database: Database): void {
+  assertCurrentRebuildSources(database);
   assertScheduleLeaseTuples(database);
 
   database.exec(`
@@ -618,7 +623,10 @@ function prepareVersionFour(database: Database): void {
       lease_token TEXT,
       last_error TEXT,
       created_at INTEGER NOT NULL,
-      CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
+      CHECK (
+        (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+        OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
+      )
     );
     INSERT INTO schedules_v4
       (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
@@ -636,11 +644,16 @@ function tableInfo(database: Database, table: string): TableInfoRow[] {
 }
 
 function assertScheduleLeaseTuples(database: Database): void {
+  const hasLeaseToken = tableInfo(database, "schedules").some((column) => column.name === "lease_token");
+  const malformedLease = hasLeaseToken
+    ? `
+       (claimed_by IS NULL) != (claimed_at IS NULL)
+       OR (claimed_by IS NULL) != (lease_token IS NULL)`
+    : `claimed_by IS NOT NULL OR claimed_at IS NOT NULL`;
   const malformed = database
     .query(
       `SELECT id FROM schedules
-       WHERE (claimed_by IS NULL AND claimed_at IS NOT NULL)
-          OR (claimed_by IS NOT NULL AND claimed_at IS NULL)
+       WHERE ${malformedLease}
        LIMIT 1`,
     )
     .get() as { id: string } | null;
@@ -821,52 +834,146 @@ const hardenedVersionOneLineage: SchemaLineage = {
 const taskStatusValues = "'pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted'";
 const runStatusValues = "'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted'";
 
-function expectedLineageTableSql(table: "tasks" | "runs", hasInlineStatusChecks: boolean): string {
-  const status = table === "tasks" ? taskStatusValues : runStatusValues;
-  const statusColumn = hasInlineStatusChecks
-    ? `status TEXT NOT NULL CHECK (status IN (${status}))`
+const lineageTables = [
+  "tasks",
+  "runs",
+  "messages",
+  "tool_calls",
+  "events",
+  "memories",
+  "schedules",
+  "approvals",
+] as const;
+
+type LineageTable = (typeof lineageTables)[number];
+
+function expectedLineageTableSql(table: LineageTable, lineage: SchemaLineage): string {
+  const taskStatus = lineage.hasInlineStatusChecks
+    ? `status TEXT NOT NULL CHECK (status IN (${taskStatusValues}))`
     : "status TEXT NOT NULL";
-  if (table === "tasks") {
-    return normalizedSql(`
+  const runStatus = lineage.hasInlineStatusChecks
+    ? `status TEXT NOT NULL CHECK (status IN (${runStatusValues}))`
+    : "status TEXT NOT NULL";
+
+  const definitions: Record<LineageTable, string> = {
+    tasks: `
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         prompt TEXT NOT NULL,
         workspace TEXT NOT NULL,
         max_steps INTEGER NOT NULL,
-        ${statusColumn},
+        ${taskStatus},
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
-    `);
-  }
-  return normalizedSql(`
-    CREATE TABLE runs (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL REFERENCES tasks(id),
-      idempotency_key TEXT NOT NULL,
-      ${statusColumn},
-      started_at INTEGER NOT NULL,
-      finished_at INTEGER,
-      UNIQUE (task_id, idempotency_key)
-    )
-  `);
+    `,
+    runs: `
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        ${runStatus},
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, idempotency_key)
+      )
+    `,
+    messages: `
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      )
+    `,
+    tool_calls: `
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL${lineage.hasInlineToolCallUnique ? " UNIQUE" : ""},
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      )
+    `,
+    events: `
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `,
+    memories: `
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `,
+    schedules: `
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL,
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `,
+    approvals: `
+      CREATE TABLE approvals (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      )
+    `,
+  };
+
+  return normalizedSql(definitions[table]);
 }
 
-function expectedLineageToolCallsSql(hasInlineUnique: boolean): string {
-  return normalizedSql(`
-    CREATE TABLE tool_calls (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_id TEXT NOT NULL REFERENCES runs(id),
-      call_id TEXT NOT NULL${hasInlineUnique ? " UNIQUE" : ""},
-      name TEXT NOT NULL,
-      arguments TEXT NOT NULL,
-      state TEXT NOT NULL,
-      result TEXT,
-      created_at INTEGER NOT NULL,
-      finished_at INTEGER
-    )
-  `);
+function assertHistoricalLineageTables(database: Database, lineage: SchemaLineage): void {
+  for (const table of lineageTables) {
+    const columns = requiredTableColumns[table].filter((column) => column.name !== "lease_token");
+    if (!hasTable(database, table)) {
+      fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
+    }
+    const definition = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) as { sql: string } | null;
+    if (definition === null || normalizedSql(definition.sql) !== expectedLineageTableSql(table, lineage)) {
+      fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
+    }
+    assertTableColumns(database, table, columns);
+    assertForeignKeys(database, table, requiredForeignKeys[table]);
+  }
+  assertTableUniqueConstraints(database);
 }
 
 const schemaLineages = new Map<string, SchemaLineage>([
@@ -894,24 +1001,8 @@ function schemaLineageFor(database: Database, hasChecksum: boolean): SchemaLinea
 }
 
 function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIndexes: boolean): void {
-  const legacyColumns = Object.fromEntries(
-    Object.entries(requiredTableColumns).map(([table, columns]) => [
-      table,
-      columns.filter((column) => column.name !== "lease_token"),
-    ]),
-  ) as Record<string, readonly ColumnDefinition[]>;
   if (checkIndexes) {
-    for (const [table, columns] of Object.entries(legacyColumns)) {
-      if (table === "schema_migrations") {
-        continue;
-      }
-      if (!hasTable(database, table)) {
-        fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
-      }
-      assertTableColumns(database, table, columns);
-      assertForeignKeys(database, table, requiredForeignKeys[table]);
-    }
-    assertTableUniqueConstraints(database);
+    assertHistoricalLineageTables(database, lineage);
   }
 
   for (const table of ["tasks", "runs"] as const) {
@@ -920,7 +1011,7 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
       .get(table) as { sql: string } | null;
     if (
       row === null ||
-      normalizedSql(row.sql) !== expectedLineageTableSql(table as "tasks" | "runs", lineage.hasInlineStatusChecks)
+      normalizedSql(row.sql) !== expectedLineageTableSql(table, lineage)
     ) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
     }
@@ -928,16 +1019,6 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
 
   if (!checkIndexes) {
     return;
-  }
-
-  const toolCalls = database
-    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'")
-    .get() as { sql: string } | null;
-  if (
-    toolCalls === null ||
-    normalizedSql(toolCalls.sql) !== expectedLineageToolCallsSql(lineage.hasInlineToolCallUnique)
-  ) {
-    fail("migration 1 checksum does not match the schema lineage for tool_calls");
   }
 
   const actualIndexes = database
@@ -1000,7 +1081,10 @@ const requiredTableDefinitions = [
         lease_token TEXT,
         last_error TEXT,
         created_at INTEGER NOT NULL,
-        CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
+        CHECK (
+          (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+          OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
+        )
       )
     `),
   },
@@ -1022,6 +1106,17 @@ const requiredTableDefinitions = [
     `),
   },
 ] as const;
+
+function assertCurrentRebuildSources(database: Database): void {
+  for (const table of requiredTableDefinitions) {
+    const actual = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table.table) as { sql: string } | null;
+    if (actual === null || normalizedSql(actual.sql) !== table.sql) {
+      fail(`required table definition is missing or altered: ${table.table}`);
+    }
+  }
+}
 
 const requiredCurrentTableDefinitions = [
   {

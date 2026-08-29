@@ -273,8 +273,12 @@ function createHistoricalDatabase(
   database.close();
 }
 
-function createVersionTwoDatabase(path: string, seed: (database: Database) => void): void {
-  createHistoricalDatabase(path, historicalVersionOneSqlFrom0fed, null, () => {});
+function createVersionTwoDatabase(
+  path: string,
+  seed: (database: Database) => void,
+  historicalSql = historicalVersionOneSqlFrom0fed,
+): void {
+  createHistoricalDatabase(path, historicalSql, null, () => {});
   const database = new Database(path);
   database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''");
   database.query("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run(versionOneChecksum);
@@ -569,7 +573,7 @@ test("claimDueSchedule reclaims a stale lease with a new fencing token", () => {
   });
 });
 
-test("createSchedule rejects a half-populated lease tuple", () => {
+test("createSchedule rejects an owned schedule without a lease token", () => {
   withDatabase((_path, open) => {
     const repository = new StoreRepository(open());
 
@@ -580,13 +584,14 @@ test("createSchedule rejects a half-populated lease tuple", () => {
         nextRunAt: 1_000,
         enabled: true,
         claimedBy: "owner-a",
-        claimedAt: null,
+        claimedAt: 1_000,
+        leaseToken: null,
       }),
     ).toThrow(PersistenceError);
   });
 });
 
-test("claimDueSchedule safely reclaims a malformed claimed row", () => {
+test("claimDueSchedule does not reclaim a malformed lease row", () => {
   withDatabase((_path, open) => {
     const database = open();
     const repository = new StoreRepository(database);
@@ -595,9 +600,21 @@ test("claimDueSchedule safely reclaims a malformed claimed row", () => {
     database.exec("PRAGMA ignore_check_constraints = ON");
     database.query("UPDATE schedules SET claimed_by = ?, claimed_at = NULL WHERE id = ?").run("dead-worker", "malformed-schedule");
 
-    const claim = repository.claimDueSchedule(1_000, "owner-b");
-    expect(claim).toMatchObject({ id: "malformed-schedule", claimedBy: "owner-b", claimedAt: 1_000 });
-    expect(claim?.leaseToken).toEqual(expect.any(String));
+    expect(repository.claimDueSchedule(1_000, "owner-b")).toBeNull();
+  });
+});
+
+test("finishSchedule rejects a lease with a missing claim timestamp", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    repository.createSchedule({ id: "malformed-finish-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+    const claim = repository.claimDueSchedule(1_000, "owner-a")!;
+
+    database.exec("PRAGMA ignore_check_constraints = ON");
+    database.query("UPDATE schedules SET claimed_at = NULL WHERE id = ?").run("malformed-finish-schedule");
+
+    expect(repository.finishSchedule("malformed-finish-schedule", "owner-a", claim.leaseToken!, null, null)).toBe(false);
   });
 });
 
@@ -1068,8 +1085,8 @@ test("migration rejects a persisted half-populated schedule lease", () => {
     repository.createSchedule({ id: "malformed-migration-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
     database.exec("PRAGMA ignore_check_constraints = ON");
     database
-      .query("UPDATE schedules SET claimed_by = ?, claimed_at = NULL WHERE id = ?")
-      .run("dead-worker", "malformed-migration-schedule");
+      .query("UPDATE schedules SET claimed_by = ?, claimed_at = ?, lease_token = NULL WHERE id = ?")
+      .run("dead-worker", 1_000, "malformed-migration-schedule");
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/lease|claim|schedule|schema/i);
@@ -1284,6 +1301,62 @@ test("migration rejects a legacy schema without the inline tool-call uniqueness"
     createHistoricalDatabase(path, alteredLegacySql, null, () => {});
 
     expect(() => openDatabase(path)).toThrow(/lineage|tool.?calls|unique|schema/i);
+  });
+});
+
+test("version-three migration rejects an altered legacy schedule default before rebuilding it", () => {
+  withDatabase((path) => {
+    const alteredLegacySql = historicalVersionOneSqlFrom0fed.replace(
+      "last_error TEXT,\n        created_at INTEGER NOT NULL",
+      "last_error TEXT,\n        created_at INTEGER NOT NULL DEFAULT 0",
+    );
+    createVersionTwoDatabase(path, () => {}, alteredLegacySql);
+
+    expect(() => openDatabase(path)).toThrow(/lineage|schedule|default|schema/i);
+  });
+});
+
+test("version-three migration rejects an altered legacy approval CHECK before rebuilding it", () => {
+  withDatabase((path) => {
+    const alteredLegacySql = historicalVersionOneSqlFrom0fed.replace(
+      "decision TEXT NOT NULL,\n        requested_at INTEGER NOT NULL",
+      "decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),\n        requested_at INTEGER NOT NULL",
+    );
+    createVersionTwoDatabase(path, () => {}, alteredLegacySql);
+
+    expect(() => openDatabase(path)).toThrow(/lineage|approval|constraint|schema/i);
+  });
+});
+
+test("version-four migration rejects an altered current schedule definition before rebuilding it", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("DROP INDEX idx_schedules_due");
+    database.exec("ALTER TABLE schedules RENAME TO schedules_original");
+    database.exec(`
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        lease_token TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
+      )
+    `);
+    database.exec("INSERT INTO schedules SELECT * FROM schedules_original");
+    database.exec("DROP TABLE schedules_original");
+    database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
+    database.query("DELETE FROM schema_migrations WHERE version = 4").run();
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/schedule|default|schema/i);
   });
 });
 
@@ -1528,6 +1601,15 @@ test("approval and schedule persisted domains are checked by SQLite", () => {
         )
         .run("schedule-domain", "Run once", 1_000, 2, 1),
     ).toThrow();
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO schedules
+             (id, prompt, next_run_at, enabled, claimed_by, claimed_at, lease_token, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("schedule-lease-domain", "Run once", 1_000, 1, "owner-a", 1_000, null, 1),
+    ).toThrow();
   });
 });
 
@@ -1552,6 +1634,23 @@ test("decoding rejects tampered approval and schedule domains", () => {
 
     expect(() => repository.getApproval("tampered-approval", "hash")).toThrow(PersistenceError);
     expect(() => repository.getSchedule("tampered-schedule")).toThrow(PersistenceError);
+  });
+});
+
+test("decoding rejects a claimed schedule with a missing lease token", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    database.exec("PRAGMA ignore_check_constraints = ON");
+    database
+      .query(
+        `INSERT INTO schedules
+           (id, prompt, next_run_at, enabled, claimed_by, claimed_at, lease_token, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("tampered-lease", "Run once", 1_000, 1, "owner-a", 1_000, null, 1);
+
+    expect(() => repository.getSchedule("tampered-lease")).toThrow(PersistenceError);
   });
 });
 

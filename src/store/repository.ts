@@ -182,7 +182,8 @@ function scheduleFromRow(row: Row): ScheduleRecord {
   }
   const hasClaimedBy = row.claimed_by !== null && row.claimed_by !== undefined;
   const hasClaimedAt = row.claimed_at !== null && row.claimed_at !== undefined;
-  if (hasClaimedBy !== hasClaimedAt) {
+  const hasLeaseToken = row.lease_token !== null && row.lease_token !== undefined;
+  if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken) {
     throw new PersistenceError(`invalid persisted schedule lease tuple for ${String(row.id)}`);
   }
   return {
@@ -398,8 +399,9 @@ export class StoreRepository {
   createSchedule(input: ScheduleRecord): void {
     const hasClaimedBy = input.claimedBy !== null && input.claimedBy !== undefined;
     const hasClaimedAt = input.claimedAt !== null && input.claimedAt !== undefined;
-    if (hasClaimedBy !== hasClaimedAt) {
-      throw new PersistenceError("schedule claimed_by and claimed_at must be both set or both null");
+    const hasLeaseToken = input.leaseToken !== null && input.leaseToken !== undefined;
+    if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken) {
+      throw new PersistenceError("schedule claimed_by, claimed_at, and lease_token must be all set or all null");
     }
     immediateTransaction(this.database, () => {
       this.database
@@ -431,7 +433,10 @@ export class StoreRepository {
         .query(
           `SELECT id FROM schedules
            WHERE enabled = 1 AND next_run_at <= ?
-             AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?)
+             AND (
+               (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND claimed_at <= ?)
+             )
            ORDER BY next_run_at, id
            LIMIT 1`,
         )
@@ -446,7 +451,10 @@ export class StoreRepository {
           `UPDATE schedules
            SET claimed_by = ?, claimed_at = ?, lease_token = ?
            WHERE id = ? AND enabled = 1 AND next_run_at <= ?
-             AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?)`,
+             AND (
+               (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND claimed_at <= ?)
+             )`,
         )
         .run(owner, now, leaseToken, row.id, now, staleBefore);
       if (updated.changes !== 1) {
@@ -470,7 +478,7 @@ export class StoreRepository {
           `UPDATE schedules
            SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL,
                enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
-           WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
+           WHERE id = ? AND claimed_by = ? AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND lease_token = ?`,
         )
         .run(nextRunAt, error, nextRunAt, id, owner, leaseToken);
       return update.changes === 1;
