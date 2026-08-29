@@ -1,13 +1,14 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeModel } from "../src/model/fake";
 import { ApprovalManager } from "../src/policy/approvals";
 import { openDatabase } from "../src/store/database";
 import { StoreRepository } from "../src/store/repository";
-import { createToolRegistry } from "../src/tools/registry";
-import type { ModelResponse } from "../src/protocol/types";
+import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
+import { createUpgradeTools } from "../src/upgrade/tools";
+import type { ModelRequest, ModelResponse } from "../src/protocol/types";
 import { RunKernel } from "../src/kernel";
 
 function assistant(content: string): ModelResponse {
@@ -37,6 +38,30 @@ function setup(model: FakeModel = new FakeModel([assistant("default")])) {
     rmSync(workspace, { recursive: true, force: true });
   };
   return { workspace, database, repository, approvals, registry, model, cleanup };
+}
+
+class IntegratedUpgradeModel {
+  readonly requests: ModelRequest[] = [];
+  private proposalId: string | undefined;
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    if (this.requests.length === 1) {
+      return toolCall("upgrade-call", "self.upgrade", {
+        patch: "--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        verification: ["git", "status"],
+      });
+    }
+    if (this.requests.length === 2) {
+      const last = request.messages.at(-1);
+      if (last === undefined) throw new Error("upgrade proposal result is missing");
+      const parsed = JSON.parse(last.content) as { data?: { id?: string } };
+      this.proposalId = parsed.data?.id;
+      if (this.proposalId === undefined) throw new Error(`upgrade proposal ID is missing: ${last.content}`);
+      return toolCall("apply-call", "self.apply", { proposalId: this.proposalId });
+    }
+    return assistant("upgrade applied");
+  }
 }
 
 test("runs multiple tool turns, persists messages/events, and returns the final answer", async () => {
@@ -108,6 +133,39 @@ test("pauses before an approval-gated tool and resumes it exactly once", async (
     expect(model.requests).toHaveLength(2);
     expect(state.database.query("SELECT state, COUNT(*) AS count FROM tool_calls WHERE call_id = ? GROUP BY state").get("shell-1"))
       .toEqual({ state: "completed", count: 1 });
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("integrated self-upgrade resumes self.apply once without synthetic-call duplicate detection", async () => {
+  const state = setup();
+  const model = new IntegratedUpgradeModel();
+  writeFileSync(join(state.workspace, "target.txt"), "old\n");
+  for (const command of [
+    ["git", "init"],
+    ["git", "config", "user.email", "kestrel-test@example.invalid"],
+    ["git", "config", "user.name", "Kestrel Test"],
+    ["git", "add", "target.txt"],
+    ["git", "commit", "-m", "initial"],
+  ]) Bun.spawnSync(command, { cwd: state.workspace });
+  const registry = new ToolRegistry(createUpgradeTools(state.approvals), { approvals: state.approvals });
+  try {
+    const kernel = new RunKernel({ model, repository: state.repository, registry, approvals: state.approvals });
+    const paused = await kernel.run({ title: "Upgrade", prompt: "upgrade", workspace: state.workspace });
+    expect(paused).toMatchObject({ status: "blocked_on_approval", approvalId: "upgrade-call" });
+
+    state.approvals.approve("upgrade-call");
+    const applyPaused = await kernel.resume(paused.runId);
+    expect(applyPaused).toMatchObject({ status: "blocked_on_approval", approvalId: "apply-call" });
+
+    state.approvals.approve("apply-call");
+    const completed = await kernel.resume(paused.runId);
+    expect(completed).toMatchObject({ status: "completed", answer: "upgrade applied" });
+    expect(readFileSync(join(state.workspace, "target.txt"), "utf8")).toBe("new\n");
+    expect(state.repository.getToolCall("apply-call")).toMatchObject({ state: "completed" });
+    expect(state.repository.getEvents(paused.runId).some((event) => event.type === "run.budget_exhausted")).toBe(false);
+    expect(state.repository.getToolCalls(paused.runId).filter((call) => call.name === "self.apply" && call.state === "completed")).toHaveLength(1);
   } finally {
     state.cleanup();
   }

@@ -61,7 +61,7 @@ test("proposes a bounded patch without mutating source and persists its base sta
       approval: { status: "pending" },
     });
     expect(proposal.id).toBeString();
-    expect(value.repository.getToolCall(proposal.approval.id)).toMatchObject({ name: "self.apply", state: "awaiting_approval" });
+    expect(value.repository.getToolCall(proposal.approval.id)).toMatchObject({ name: "self.apply", state: "synthetic_approval" });
     expect(proposal.patchHash).toMatch(/^[0-9a-f]{64}$/);
     expect(value.repository.getEvents(value.runId).some((event) => event.type === "upgrade.proposed")).toBe(true);
   } finally {

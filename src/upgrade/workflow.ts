@@ -7,6 +7,7 @@ import {
 import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { ApprovalRequiredError, ToolExecutionError, ValidationError } from "../errors";
+import { hashToolCall } from "../policy/rules";
 import { runProcess, MAX_PROCESS_TIMEOUT_MS } from "../runtime/process";
 import { createFilesystemTools } from "../tools/filesystem";
 import {
@@ -34,6 +35,8 @@ import {
   MAX_UPGRADE_PATCH_BYTES,
   MAX_UPGRADE_TARGETS,
   MAX_UPGRADE_VERIFICATION_MS,
+  SYNTHETIC_UPGRADE_APPROVAL_STATE,
+  syntheticUpgradeApprovalCallId,
 } from "./types";
 
 const MAX_FILE_BYTES = 64 * 1024;
@@ -212,9 +215,10 @@ export class SelfUpgrade {
     const id = `upgrade-${randomUUID()}`;
     const patchHash = sha256(patch);
     const approvalArguments = { proposalId: id };
-    this.repository.recordToolCall(input.runId, { id: `approval-${id}`, name: "self.apply", arguments: approvalArguments }, "awaiting_approval");
+    const approvalId = syntheticUpgradeApprovalCallId(id);
+    this.repository.recordToolCall(input.runId, { id: approvalId, name: "self.apply", arguments: approvalArguments }, SYNTHETIC_UPGRADE_APPROVAL_STATE);
     const approval = this.approvals.request({
-      id: `approval-${id}`,
+      id: approvalId,
       runId: input.runId,
       tool: "self.apply",
       capability: "self-modification",
@@ -280,16 +284,21 @@ export class SelfUpgrade {
     }
     const approvalArguments = { proposalId: proposal.id };
     const approvalRecord = this.approvals.get(proposal.approval.id);
-    const approvalConsumedByCaller = approvalRecord?.status === "consumed";
-    const approved = approvalRecord?.status === "approved"
-      ? this.approvals.consume({ id: proposal.approval.id, tool: "self.apply", arguments: approvalArguments }, undefined, this.now())
-      : approvalRecord?.status === "consumed" && this.repository.getToolCall(proposal.approval.id)?.state === "executing";
+    const callerApproval = this.callerApproval(input, approvalArguments);
+    const approvalConsumedByCaller = callerApproval !== null;
+    const syntheticCall = this.repository.getToolCall(proposal.approval.id);
+    if (!approvalConsumedByCaller && approvalRecord?.status === "consumed" && syntheticCall?.state === "executing") {
+      throw new ToolExecutionError("an unfinished self-upgrade cannot be replayed safely");
+    }
+    const approved = approvalConsumedByCaller || (approvalRecord?.status === "approved"
+      ? this.approvals.consume({ id: proposal.approval.id, tool: "self.apply", arguments: approvalArguments }, undefined, this.now(), input.runId)
+      : false);
     if (!approved) {
       throw new ApprovalRequiredError(`approval required for upgrade ${proposal.id}`);
     }
 
     if (input.signal?.aborted) throw new ToolExecutionError("upgrade application cancelled");
-    this.repository.updateToolCallState(proposal.runId, proposal.approval.id, "executing");
+    if (!approvalConsumedByCaller) this.repository.updateToolCallState(proposal.runId, proposal.approval.id, "executing");
 
     this.recordStatus({ ...proposal, status: "applying", approval: { ...proposal.approval, status: "consumed" } });
     const before = snapshotForWorkspace(proposal.workspace, proposal.targetFiles);
@@ -344,6 +353,23 @@ export class SelfUpgrade {
     const root = resolve(workspace);
     if (!existsSync(root) || !lstatSync(root).isDirectory()) throw new ValidationError("upgrade workspace must be a directory");
     return realpathSync(root);
+  }
+
+  private callerApproval(input: UpgradeApplyInput, argumentsValue: Record<string, unknown>): { callId: string } | null {
+    if (input.approvalConsumed !== true || input.approvalId === undefined) return null;
+    const approval = this.approvals.get(input.approvalId);
+    const call = this.repository.getToolCall(input.approvalId);
+    if (
+      approval?.status !== "consumed" ||
+      approval.runId !== input.runId ||
+      approval.tool !== "self.apply" ||
+      approval.argumentsHash !== hashToolCall("self.apply", argumentsValue) ||
+      call?.runId !== input.runId ||
+      call.name !== "self.apply" ||
+      call.state !== "executing" ||
+      hashToolCall(call.name, call.arguments) !== approval.argumentsHash
+    ) return null;
+    return { callId: input.approvalId };
   }
 
   private resolveTargets(workspace: string, targetFiles: readonly string[]): string[] {

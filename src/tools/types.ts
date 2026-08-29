@@ -55,8 +55,8 @@ export function boundToolResult(result: ToolResult): ToolResult {
   const hasData = Object.prototype.hasOwnProperty.call(safeResult, "data") && safeResult.data !== undefined;
   const hasRedactions = Object.prototype.hasOwnProperty.call(safeResult, "redactions") && safeResult.redactions !== undefined;
   const fieldShareBytes = Math.floor(MAX_TOOL_OUTPUT_BYTES / (1 + Number(hasData) + Number(hasRedactions)));
-  const data = hasData ? boundToolData(result.data, fieldShareBytes) : undefined;
-  const redactions = hasRedactions ? boundToolData(result.redactions, fieldShareBytes) : undefined;
+  const data = hasData ? boundToolData(safeResult.data, fieldShareBytes) : undefined;
+  const redactions = hasRedactions ? boundToolData(safeResult.redactions, fieldShareBytes) : undefined;
   return {
     ok: result.ok,
     content: boundToolContent(

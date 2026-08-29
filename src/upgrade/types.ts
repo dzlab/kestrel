@@ -1,6 +1,17 @@
 import type { ApprovalManager } from "../policy/approvals";
 import type { StoreRepository } from "../store/repository";
 
+export const SYNTHETIC_UPGRADE_APPROVAL_PREFIX = "approval-upgrade-";
+export const SYNTHETIC_UPGRADE_APPROVAL_STATE = "synthetic_approval";
+
+export function syntheticUpgradeApprovalCallId(proposalId: string): string {
+  return `${SYNTHETIC_UPGRADE_APPROVAL_PREFIX}${proposalId}`;
+}
+
+export function isSyntheticUpgradeApprovalCall(call: { callId: string; name: string; state: string }): boolean {
+  return call.name === "self.apply" && call.state === SYNTHETIC_UPGRADE_APPROVAL_STATE && call.callId.startsWith(SYNTHETIC_UPGRADE_APPROVAL_PREFIX);
+}
+
 export const MAX_UPGRADE_PATCH_BYTES = 256 * 1024;
 export const MAX_UPGRADE_TARGETS = 32;
 export const MAX_UPGRADE_VERIFICATION_MS = 120_000;
@@ -70,6 +81,8 @@ export type UpgradeApplyInput = {
   runId: string;
   proposalId: string;
   signal?: AbortSignal;
+  approvalId?: string;
+  approvalConsumed?: boolean;
 };
 
 export type UpgradeApplyResult = UpgradeProposal & {

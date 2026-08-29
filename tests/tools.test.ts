@@ -21,6 +21,7 @@ import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
 import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES, boundToolResult } from "../src/tools/types";
 import type { ToolContext } from "../src/tools/types";
 import { validateNativeDirentHeader, validateNativeReaddirResult } from "../src/tools/secure-fs";
+import { buildToolMessage } from "../src/kernel/context";
 
 const libc = dlopen("/usr/lib/libSystem.B.dylib", {
   mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
@@ -118,6 +119,38 @@ test("registry gates custom shell implementations and consumes a matching approv
     approvals.approve(call.id, 10_001);
     await expect(registry.execute(call, context)).resolves.toMatchObject({ ok: true, content: "executed" });
     await expect(registry.execute(call, context)).resolves.toMatchObject({ ok: false });
+    expect(executions).toBe(1);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("approval consumption is fenced to the current tool run", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "kestrel-run-fence-"));
+  let executions = 0;
+  const shell = {
+    definition: {
+      name: "shell.exec",
+      description: "test shell",
+      capability: "shell",
+      inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"], additionalProperties: false },
+    },
+    async execute() {
+      executions += 1;
+      return { ok: true, content: "executed" };
+    },
+  };
+  const approvals = new ApprovalManager({ now: () => 10_000 });
+  const call = { id: "run-fenced-call", name: "shell.exec", arguments: { command: "printf safe" } };
+  approvals.request({ callId: call.id, runId: "run-a", tool: call.name, capability: "shell", risk: "high", summary: "Run shell", arguments: call.arguments, createdAt: 10_000, expiresAt: 20_000 });
+  approvals.approve(call.id, 10_001);
+  const registry = new ToolRegistry([shell], { approvals, policyContext: (context) => ({ workspace, runId: context.runId, now: 10_001 }) });
+
+  try {
+    await expect(registry.execute(call, { workspace, runId: "run-b", repository: {} } as ToolContext)).resolves.toMatchObject({ ok: false });
+    expect(executions).toBe(0);
+    expect(approvals.get(call.id)).toMatchObject({ status: "approved", runId: "run-a" });
+    await expect(registry.execute(call, { workspace, runId: "run-a", repository: {} } as ToolContext)).resolves.toMatchObject({ ok: true });
     expect(executions).toBe(1);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
@@ -610,6 +643,17 @@ test("caps oversized tool output", async () => {
     expect(result.ok).toBe(true);
     expect(new TextEncoder().encode(result.content).byteLength).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
   });
+});
+
+test("redacts structured ToolResult data before bounding and feeding it to the model", () => {
+  const result = boundToolResult({
+    ok: true,
+    content: "safe",
+    data: { nested: "TOKEN=structured-secret-value" },
+  });
+
+  expect(result.data).toEqual({ nested: "TOKEN=[REDACTED]" });
+  expect(JSON.stringify(buildToolMessage("structured-result", result))).not.toContain("structured-secret-value");
 });
 
 test("patch validates every target before changing any file", async () => {

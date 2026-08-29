@@ -163,7 +163,7 @@ export class ApprovalManager {
     return request.status === "approved";
   }
 
-  consume(input: ApprovalLookup | string, args?: Record<string, unknown>, now = this.now()): boolean {
+  consume(input: ApprovalLookup | string, args?: Record<string, unknown>, now = this.now(), currentRunId?: string): boolean {
     const lookup: ApprovalLookup | null = typeof input === "string"
       ? args === undefined
         ? null
@@ -173,9 +173,15 @@ export class ApprovalManager {
           })()
       : input;
     if (lookup === null) return false;
+    const expectedRunId = currentRunId ?? (typeof input === "string" ? undefined : input.runId);
     const request = this.lookup(lookup);
     if (request !== null) this.refresh(request);
-    if (request === null || this.expireIfNeeded(request, now) || request.status !== "approved") return false;
+    if (
+      request === null ||
+      (expectedRunId !== undefined && request.runId !== expectedRunId) ||
+      this.expireIfNeeded(request, now) ||
+      request.status !== "approved"
+    ) return false;
 
     if (this.store !== undefined) {
       const consumed = this.store.consumeApproval(request.id, request.argumentsHash, now, request.version);

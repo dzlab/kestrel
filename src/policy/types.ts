@@ -60,6 +60,7 @@ export type ApprovalLookup = {
   id: string;
   tool: string;
   arguments: Record<string, unknown>;
+  runId?: string;
 };
 
 export type ApprovalStoreRecord = {

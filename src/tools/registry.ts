@@ -251,6 +251,7 @@ export class ToolRegistry {
         { id: call.id, tool: call.name, arguments: call.arguments },
         undefined,
         policyContext.now,
+        context.runId,
       );
       if (!consumed) {
         return failure(new ApprovalRequiredError(`approval required for ${call.name} (${call.id})`));

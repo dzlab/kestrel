@@ -78,6 +78,8 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
           runId: context.runId,
           proposalId: String(args.proposalId),
           signal: context.signal,
+          approvalId: context.toolCallId,
+          approvalConsumed: context.approvalConsumed,
         });
         return { ok: true, content: `applied ${result.id}`, data: result };
       } catch (error) {

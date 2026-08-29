@@ -18,6 +18,7 @@ import { defaultSelfPaths, ToolRegistry } from "../tools/registry";
 import type { ToolContext, ToolResult } from "../tools/types";
 import { MemoryStore } from "../memory/store";
 import type { MemoryScope } from "../memory/types";
+import { isSyntheticUpgradeApprovalCall } from "../upgrade/types";
 
 const DEFAULT_MAX_TURNS = 12;
 const DEFAULT_MAX_TOOL_CALLS = 24;
@@ -235,7 +236,7 @@ export class RunKernel {
       this.repository.updateRunStatus(run.id, "running");
     }
 
-    const pending = this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null);
+    const pending = this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null && !isSyntheticUpgradeApprovalCall(call));
     if (pending.some((call) => call.state === "executing")) {
       return this.fail(run, "an unfinished tool call cannot be replayed safely");
     }
@@ -244,18 +245,18 @@ export class RunKernel {
       this.repository.updateToolCallState(run.id, call.callId, "awaiting_approval");
       this.repository.appendEvent(run.id, "run.blocked_on_approval", { callId: call.callId, reason: "approval pause recovered" });
     }
-    const resumed = await this.resumeApproval(task, run, this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null), options, deadline, messages);
+    const resumed = await this.resumeApproval(task, run, this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null && !isSyntheticUpgradeApprovalCall(call)), options, deadline, messages);
     if (resumed !== null) return resumed;
     messages = this.repository.getMessages(run.id);
 
-    const seenCalls = new Set(this.repository.getToolCalls(run.id).map((call) => canonicalCallKey({
+    const seenCalls = new Set(this.repository.getToolCalls(run.id).filter((call) => !isSyntheticUpgradeApprovalCall(call)).map((call) => canonicalCallKey({
       id: call.callId,
       name: call.name,
       arguments: call.arguments,
     })));
     const priorEvents = this.repository.getEvents(run.id);
     let turns = priorEvents.filter((event) => event.type === "model.requested").length;
-    let toolCallCount = this.repository.getToolCalls(run.id).length;
+    let toolCallCount = this.repository.getToolCalls(run.id).filter((call) => !isSyntheticUpgradeApprovalCall(call)).length;
     let tokens = priorEvents
       .filter((event) => event.type === "model.responded")
       .reduce((total, event) => {
@@ -508,7 +509,7 @@ export class RunKernel {
   private summary(run: RunRecord): RunSummary {
     const messages = this.repository.getMessages(run.id);
     const answer = [...messages].reverse().find((message) => message.role === "assistant" && message.toolCalls === undefined)?.content;
-    const approval = this.repository.getToolCalls(run.id).find((call) => call.state === "awaiting_approval");
+    const approval = this.repository.getToolCalls(run.id).find((call) => call.state === "awaiting_approval" && !isSyntheticUpgradeApprovalCall(call));
     return {
       taskId: run.taskId,
       runId: run.id,
