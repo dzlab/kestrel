@@ -254,7 +254,7 @@ Run:
 
 ~~~~sh
 ! rg -n 'dlopen\("/usr/lib/libSystem\.B\.dylib"' src
-! rg -n '/usr/lib/libSystem\.B\.dylib' src/tools/secure-fs.ts tests
+! rg -n '/usr/lib/libSystem\.B\.dylib' src/tools/secure-fs.ts
 rg -n 'getNativeFs|loadNativeFsForPlatform|macos-latest|ubuntu-latest' src tests .github/workflows README.md
 git status --short
 ~~~~
