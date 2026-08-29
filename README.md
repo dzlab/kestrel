@@ -90,4 +90,6 @@ mise exec -- bun run diff:check
 mise exec -- bun run smoke
 ```
 
+GitHub Actions runs the same `check` and `smoke` commands on pull requests and pushes to `main` under Bun 1.4.0 and the latest Bun release. The repository also runs actionlint, scheduled CodeQL analysis, and pull-request dependency review. CI installs the committed npm lockfile with `npm ci --ignore-scripts`; local Bun development remains supported through `bun install`.
+
 The public `createKestrel` factory accepts an injected `FakeModel`, so integration tests can construct the complete registry/kernel/store without network access. See [docs/architecture.md](docs/architecture.md) and [docs/security.md](docs/security.md) for the system flow and threat model.
