@@ -130,9 +130,9 @@ Create src/tools/native-fs/linux.ts. Try fixed library candidates libc.so.6, lib
 
 Catch each failed candidate. If all fail, throw a bounded ToolExecutionError naming Linux and the operation without exposing arbitrary loader text.
 
-- [ ] **Step 4: Implement lazy platform selection**
+- [ ] **Step 4: Implement lazy platform selection and pure ABI decoding**
 
-Create src/tools/native-fs/index.ts with getNativeFs(): NativeFs and loadNativeFsForPlatform(platform: string): NativeFs. Select only darwin or linux, cache the immutable adapter after successful initialization, and throw a stable unsupported-platform ToolExecutionError otherwise. Never accept a library path from environment, tools, or model output.
+Create src/tools/native-fs/index.ts with getNativeFs(): NativeFs, loadNativeFsForPlatform(platform: string): NativeFs, and decodeDirent(platform: NativePlatform, record: Uint8Array): { recordLength: number; name: string; type: number }. The pure decodeDirent helper must select only the requested ABI parser without loading an unrelated host library, so tests can exercise both Darwin and Linux record layouts on either supported host. Select only darwin or linux for native loading, cache the immutable adapter after successful initialization, and throw a stable unsupported-platform ToolExecutionError otherwise. Never accept a library path from environment, tools, or model output.
 
 - [ ] **Step 5: Run focused tests and typecheck**
 
