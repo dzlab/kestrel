@@ -131,23 +131,126 @@ const versionTwoSql = `
       BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
     `;
 
-export const versionOneChecksum = "35a5325463baa76e76db95fb84a46bd41d40aa26d4414776bb855785fb0ac129";
+// This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
+// below as a historical checksum because that release changed v1 in place.
+export const versionOneChecksum = migrationChecksum(versionOneSql);
+export const historicalVersionOneChecksum =
+  "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa";
 
 export const migrations: readonly Migration[] = [
   { version: 1, sql: versionOneSql },
   { version: 2, sql: versionTwoSql, prepare: prepareVersionTwo },
 ];
 
-const requiredTableColumns: Readonly<Record<string, readonly string[]>> = {
-  schema_migrations: ["version", "checksum", "applied_at"],
-  tasks: ["id", "title", "prompt", "workspace", "max_steps", "status", "created_at", "updated_at"],
-  runs: ["id", "task_id", "idempotency_key", "status", "started_at", "finished_at"],
-  messages: ["id", "run_id", "sequence_number", "payload", "created_at"],
-  tool_calls: ["id", "run_id", "call_id", "name", "arguments", "state", "result", "created_at", "finished_at"],
-  events: ["id", "task_id", "run_id", "type", "payload", "created_at"],
-  memories: ["id", "task_id", "run_id", "kind", "content", "metadata", "confidence", "created_at", "updated_at"],
-  schedules: ["id", "task_id", "prompt", "cron", "next_run_at", "enabled", "claimed_by", "claimed_at", "last_error", "created_at"],
-  approvals: ["call_id", "arguments_hash", "task_id", "run_id", "capability", "risk_level", "decision", "requested_at", "resolved_at"],
+type ColumnDefinition = { name: string; type: string };
+
+const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>> = {
+  schema_migrations: [
+    { name: "version", type: "INTEGER" },
+    { name: "checksum", type: "TEXT" },
+    { name: "applied_at", type: "INTEGER" },
+  ],
+  tasks: [
+    { name: "id", type: "TEXT" },
+    { name: "title", type: "TEXT" },
+    { name: "prompt", type: "TEXT" },
+    { name: "workspace", type: "TEXT" },
+    { name: "max_steps", type: "INTEGER" },
+    { name: "status", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+    { name: "updated_at", type: "INTEGER" },
+  ],
+  runs: [
+    { name: "id", type: "TEXT" },
+    { name: "task_id", type: "TEXT" },
+    { name: "idempotency_key", type: "TEXT" },
+    { name: "status", type: "TEXT" },
+    { name: "started_at", type: "INTEGER" },
+    { name: "finished_at", type: "INTEGER" },
+  ],
+  messages: [
+    { name: "id", type: "INTEGER" },
+    { name: "run_id", type: "TEXT" },
+    { name: "sequence_number", type: "INTEGER" },
+    { name: "payload", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+  ],
+  tool_calls: [
+    { name: "id", type: "INTEGER" },
+    { name: "run_id", type: "TEXT" },
+    { name: "call_id", type: "TEXT" },
+    { name: "name", type: "TEXT" },
+    { name: "arguments", type: "TEXT" },
+    { name: "state", type: "TEXT" },
+    { name: "result", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+    { name: "finished_at", type: "INTEGER" },
+  ],
+  events: [
+    { name: "id", type: "INTEGER" },
+    { name: "task_id", type: "TEXT" },
+    { name: "run_id", type: "TEXT" },
+    { name: "type", type: "TEXT" },
+    { name: "payload", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+  ],
+  memories: [
+    { name: "id", type: "TEXT" },
+    { name: "task_id", type: "TEXT" },
+    { name: "run_id", type: "TEXT" },
+    { name: "kind", type: "TEXT" },
+    { name: "content", type: "TEXT" },
+    { name: "metadata", type: "TEXT" },
+    { name: "confidence", type: "REAL" },
+    { name: "created_at", type: "INTEGER" },
+    { name: "updated_at", type: "INTEGER" },
+  ],
+  schedules: [
+    { name: "id", type: "TEXT" },
+    { name: "task_id", type: "TEXT" },
+    { name: "prompt", type: "TEXT" },
+    { name: "cron", type: "TEXT" },
+    { name: "next_run_at", type: "INTEGER" },
+    { name: "enabled", type: "INTEGER" },
+    { name: "claimed_by", type: "TEXT" },
+    { name: "claimed_at", type: "INTEGER" },
+    { name: "last_error", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+  ],
+  approvals: [
+    { name: "call_id", type: "TEXT" },
+    { name: "arguments_hash", type: "TEXT" },
+    { name: "task_id", type: "TEXT" },
+    { name: "run_id", type: "TEXT" },
+    { name: "capability", type: "TEXT" },
+    { name: "risk_level", type: "TEXT" },
+    { name: "decision", type: "TEXT" },
+    { name: "requested_at", type: "INTEGER" },
+    { name: "resolved_at", type: "INTEGER" },
+  ],
+};
+
+type ForeignKeyDefinition = { table: string; from: string; to: string };
+
+const requiredForeignKeys: Readonly<Record<string, readonly ForeignKeyDefinition[]>> = {
+  schema_migrations: [],
+  tasks: [],
+  runs: [{ table: "tasks", from: "task_id", to: "id" }],
+  messages: [{ table: "runs", from: "run_id", to: "id" }],
+  tool_calls: [{ table: "runs", from: "run_id", to: "id" }],
+  events: [
+    { table: "tasks", from: "task_id", to: "id" },
+    { table: "runs", from: "run_id", to: "id" },
+  ],
+  memories: [
+    { table: "tasks", from: "task_id", to: "id" },
+    { table: "runs", from: "run_id", to: "id" },
+  ],
+  schedules: [{ table: "tasks", from: "task_id", to: "id" }],
+  approvals: [
+    { table: "tasks", from: "task_id", to: "id" },
+    { table: "runs", from: "run_id", to: "id" },
+  ],
 };
 
 const requiredIndexes = [
@@ -161,23 +264,12 @@ const requiredIndexes = [
   { name: "idx_approvals_call_hash", table: "approvals", unique: false, columns: ["call_id", "arguments_hash"] },
 ] as const;
 
-const requiredTriggers = [
-  "tasks_status_insert_guard",
-  "tasks_status_update_guard",
-  "runs_status_insert_guard",
-  "runs_status_update_guard",
-] as const;
-
 export function migrationChecksum(sql: string): string {
   return createHash("sha256").update(sql).digest("hex");
 }
 
 function expectedChecksum(migration: Migration): string {
-  const checksum = migrationChecksum(migration.sql);
-  if (migration.version === 1 && checksum !== versionOneChecksum) {
-    fail("bundled version-1 migration does not match its historical checksum");
-  }
-  return migration.version === 1 ? versionOneChecksum : checksum;
+  return migrationChecksum(migration.sql);
 }
 
 function fail(message: string): never {
@@ -185,7 +277,7 @@ function fail(message: string): never {
 }
 
 function prepareVersionTwo(database: Database): void {
-  if (tableColumns(database, "schema_migrations").has("checksum")) {
+  if (tableInfo(database, "schema_migrations").some((column) => column.name === "checksum")) {
     return;
   }
 
@@ -198,10 +290,10 @@ function prepareVersionTwo(database: Database): void {
   }
 }
 
-function tableColumns(database: Database, table: string): Set<string> {
-  return new Set(
-    (database.query(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>).map((column) => column.name),
-  );
+type TableInfoRow = { name: string; type: string };
+
+function tableInfo(database: Database, table: string): TableInfoRow[] {
+  return database.query(`PRAGMA table_info('${table}')`).all() as TableInfoRow[];
 }
 
 function hasTable(database: Database, table: string): boolean {
@@ -215,27 +307,93 @@ function assertSchemaMigrationsShape(database: Database): boolean {
     fail("schema_migrations table is missing");
   }
 
-  const columns = tableColumns(database, "schema_migrations");
-  for (const requiredColumn of ["version", "applied_at"] as const) {
-    if (!columns.has(requiredColumn)) {
-      fail(`schema_migrations is missing required column ${requiredColumn}`);
+  const columns = tableInfo(database, "schema_migrations");
+  const expected = columns.some((column) => column.name === "checksum")
+    ? requiredTableColumns.schema_migrations
+    : requiredTableColumns.schema_migrations.filter((column) => column.name !== "checksum");
+  if (columns.length !== expected.length) {
+    fail("schema_migrations has an altered column layout");
+  }
+  for (const requiredColumn of expected) {
+    const actual = columns.find((column) => column.name === requiredColumn.name);
+    if (actual === undefined) {
+      fail(`schema_migrations is missing required column ${requiredColumn.name}`);
+    }
+    if (actual.type.toUpperCase() !== requiredColumn.type) {
+      fail(`schema_migrations column ${requiredColumn.name} has an altered declared type`);
     }
   }
-  return columns.has("checksum");
+  return expected.length === requiredTableColumns.schema_migrations.length;
 }
+
+function assertTableColumns(database: Database, table: string, expected: readonly ColumnDefinition[]): void {
+  const actual = tableInfo(database, table);
+  if (actual.length !== expected.length) {
+    fail(`required table ${table} has an altered column layout`);
+  }
+  for (const [index, requiredColumn] of expected.entries()) {
+    const actualColumn = table === "schema_migrations"
+      ? actual.find((column) => column.name === requiredColumn.name)
+      : actual[index];
+    if (actualColumn?.name !== requiredColumn.name) {
+      fail(`required table ${table} has an altered column layout`);
+    }
+    if (actualColumn.type.toUpperCase() !== requiredColumn.type) {
+      fail(`required table ${table} column ${requiredColumn.name} has an altered declared type`);
+    }
+  }
+}
+
+function assertForeignKeys(database: Database, table: string, expected: readonly ForeignKeyDefinition[]): void {
+  const actual = (
+    database.query(`PRAGMA foreign_key_list('${table}')`).all() as Array<{
+      table: string;
+      from: string;
+      to: string;
+    }>
+  )
+    .map((foreignKey) => `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}`)
+    .sort();
+  const required = expected.map((foreignKey) => `${foreignKey.table}:${foreignKey.from}:${foreignKey.to}`).sort();
+  if (JSON.stringify(actual) !== JSON.stringify(required)) {
+    fail(`required foreign-key relationships are missing or altered on ${table}`);
+  }
+}
+
+function normalizedSql(sql: string): string {
+  return sql
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/\s*;\s*$/, "")
+    .trim();
+}
+
+const requiredTriggerDefinitions = [
+  {
+    name: "tasks_status_insert_guard",
+    sql: "CREATE TRIGGER tasks_status_insert_guard BEFORE INSERT ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
+  },
+  {
+    name: "tasks_status_update_guard",
+    sql: "CREATE TRIGGER tasks_status_update_guard BEFORE UPDATE OF status ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
+  },
+  {
+    name: "runs_status_insert_guard",
+    sql: "CREATE TRIGGER runs_status_insert_guard BEFORE INSERT ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
+  },
+  {
+    name: "runs_status_update_guard",
+    sql: "CREATE TRIGGER runs_status_update_guard BEFORE UPDATE OF status ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
+  },
+] as const;
 
 function assertRequiredSchema(database: Database): void {
   for (const [table, columns] of Object.entries(requiredTableColumns)) {
     if (!hasTable(database, table)) {
       fail(`required table is missing: ${table}`);
     }
-
-    const actualColumns = tableColumns(database, table);
-    for (const column of columns) {
-      if (!actualColumns.has(column)) {
-        fail(`required table ${table} is missing column ${column}`);
-      }
-    }
+    assertTableColumns(database, table, columns);
+    assertForeignKeys(database, table, requiredForeignKeys[table]);
   }
 
   for (const index of requiredIndexes) {
@@ -258,13 +416,15 @@ function assertRequiredSchema(database: Database): void {
     }
   }
 
-  for (const trigger of requiredTriggers) {
-    if (
-      database
-        .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'trigger' AND name = ?")
-        .get(trigger) === null
-    ) {
-      fail(`required trigger is missing: ${trigger}`);
+  for (const trigger of requiredTriggerDefinitions) {
+    const actual = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+      .get(trigger.name) as { sql: string } | null;
+    if (actual === null) {
+      fail(`required trigger is missing: ${trigger.name}`);
+    }
+    if (normalizedSql(actual.sql) !== normalizedSql(trigger.sql)) {
+      fail(`required trigger is missing or altered: ${trigger.name}`);
     }
   }
 
@@ -302,7 +462,10 @@ function assertAppliedChecksums(
     if (migration === undefined) {
       fail(`unknown migration version ${row.version}; database requires a newer Kestrel version`);
     }
-    if (row.checksum !== expectedChecksum(migration)) {
+    const acceptedChecksums = migration.version === 1
+      ? [versionOneChecksum, historicalVersionOneChecksum]
+      : [expectedChecksum(migration)];
+    if (row.checksum === null || !acceptedChecksums.includes(row.checksum)) {
       fail(`migration ${row.version} checksum mismatch`);
     }
   }

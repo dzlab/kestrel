@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersistenceError, ValidationError } from "../src/errors";
 import { openDatabase } from "../src/store/database";
-import { migrations } from "../src/store/migrations";
+import {
+  historicalVersionOneChecksum,
+  migrationChecksum,
+  migrations,
+  versionOneChecksum,
+} from "../src/store/migrations";
 import { StoreRepository } from "../src/store/repository";
 import type { Message, ToolCall } from "../src/protocol/types";
 
@@ -54,6 +59,248 @@ function createRun(repository: StoreRepository) {
   return repository.startRun(task.id, `run-${task.id}`);
 }
 
+const historicalVersionOneSqlFrom0fed = `
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        max_steps INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, idempotency_key)
+      );
+
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      );
+
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL,
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE approvals (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      );
+    `;
+
+const historicalVersionOneSqlFrom0084a0f = `
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        max_steps INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, idempotency_key)
+      );
+
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      );
+
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL,
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE approvals (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      );
+
+      CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id);
+      CREATE INDEX idx_runs_task_id ON runs(task_id);
+      CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence_number);
+      CREATE INDEX idx_events_task_created ON events(task_id, created_at);
+      CREATE INDEX idx_events_run_created ON events(run_id, created_at);
+      CREATE INDEX idx_memories_created ON memories(created_at);
+      CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
+      CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
+function createHistoricalDatabase(
+  path: string,
+  sql: string,
+  checksum: string | null,
+  seed: (database: Database) => void,
+): void {
+  const database = new Database(path);
+  database.exec(sql);
+  if (checksum === null) {
+    database.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    database.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(1, 1_700_000_000_000);
+  } else {
+    database.exec(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    database
+      .query("INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)")
+      .run(1, checksum, 1_700_000_000_000);
+  }
+  seed(database);
+  database.close();
+}
+
+function expectCurrentSchema(database: Database): void {
+  expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()).toEqual(
+    expect.arrayContaining([
+      { name: "approvals" },
+      { name: "events" },
+      { name: "memories" },
+      { name: "messages" },
+      { name: "runs" },
+      { name: "schedules" },
+      { name: "schema_migrations" },
+      { name: "tasks" },
+      { name: "tool_calls" },
+    ]),
+  );
+  expect(database.query("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name").all()).toEqual(
+    expect.arrayContaining([
+      { name: "idx_approvals_call_hash" },
+      { name: "idx_events_run_created" },
+      { name: "idx_events_task_created" },
+      { name: "idx_memories_created" },
+      { name: "idx_messages_run_sequence" },
+      { name: "idx_runs_task_id" },
+      { name: "idx_schedules_due" },
+      { name: "idx_tool_calls_call_id" },
+    ]),
+  );
+}
+
 test("createTask persists the task and its initial created event", () => {
   withDatabase((_path, open) => {
     const database = open();
@@ -83,6 +330,90 @@ test("createTask persists the task and its initial created event", () => {
       maxSteps: 10,
     });
 
+  });
+});
+
+test("version one checksum is derived from the immutable original SQL", () => {
+  expect(versionOneChecksum).toBe(migrationChecksum(migrations[0].sql));
+  expect(versionOneChecksum).toBe("5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0");
+  expect(historicalVersionOneChecksum).toBe(migrationChecksum(historicalVersionOneSqlFrom0084a0f));
+});
+
+test("fresh databases contain every required table and index", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    expectCurrentSchema(database);
+  });
+});
+
+test("foreign keys reject records that reference missing parents", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO runs (id, task_id, idempotency_key, status, started_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run("orphan-run", "missing-task", "key", "running", 1),
+    ).toThrow();
+  });
+});
+
+test("store keeps integer columns and structured values in JSON text", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const task = repository.createTask({
+      title: "Typed values",
+      prompt: "Persist types",
+      workspace: "/tmp/workspace",
+      maxSteps: 7,
+    });
+    repository.saveMemory({ id: "memory-1", kind: "fact", content: "SQLite", metadata: { source: "test" } });
+
+    expect(database.query("SELECT typeof(max_steps) AS type FROM tasks WHERE id = ?").get(task.id)).toEqual({
+      type: "integer",
+    });
+    expect(database.query("SELECT typeof(metadata) AS type, metadata FROM memories WHERE id = ?").get("memory-1")).toEqual({
+      type: "text",
+      metadata: '{"source":"test"}',
+    });
+  });
+});
+
+test("events are appended in order without overwriting prior audit records", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const task = repository.createTask({
+      title: "Audit trail",
+      prompt: "Keep history",
+      workspace: "/tmp/workspace",
+      maxSteps: 1,
+    });
+    const run = repository.startRun(task.id, "event-key");
+
+    repository.appendEvent(run.id, "started", { step: 1 });
+    repository.appendEvent(run.id, "finished", { step: 2 });
+
+    expect(
+      database.query("SELECT type, payload FROM events WHERE run_id = ? ORDER BY id").all(run.id),
+    ).toEqual([
+      { type: "started", payload: '{"step":1}' },
+      { type: "finished", payload: '{"step":2}' },
+    ]);
+  });
+});
+
+test("memory search caps an oversized limit at one hundred rows", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    for (let index = 0; index < 105; index += 1) {
+      repository.saveMemory({ id: `memory-${index}`, kind: "fact", content: "bounded", metadata: {} });
+    }
+
+    expect(repository.searchMemories("bounded", 1_000)).toHaveLength(100);
   });
 });
 
@@ -294,6 +625,83 @@ test("migration rejects an altered required index", () => {
   });
 });
 
+test("migration rejects a same-name table with an altered declared type", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("ALTER TABLE tasks RENAME TO tasks_original");
+    database.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        max_steps TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    database.exec("DROP TABLE tasks_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/declared type|schema|tasks/i);
+  });
+});
+
+test("migration rejects a same-name table with a missing foreign key", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("ALTER TABLE runs RENAME TO runs_original");
+    database.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, idempotency_key)
+      )
+    `);
+    database.exec("DROP TABLE runs_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/foreign key|relationship|runs/i);
+  });
+});
+
+test("migration rejects a missing status guard", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("DROP TRIGGER tasks_status_update_guard");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/trigger|status/i);
+  });
+});
+
+test("migration rejects a same-name status guard with altered behavior", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("DROP TRIGGER tasks_status_update_guard");
+    database.exec(`
+      CREATE TRIGGER tasks_status_update_guard
+      BEFORE UPDATE OF status ON tasks
+      WHEN 1 = 0
+      BEGIN SELECT RAISE(ABORT, 'invalid task status'); END
+    `);
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/trigger|status/i);
+  });
+});
+
 test("fresh databases apply the complete migration history", () => {
   withDatabase((_path, open) => {
     const database = open();
@@ -314,17 +722,14 @@ test("fresh databases apply the complete migration history", () => {
 
 test("legacy version-1 databases upgrade without losing data", () => {
   withDatabase((path, open) => {
-    const legacy = new Database(path);
-    legacy.exec(migrations.find((migration) => migration.version === 1)?.sql ?? "");
-    legacy.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
-    legacy.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(1, 1_700_000_000_000);
-    legacy
-      .query(
-        `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run("legacy-task", "Legacy", "Keep this task", "/tmp/workspace", 3, "pending", 1_700_000_000_000, 1_700_000_000_000);
-    legacy.close();
+    createHistoricalDatabase(path, historicalVersionOneSqlFrom0fed, null, (database) => {
+      database
+        .query(
+          `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-task", "Legacy", "Keep this task", "/tmp/workspace", 3, "pending", 1_700_000_000_000, 1_700_000_000_000);
+    });
 
     const database = open();
     expect(database.query("SELECT title FROM tasks WHERE id = ?").get("legacy-task")).toEqual({ title: "Legacy" });
@@ -335,6 +740,33 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 1 },
       { version: 2 },
     ]);
+    expectCurrentSchema(database);
+  });
+});
+
+test("hardened historical version-one databases upgrade without losing data", () => {
+  withDatabase((path, open) => {
+    createHistoricalDatabase(
+      path,
+      historicalVersionOneSqlFrom0084a0f,
+      "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa",
+      (database) => {
+        database
+          .query(
+            `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run("hardened-task", "Hardened", "Keep this task", "/tmp/workspace", 4, "pending", 1_700_000_000_000, 1_700_000_000_000);
+      },
+    );
+
+    const database = open();
+    expect(database.query("SELECT title FROM tasks WHERE id = ?").get("hardened-task")).toEqual({ title: "Hardened" });
+    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
+      { version: 1 },
+      { version: 2 },
+    ]);
+    expectCurrentSchema(database);
   });
 });
 
