@@ -1,14 +1,21 @@
 export class KestrelError extends Error {
-  readonly code: string = "KESTREL_ERROR";
+  static readonly code: string = "KESTREL_ERROR";
+  readonly code!: string;
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = new.target.name;
+    Object.defineProperty(this, "code", {
+      value: (new.target as typeof KestrelError).code,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
 }
 
 export class ValidationError extends KestrelError {
-  readonly code = "VALIDATION_ERROR";
+  static readonly code = "VALIDATION_ERROR";
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -16,7 +23,7 @@ export class ValidationError extends KestrelError {
 }
 
 export class PolicyError extends KestrelError {
-  readonly code = "POLICY_ERROR";
+  static readonly code = "POLICY_ERROR";
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -24,7 +31,7 @@ export class PolicyError extends KestrelError {
 }
 
 export class ApprovalRequiredError extends KestrelError {
-  readonly code = "APPROVAL_REQUIRED";
+  static readonly code = "APPROVAL_REQUIRED";
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -32,7 +39,7 @@ export class ApprovalRequiredError extends KestrelError {
 }
 
 export class ToolExecutionError extends KestrelError {
-  readonly code = "TOOL_EXECUTION_ERROR";
+  static readonly code = "TOOL_EXECUTION_ERROR";
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -40,7 +47,7 @@ export class ToolExecutionError extends KestrelError {
 }
 
 export class PersistenceError extends KestrelError {
-  readonly code = "PERSISTENCE_ERROR";
+  static readonly code = "PERSISTENCE_ERROR";
 
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
