@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import type { Message, ToolCall } from "../protocol/types";
+import { PersistenceError, ValidationError } from "../errors";
+import type { Message, RunStatus, ToolCall } from "../protocol/types";
 
 type Row = Record<string, unknown>;
 
@@ -10,7 +11,7 @@ export type TaskRecord = {
   prompt: string;
   workspace: string;
   maxSteps: number;
-  status: string;
+  status: TaskStatus;
   createdAt: number;
   updatedAt: number;
 };
@@ -19,12 +20,14 @@ export type RunRecord = {
   id: string;
   taskId: string;
   idempotencyKey: string;
-  status: string;
+  status: RunStatus;
   startedAt: number;
   finishedAt: number | null;
 };
 
 export type ApprovalDecision = "pending" | "approved" | "denied";
+
+export type TaskStatus = "pending" | RunStatus;
 
 export type ApprovalRecord = {
   callId: string;
@@ -53,7 +56,7 @@ export type MemoryRecord = {
 export type ScheduleRecord = {
   id: string;
   prompt: string;
-  nextRunAt: number;
+  nextRunAt: number | null;
   taskId?: string | null;
   cron?: string | null;
   enabled?: boolean;
@@ -71,6 +74,58 @@ function parseJson<T>(value: unknown): T {
   return JSON.parse(String(value)) as T;
 }
 
+const runStatuses: readonly RunStatus[] = [
+  "running",
+  "completed",
+  "failed",
+  "blocked_on_approval",
+  "budget_exhausted",
+];
+
+const taskStatuses: readonly TaskStatus[] = ["pending", ...runStatuses];
+
+function parseRunStatus(value: unknown): RunStatus {
+  if (typeof value !== "string" || !runStatuses.includes(value as RunStatus)) {
+    throw new PersistenceError(`invalid persisted run status: ${String(value)}`);
+  }
+  return value as RunStatus;
+}
+
+function parseTaskStatus(value: unknown): TaskStatus {
+  if (typeof value !== "string" || !taskStatuses.includes(value as TaskStatus)) {
+    throw new PersistenceError(`invalid persisted task status: ${String(value)}`);
+  }
+  return value as TaskStatus;
+}
+
+function isBusyError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const candidate = error as { code?: unknown; message?: unknown };
+  return candidate.code === "SQLITE_BUSY" || /SQLITE_BUSY|database is locked/i.test(String(candidate.message));
+}
+
+function pause(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function immediateTransaction<T>(database: Database, callback: () => T): T {
+  let delay = 1;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      return database.transaction(callback).immediate();
+    } catch (error) {
+      if (!isBusyError(error) || attempt === 3) {
+        throw error;
+      }
+      pause(delay);
+      delay *= 2;
+    }
+  }
+  throw new PersistenceError("immediate transaction retry loop exhausted");
+}
+
 function taskFromRow(row: Row): TaskRecord {
   return {
     id: String(row.id),
@@ -78,7 +133,7 @@ function taskFromRow(row: Row): TaskRecord {
     prompt: String(row.prompt),
     workspace: String(row.workspace),
     maxSteps: Number(row.max_steps),
-    status: String(row.status),
+    status: parseTaskStatus(row.status),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
@@ -89,7 +144,7 @@ function runFromRow(row: Row): RunRecord {
     id: String(row.id),
     taskId: String(row.task_id),
     idempotencyKey: String(row.idempotency_key),
-    status: String(row.status),
+    status: parseRunStatus(row.status),
     startedAt: Number(row.started_at),
     finishedAt: row.finished_at === null || row.finished_at === undefined ? null : Number(row.finished_at),
   };
@@ -127,7 +182,7 @@ function scheduleFromRow(row: Row): ScheduleRecord {
   return {
     id: String(row.id),
     prompt: String(row.prompt),
-    nextRunAt: Number(row.next_run_at),
+    nextRunAt: row.next_run_at === null || row.next_run_at === undefined ? null : Number(row.next_run_at),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     cron: row.cron === null || row.cron === undefined ? null : String(row.cron),
     enabled: Number(row.enabled) === 1,
@@ -184,7 +239,7 @@ export class StoreRepository {
   }
 
   appendMessage(runId: string, message: Message): void {
-    const transaction = this.database.transaction(() => {
+    immediateTransaction(this.database, () => {
       const row = this.database
         .query("SELECT COALESCE(MAX(sequence_number), -1) + 1 AS sequence_number FROM messages WHERE run_id = ?")
         .get(runId) as { sequence_number: number };
@@ -192,7 +247,6 @@ export class StoreRepository {
         .query("INSERT INTO messages (run_id, sequence_number, payload, created_at) VALUES (?, ?, ?, ?)")
         .run(runId, row.sequence_number, json(message), Date.now());
     });
-    transaction();
   }
 
   appendEvent(runId: string, type: string, payload: unknown): void {
@@ -214,13 +268,16 @@ export class StoreRepository {
   }
 
   finishToolCall(runId: string, callId: string, result: unknown, state: string): void {
-    this.database
+    const update = this.database
       .query(
         `UPDATE tool_calls
          SET result = ?, state = ?, finished_at = ?
          WHERE run_id = ? AND call_id = ?`,
       )
       .run(json(result), state, Date.now(), runId, callId);
+    if (update.changes !== 1) {
+      throw new PersistenceError(`tool call ${callId} was not found for run ${runId}`);
+    }
   }
 
   saveApproval(input: ApprovalRecord): void {
@@ -288,6 +345,11 @@ export class StoreRepository {
   }
 
   searchMemories(query: string, limit: number): MemoryRecord[] {
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new ValidationError("memory search limit must be a positive integer");
+    }
+
+    const cappedLimit = Math.min(limit, 100);
     const rows = this.database
       .query(
         `SELECT * FROM memories
@@ -295,7 +357,7 @@ export class StoreRepository {
          ORDER BY created_at DESC
          LIMIT ?`,
       )
-      .all(`%${query}%`, `%${query}%`, limit) as Row[];
+      .all(`%${query}%`, `%${query}%`, cappedLimit) as Row[];
     return rows.map(memoryFromRow);
   }
 
@@ -321,7 +383,7 @@ export class StoreRepository {
   }
 
   claimDueSchedule(now: number, owner: string): ScheduleRecord | null {
-    const transaction = this.database.transaction(() => {
+    return immediateTransaction(this.database, () => {
       const row = this.database
         .query(
           `SELECT id FROM schedules
@@ -347,19 +409,18 @@ export class StoreRepository {
 
       return scheduleFromRow(this.database.query("SELECT * FROM schedules WHERE id = ?").get(row.id) as Row);
     });
-
-    return transaction();
   }
 
-  finishSchedule(id: string, nextRunAt: number | null, error: string | null): void {
-    this.database
+  finishSchedule(id: string, owner: string, nextRunAt: number | null, error: string | null): boolean {
+    const update = this.database
       .query(
         `UPDATE schedules
          SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL,
              enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
-         WHERE id = ?`,
+         WHERE id = ? AND claimed_by = ?`,
       )
-      .run(nextRunAt, error, nextRunAt, id);
+      .run(nextRunAt, error, nextRunAt, id, owner);
+    return update.changes === 1;
   }
 }
 
