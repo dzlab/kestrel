@@ -11,21 +11,17 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dlopen, FFIType } from "bun:ffi";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PolicyError, ValidationError } from "../src/errors";
 import { ApprovalManager } from "../src/policy/approvals";
 import { createFilesystemTools, resolveWorkspacePath } from "../src/tools/filesystem";
+import { getNativeFs } from "../src/tools/native-fs";
 import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
 import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES, boundToolResult } from "../src/tools/types";
 import type { ToolContext } from "../src/tools/types";
 import { validateNativeDirentHeader, validateNativeReaddirResult } from "../src/tools/secure-fs";
 import { buildToolMessage } from "../src/kernel/context";
-
-const libc = dlopen("/usr/lib/libSystem.B.dylib", {
-  mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
-});
 
 function withWorkspace<T>(callback: (workspace: string, context: ToolContext) => T | Promise<T>): T | Promise<T> {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-tools-"));
@@ -773,7 +769,7 @@ test("patch rejects non-empty lines between headers and hunks", async () => {
 test("read rejects a FIFO without blocking", async () => {
   await withWorkspace(async (workspace, context) => {
     const fifo = join(workspace, "pipe");
-    expect(libc.symbols.mkfifo(fifo, 0o600)).toBe(0);
+    expect(getNativeFs().symbols.mkfifo(fifo, 0o600)).toBe(0);
 
     const result = await Promise.race([
       createToolRegistry().execute(
@@ -1226,7 +1222,7 @@ test("direct search honors ignored directories and rejects special files", async
     writeFileSync(join(workspace, ".git", "ignored.txt"), "needle\n");
     writeFileSync(join(workspace, "node_modules", "ignored.txt"), "needle\n");
     const fifo = join(workspace, "pipe");
-    expect(libc.symbols.mkfifo(fifo, 0o600)).toBe(0);
+    expect(getNativeFs().symbols.mkfifo(fifo, 0o600)).toBe(0);
     const registry = createToolRegistry();
 
     for (const path of [".git", "node_modules", ".git/ignored.txt", "node_modules/ignored.txt"]) {
