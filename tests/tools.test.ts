@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -181,5 +182,105 @@ test("patch validates every target before changing any file", async () => {
     );
     expect(result.ok).toBe(false);
     expect(readFileSync(join(workspace, "safe.txt"), "utf8")).toBe("safe\n");
+  });
+});
+
+test("patch rolls back earlier files when a later commit operation fails", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "safe.txt"), "original\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "late-failure",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n--- /dev/null\n+++ b/newdir/child.txt\n@@ -0,0 +1 @@\n+child\n--- /dev/null\n+++ b/newdir\n@@ -0,0 +1 @@\n+file\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "safe.txt"), "utf8")).toBe("original\n");
+    expect(existsSync(join(workspace, "newdir"))).toBe(false);
+  });
+});
+
+test("patch validates deletion contents before unlinking", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "keep.txt"), "actual\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "bad-delete",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/keep.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-wrong\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "keep.txt"), "utf8")).toBe("actual\n");
+  });
+});
+
+test("patch deletes a file only after a matching full-file deletion hunk", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "remove.txt"), "remove me\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "delete",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove me\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(workspace, "remove.txt"))).toBe(false);
+  });
+});
+
+test("bounds structured tool data as well as content", async () => {
+  await withWorkspace(async (workspace, context) => {
+    for (let index = 0; index < 1_000; index += 1) {
+      writeFileSync(join(workspace, `data-${String(index).padStart(4, "0")}-${"x".repeat(200)}.txt`), "x");
+    }
+    const result = await createToolRegistry().execute(
+      { id: "list-data-big", name: "fs.list", arguments: { path: "." } },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(result.data)).byteLength).toBeLessThanOrEqual(
+      MAX_TOOL_OUTPUT_BYTES,
+    );
+    expect(result.data).not.toHaveLength(1_000);
+  });
+});
+
+test("rejects workspace symlinks even when they point back inside the workspace", async () => {
+  await withWorkspace(async (workspace, context) => {
+    mkdirSync(join(workspace, "real"));
+    writeFileSync(join(workspace, "real", "inside.txt"), "inside\n");
+    symlinkSync(join(workspace, "real"), join(workspace, "alias"));
+
+    const registry = createToolRegistry();
+    const read = await registry.execute(
+      { id: "internal-link-read", name: "fs.read", arguments: { path: "alias/inside.txt" } },
+      context,
+    );
+    const list = await registry.execute(
+      { id: "internal-link-list", name: "fs.list", arguments: { path: "alias" } },
+      context,
+    );
+
+    expect(read.ok).toBe(false);
+    expect(list.ok).toBe(false);
+    expect(read.content).toContain("symlink");
+    expect(list.content).toContain("symlink");
   });
 });

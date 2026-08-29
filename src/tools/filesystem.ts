@@ -1,17 +1,18 @@
 import {
   mkdir,
+  open,
   readdir,
-  stat,
-  writeFile,
+  rename,
+  rmdir,
+  unlink,
 } from "node:fs/promises";
 import {
-  existsSync,
+  constants,
   lstatSync,
-  readFileSync,
   realpathSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
 import type { Tool } from "./types";
@@ -22,12 +23,11 @@ import {
 } from "./types";
 import type { ToolContext, ToolResult } from "./types";
 
-function fail(error: unknown): never {
-  if (error instanceof ValidationError || error instanceof ToolExecutionError) {
-    throw error;
-  }
-  throw new ToolExecutionError(error instanceof Error ? error.message : String(error), { cause: error });
-}
+const NO_FOLLOW = constants.O_NOFOLLOW;
+const READ_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | NO_FOLLOW;
+const READ_FILE_FLAGS = constants.O_RDONLY | NO_FOLLOW;
+const WRITE_FILE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NO_FOLLOW;
+const CREATE_FILE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW;
 
 function stringArgument(args: Record<string, unknown>, name: string): string {
   const value = args[name];
@@ -78,6 +78,27 @@ function nearestExistingRealpath(candidate: string): { path: string; missing: st
   }
 }
 
+function checkNoSymlinkComponents(workspace: string, candidate: string): void {
+  const remainder = relative(workspace, candidate);
+  if (remainder.length === 0) return;
+  if (remainder.startsWith(`..${sep}`) || remainder === ".." || isAbsolute(remainder)) {
+    throw new ValidationError("path resolves outside workspace");
+  }
+
+  let current = workspace;
+  for (const component of remainder.split(sep)) {
+    current = join(current, component);
+    try {
+      const entry = lstatSync(current);
+      if (entry.isSymbolicLink()) throw new ValidationError("workspace path contains a symlink");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (error instanceof ValidationError || (code !== "ENOENT" && code !== "ENOTDIR")) throw error;
+      break;
+    }
+  }
+}
+
 export function resolveWorkspacePath(workspace: string, requested: string): string {
   if (typeof workspace !== "string" || workspace.length === 0) {
     throw new ValidationError("workspace must be a non-empty path");
@@ -96,7 +117,8 @@ export function resolveWorkspacePath(workspace: string, requested: string): stri
     throw new ValidationError("workspace does not exist", { cause: error });
   }
 
-  const lexical = resolve(workspace, requested);
+  const lexical = isAbsolute(requested) ? resolve(requested) : resolve(workspaceRealpath, requested);
+  checkNoSymlinkComponents(workspaceRealpath, lexical);
   let canonical: string;
   try {
     const existing = nearestExistingRealpath(lexical);
@@ -110,6 +132,7 @@ export function resolveWorkspacePath(workspace: string, requested: string): stri
   if (!isWithin(workspaceRealpath, canonical)) {
     throw new ValidationError("path resolves outside workspace");
   }
+  checkNoSymlinkComponents(workspaceRealpath, canonical);
   return canonical;
 }
 
@@ -119,6 +142,129 @@ function relativePath(workspace: string, filePath: string): string {
 
 function result(content: string, data?: unknown): ToolResult {
   return boundToolResult({ ok: true, content, ...(data === undefined ? {} : { data }) });
+}
+
+async function withOpenFile<T>(path: string, callback: (handle: Awaited<ReturnType<typeof open>>) => Promise<T>): Promise<T> {
+  // O_NOFOLLOW makes the final component fail closed if it is replaced by a
+  // symlink. Node/Bun expose no openat-style parent directory traversal, so
+  // callers also validate canonical components immediately before opening.
+  const handle = await open(path, READ_FILE_FLAGS);
+  try {
+    return await callback(handle);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function readWorkspaceText(path: string): Promise<{ content: string; truncated: boolean }> {
+  return withOpenFile(path, async (handle) => {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new ToolExecutionError("path is not a regular file");
+    const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+    const content = buffer.subarray(0, bytesRead).toString("utf8");
+    return { content: truncateUtf8(content, MAX_READ_BYTES), truncated: bytesRead > MAX_READ_BYTES };
+  });
+}
+
+export async function workspacePathInfo(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean }> {
+  return withOpenFile(path, async (handle) => handle.stat());
+}
+
+async function readWorkspaceTextForPatch(path: string): Promise<string> {
+  const read = await readWorkspaceText(path);
+  if (read.truncated) throw new ToolExecutionError("patch target exceeds the bounded read limit");
+  return read.content;
+}
+
+async function assertSafeDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, READ_DIRECTORY_FLAGS);
+  try {
+    const info = await handle.stat();
+    if (!info.isDirectory()) throw new ToolExecutionError("path is not a directory");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function ensureSafeDirectory(workspace: string, directory: string): Promise<string[]> {
+  const workspaceRealpath = realpathSync(workspace);
+  const remainder = relative(workspaceRealpath, directory);
+  if (!isWithin(workspaceRealpath, directory)) {
+    throw new ValidationError("path resolves outside workspace");
+  }
+  if (remainder.length === 0) {
+    await assertSafeDirectory(workspaceRealpath);
+    return [];
+  }
+
+  const created: string[] = [];
+  let current = workspaceRealpath;
+  await assertSafeDirectory(current);
+  for (const component of remainder.split(sep)) {
+    current = join(current, component);
+    let made = false;
+    try {
+      await mkdir(current);
+      made = true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+    }
+    await assertSafeDirectory(current);
+    if (made) created.push(current);
+  }
+  return created;
+}
+
+function safeLstat(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export async function safeDirectoryEntries(path: string): Promise<Dirent[]> {
+  const handle = await open(path, READ_DIRECTORY_FLAGS);
+  try {
+    // Node/Bun do not expose readdir/openat relative to an already-open directory
+    // handle. Keep the no-follow handle open while revalidating and listing the
+    // canonical path; this narrows the final-component race, but a hostile
+    // process can still replace a parent component between these pathname calls.
+    await handle.stat();
+    const checked = lstatSync(path);
+    if (checked.isSymbolicLink() || !checked.isDirectory()) {
+      throw new ValidationError("workspace path is not a safe directory");
+    }
+    const entries = await readdir(path, { encoding: "utf8", withFileTypes: true });
+    return entries;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeWorkspaceText(workspace: string, path: string, content: string): Promise<void> {
+  await ensureSafeDirectory(workspace, dirname(path));
+  const handle = await open(path, WRITE_FILE_FLAGS, 0o666);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new ToolExecutionError("path is not a regular file");
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function removeTaskFile(path: string): Promise<void> {
+  // unlinkat(dirfd, ...) is not exposed by Node/Bun. Restrict this fallback to
+  // exact, generated regular-file paths; an external parent replacement remains
+  // an unavoidable TOCTOU limitation of the available APIs.
+  const entry = safeLstat(path);
+  if (entry === null || entry.isSymbolicLink() || !entry.isFile()) return;
+  await unlink(path);
 }
 
 function fileDefinition(name: string, description: string, properties: Record<string, unknown>, required: string[]): Tool["definition"] {
@@ -134,7 +280,7 @@ const listTool: Tool = {
   definition: fileDefinition("fs.list", "List entries in a workspace directory.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
-    const entries = (await readdir(path, { withFileTypes: true }))
+    const entries = (await safeDirectoryEntries(path))
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((entry) => ({
         name: entry.name,
@@ -148,14 +294,8 @@ const readTool: Tool = {
   definition: fileDefinition("fs.read", "Read bounded UTF-8 text from a workspace file.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
-    const info = await stat(path);
-    if (!info.isFile()) {
-      throw new ToolExecutionError("path is not a regular file");
-    }
-    const content = await Bun.file(path).slice(0, MAX_READ_BYTES + 1).text();
-    const truncated = Buffer.byteLength(content, "utf8") > MAX_READ_BYTES;
-    const bounded = truncateUtf8(content, MAX_READ_BYTES);
-    return result(bounded, { path: relativePath(context.workspace, path), truncated });
+    const read = await readWorkspaceText(path);
+    return result(read.content, { path: relativePath(context.workspace, path), truncated: read.truncated });
   },
 };
 
@@ -170,9 +310,9 @@ const writeTool: Tool = {
     const requested = stringArgument(args, "path");
     const content = stringArgument(args, "content");
     const path = resolveWorkspacePath(context.workspace, requested);
-    await mkdir(dirname(path), { recursive: true });
+    await ensureSafeDirectory(context.workspace, dirname(path));
     const finalPath = resolveWorkspacePath(context.workspace, requested);
-    await writeFile(finalPath, content, "utf8");
+    await writeWorkspaceText(context.workspace, finalPath, content);
     return result(`wrote ${relativePath(context.workspace, finalPath)}`, {
       path: relativePath(context.workspace, finalPath),
       bytes: Buffer.byteLength(content, "utf8"),
@@ -259,6 +399,9 @@ function parsePatch(patch: string): FilePatch[] {
     if (hunks.length === 0 && oldPath !== null && newPath !== null) {
       throw new ValidationError("patch file has no hunks");
     }
+    if (hunks.length === 0 && newPath === null) {
+      throw new ValidationError("deletion patch has no hunks");
+    }
     files.push({ oldPath, newPath, hunks });
   }
   if (files.length === 0) {
@@ -296,7 +439,7 @@ function applyHunks(original: string, hunks: Hunk[]): string {
   }
   output.push(...oldLines.slice(cursor));
   const patched = output.join("\n");
-  return hadTrailingNewline ? `${patched}\n` : patched;
+  return hadTrailingNewline && patched.length > 0 ? `${patched}\n` : patched;
 }
 
 const patchTool: Tool = {
@@ -312,25 +455,129 @@ const patchTool: Tool = {
       return { file, path: newPath ?? oldPath };
     });
 
-    const changes = resolved.map(({ file, path }) => {
+    const seen = new Set<string>();
+    const changes = [] as Array<{
+      file: FilePatch;
+      path: string;
+      isDelete: boolean;
+      existed: boolean;
+      content: string | null;
+    }>;
+    for (const { file, path } of resolved) {
       if (path === null) throw new ValidationError("patch target is missing");
-      const isDelete = file.newPath === null;
-      const original = existsSync(path) ? readFileSync(path, "utf8") : "";
-      if (Buffer.byteLength(original, "utf8") > MAX_READ_BYTES) {
-        throw new ToolExecutionError("patch target exceeds the bounded read limit");
-      }
-      return { file, path, isDelete, content: isDelete ? null : applyHunks(original, file.hunks) };
-    });
+      if (seen.has(path)) throw new ValidationError("patch contains duplicate file targets");
+      seen.add(path);
 
-    for (const change of changes) {
-      if (change.isDelete) {
-        if (existsSync(change.path)) unlinkSync(change.path);
-      } else {
-        await mkdir(dirname(change.path), { recursive: true });
-        const finalPath = resolveWorkspacePath(context.workspace, change.file.newPath ?? change.file.oldPath ?? "");
-        writeFileSync(finalPath, change.content ?? "", "utf8");
+      const isDelete = file.newPath === null;
+      const entry = safeLstat(path);
+      const existed = entry !== null;
+      if (entry !== null && (entry.isSymbolicLink() || !entry.isFile())) {
+        throw new ToolExecutionError("patch target is not a regular file");
+      }
+      if ((file.oldPath === null) === existed) {
+        throw new ValidationError(isDelete ? "cannot delete a missing file" : "patch target already exists or is missing");
+      }
+
+      const original = existed ? await readWorkspaceTextForPatch(path) : "";
+      const patched = applyHunks(original, file.hunks);
+      if (isDelete && patched !== "") {
+        throw new ValidationError("deletion patch must match and remove the entire file");
+      }
+      changes.push({ file, path, isDelete, existed, content: isDelete ? null : patched });
+    }
+
+    const staged: Array<{ change: (typeof changes)[number]; tempPath: string | null; backupPath: string | null; backupMade: boolean; installed: boolean }> = [];
+    const createdDirectories: string[] = [];
+    try {
+      for (const change of changes) {
+        const directory = dirname(change.path);
+        createdDirectories.push(...await ensureSafeDirectory(context.workspace, directory));
+        let tempPath: string | null = null;
+        if (!change.isDelete) {
+          tempPath = join(directory, `.kestrel-patch-${randomUUID()}.tmp`);
+          try {
+            const handle = await open(tempPath, CREATE_FILE_FLAGS, 0o600);
+            try {
+              await handle.writeFile(change.content ?? "", "utf8");
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          } catch (error) {
+            try {
+              await removeTaskFile(tempPath);
+            } catch {
+              // Cleanup is limited to this generated temporary path.
+            }
+            throw error;
+          }
+        }
+        staged.push({ change, tempPath, backupPath: null, backupMade: false, installed: false });
+      }
+
+      for (const item of staged) {
+        const { change } = item;
+        // The public Node/Bun APIs have no descriptor-relative rename/unlink
+        // operation. Revalidate every component and use same-directory renames;
+        // O_NOFOLLOW protects opened files, while a hostile parent replacement
+        // between these calls remains an OS/API limitation documented here.
+        checkNoSymlinkComponents(realpathSync(context.workspace), change.path);
+        const current = safeLstat(change.path);
+        if (change.existed && (current === null || current.isSymbolicLink() || !current.isFile())) {
+          throw new ToolExecutionError("patch target changed during staging");
+        }
+        if (!change.existed && current !== null) {
+          throw new ToolExecutionError("patch target appeared during staging");
+        }
+
+        if (change.existed) {
+          item.backupPath = join(dirname(change.path), `.kestrel-patch-${randomUUID()}.bak`);
+          await rename(change.path, item.backupPath);
+          item.backupMade = true;
+        }
+        if (item.tempPath !== null) {
+          await rename(item.tempPath, change.path);
+          item.installed = true;
+        }
+      }
+
+    } catch (error) {
+      for (const item of [...staged].reverse()) {
+        try {
+          if (item.installed) await removeTaskFile(item.change.path);
+          if (item.backupMade && item.backupPath !== null) await rename(item.backupPath, item.change.path);
+        } catch {
+          // Best-effort rollback cannot solve an external concurrent rename;
+          // never broaden cleanup to an untracked path.
+        }
+      }
+      throw error;
+    } finally {
+      for (const item of staged) {
+        if (item.tempPath !== null) {
+          try {
+            await removeTaskFile(item.tempPath);
+          } catch {
+            // Cleanup is limited to this generated temporary path.
+          }
+        }
+        if (item.backupPath !== null) {
+          try {
+            await removeTaskFile(item.backupPath);
+          } catch {
+            // Cleanup is limited to this generated backup path.
+          }
+        }
+      }
+      for (const directory of [...createdDirectories].reverse()) {
+        try {
+          await rmdir(directory);
+        } catch {
+          // Only directories created by this patch are considered for cleanup.
+        }
       }
     }
+
     const paths = changes.map((change) => relativePath(context.workspace, change.path));
     return result(`patched ${paths.length} file(s)`, paths);
   },

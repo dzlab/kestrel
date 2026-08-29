@@ -1,8 +1,7 @@
-import { readdir, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 import { ValidationError } from "../errors";
-import { resolveWorkspacePath } from "./filesystem";
+import { readWorkspaceText, resolveWorkspacePath, safeDirectoryEntries, workspacePathInfo } from "./filesystem";
 import type { Tool } from "./types";
 import {
   MAX_READ_BYTES,
@@ -32,7 +31,7 @@ function boundedMatches(matches: Match[]): Match[] {
 }
 
 async function collectFiles(workspace: string, root: string, files: string[]): Promise<void> {
-  const entries = (await readdir(root, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name));
+  const entries = (await safeDirectoryEntries(root)).sort((left, right) => left.name.localeCompare(right.name));
   for (const entry of entries) {
     if (entry.name === ".git" || entry.name === "node_modules") continue;
     if (entry.isSymbolicLink()) continue;
@@ -59,7 +58,7 @@ const searchTool: Tool = {
     if (query.length === 0) throw new ValidationError("query must be non-empty");
     const requestedPath = args.path === undefined ? "." : stringArgument(args, "path");
     const root = resolveWorkspacePath(context.workspace, requestedPath);
-    const rootInfo = await stat(root);
+    const rootInfo = await workspacePathInfo(root);
     const files: string[] = [];
     if (rootInfo.isDirectory()) await collectFiles(context.workspace, root, files);
     else if (rootInfo.isFile()) files.push(root);
@@ -67,7 +66,7 @@ const searchTool: Tool = {
     const matches: Match[] = [];
     for (const file of files) {
       if (matches.length >= MAX_SEARCH_MATCHES) break;
-      const text = await Bun.file(file).slice(0, MAX_READ_BYTES).text();
+      const text = (await readWorkspaceText(file)).content;
       const lines = text.split("\n");
       for (let index = 0; index < lines.length && matches.length < MAX_SEARCH_MATCHES; index += 1) {
         if (lines[index].includes(query)) {
