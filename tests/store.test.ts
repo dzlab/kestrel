@@ -1275,6 +1275,18 @@ test("migration rejects a historical status expression with altered behavior", (
   });
 });
 
+test("migration rejects a legacy schema without the inline tool-call uniqueness", () => {
+  withDatabase((path) => {
+    const alteredLegacySql = historicalVersionOneSqlFrom0fed.replace(
+      "call_id TEXT NOT NULL UNIQUE",
+      "call_id TEXT NOT NULL",
+    );
+    createHistoricalDatabase(path, alteredLegacySql, null, () => {});
+
+    expect(() => openDatabase(path)).toThrow(/lineage|tool.?calls|unique|schema/i);
+  });
+});
+
 test("migration rejects a current schema carrying the historical v1 checksum", () => {
   withDatabase((path, open) => {
     open().close();
@@ -1582,11 +1594,12 @@ const database = new Database(process.argv[1]);
 database.exec("PRAGMA busy_timeout = 0");
 database.exec("BEGIN IMMEDIATE");
 console.log("locked");
-setTimeout(() => { database.exec("ROLLBACK"); database.close(); }, 20);`,
+setTimeout(() => { database.exec("ROLLBACK"); database.close(); }, 5);`,
       path,
     ], { stdout: "pipe", stderr: "pipe" });
-    const output = await new Response(child.stdout).text();
-    expect(output).toContain("locked");
+    const reader = child.stdout.getReader();
+    const firstOutput = await reader.read();
+    expect(new TextDecoder().decode(firstOutput.value)).toContain("locked");
 
     secondDatabase.exec("PRAGMA busy_timeout = 0");
     secondRepository.appendEvent(run.id, "retried", { ok: true });

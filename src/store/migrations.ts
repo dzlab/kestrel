@@ -801,18 +801,21 @@ type SchemaLineage = {
   checksum: string;
   hasIndexes: boolean;
   hasInlineStatusChecks: boolean;
+  hasInlineToolCallUnique: boolean;
 };
 
 const originalVersionOneLineage: SchemaLineage = {
   checksum: versionOneChecksum,
   hasIndexes: false,
   hasInlineStatusChecks: false,
+  hasInlineToolCallUnique: true,
 };
 
 const hardenedVersionOneLineage: SchemaLineage = {
   checksum: historicalVersionOneChecksum,
   hasIndexes: true,
   hasInlineStatusChecks: true,
+  hasInlineToolCallUnique: false,
 };
 
 const taskStatusValues = "'pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted'";
@@ -846,6 +849,22 @@ function expectedLineageTableSql(table: "tasks" | "runs", hasInlineStatusChecks:
       started_at INTEGER NOT NULL,
       finished_at INTEGER,
       UNIQUE (task_id, idempotency_key)
+    )
+  `);
+}
+
+function expectedLineageToolCallsSql(hasInlineUnique: boolean): string {
+  return normalizedSql(`
+    CREATE TABLE tool_calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      call_id TEXT NOT NULL${hasInlineUnique ? " UNIQUE" : ""},
+      name TEXT NOT NULL,
+      arguments TEXT NOT NULL,
+      state TEXT NOT NULL,
+      result TEXT,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER
     )
   `);
 }
@@ -895,7 +914,7 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
     assertTableUniqueConstraints(database);
   }
 
-  for (const table of ["tasks", "runs"]) {
+  for (const table of ["tasks", "runs"] as const) {
     const row = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(table) as { sql: string } | null;
@@ -909,6 +928,16 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
 
   if (!checkIndexes) {
     return;
+  }
+
+  const toolCalls = database
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'")
+    .get() as { sql: string } | null;
+  if (
+    toolCalls === null ||
+    normalizedSql(toolCalls.sql) !== expectedLineageToolCallsSql(lineage.hasInlineToolCallUnique)
+  ) {
+    fail("migration 1 checksum does not match the schema lineage for tool_calls");
   }
 
   const actualIndexes = database
