@@ -702,6 +702,25 @@ test("migration rejects a same-name status guard with altered behavior", () => {
   });
 });
 
+test("migration rejects a current schema carrying the historical v1 checksum", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.query("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run(historicalVersionOneChecksum);
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/lineage|schema|checksum/i);
+  });
+});
+
+test("migration rejects a historical schema carrying the current v1 checksum", () => {
+  withDatabase((path, open) => {
+    createHistoricalDatabase(path, historicalVersionOneSqlFrom0084a0f, versionOneChecksum, () => {});
+
+    expect(() => openDatabase(path)).toThrow(/lineage|schema|checksum/i);
+  });
+});
+
 test("fresh databases apply the complete migration history", () => {
   withDatabase((_path, open) => {
     const database = open();
@@ -709,8 +728,10 @@ test("fresh databases apply the complete migration history", () => {
       .query("SELECT version, checksum FROM schema_migrations ORDER BY version")
       .all() as Array<{ version: number; checksum: string }>;
 
-    expect(versions.map((migration) => migration.version)).toEqual([1, 2]);
-    expect(versions.every((migration) => migration.checksum.length === 64)).toBe(true);
+    expect(versions).toEqual([
+      { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
+      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
+    ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
     });
@@ -740,6 +761,10 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 1 },
       { version: 2 },
     ]);
+    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
+      { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
+      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
+    ]);
     expectCurrentSchema(database);
   });
 });
@@ -765,6 +790,10 @@ test("hardened historical version-one databases upgrade without losing data", ()
     expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1 },
       { version: 2 },
+    ]);
+    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
+      { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
+      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
     ]);
     expectCurrentSchema(database);
   });

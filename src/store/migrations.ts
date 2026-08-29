@@ -100,6 +100,109 @@ const versionOneSql = `
       );
     `;
 
+// This is the byte-for-byte v1 SQL shipped in 0084a0f. That release folded
+// the indexes into v1, added status CHECK constraints, and moved tool-call
+// uniqueness to an explicit index.
+const historicalVersionOneSql = `
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        max_steps INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE (task_id, idempotency_key)
+      );
+
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      );
+
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        prompt TEXT NOT NULL,
+        cron TEXT,
+        next_run_at INTEGER,
+        enabled INTEGER NOT NULL,
+        claimed_by TEXT,
+        claimed_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE approvals (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      );
+
+      CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id);
+      CREATE INDEX idx_runs_task_id ON runs(task_id);
+      CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence_number);
+      CREATE INDEX idx_events_task_created ON events(task_id, created_at);
+      CREATE INDEX idx_events_run_created ON events(run_id, created_at);
+      CREATE INDEX idx_memories_created ON memories(created_at);
+      CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
+      CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
 const versionTwoSql = `
       CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_call_id ON tool_calls(call_id);
       CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
@@ -277,7 +380,9 @@ function fail(message: string): never {
 }
 
 function prepareVersionTwo(database: Database): void {
-  if (tableInfo(database, "schema_migrations").some((column) => column.name === "checksum")) {
+  const hasChecksum = tableInfo(database, "schema_migrations").some((column) => column.name === "checksum");
+  assertPreVersionTwoLineage(database, hasChecksum);
+  if (hasChecksum) {
     return;
   }
 
@@ -366,6 +471,95 @@ function normalizedSql(sql: string): string {
     .replace(/\s+/g, " ")
     .replace(/\s*;\s*$/, "")
     .trim();
+}
+
+type SchemaLineage = {
+  checksum: string;
+  tableDefinitions: ReadonlyMap<string, string>;
+  indexDefinitions: ReadonlyMap<string, string>;
+};
+
+function definitionsFromSql(sql: string, pattern: RegExp): ReadonlyMap<string, string> {
+  const definitions = new Map<string, string>();
+  for (const match of sql.matchAll(pattern)) {
+    definitions.set(match[1], normalizedSql(match[0]));
+  }
+  return definitions;
+}
+
+const tableDefinitionPattern = /CREATE TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([\s\S]*?\)\s*;/gi;
+const indexDefinitionPattern = /CREATE\s+(?:UNIQUE\s+)?INDEX\s+([A-Za-z_][A-Za-z0-9_]*)\s+ON\s+[A-Za-z_][A-Za-z0-9_]*\s*\([\s\S]*?\)\s*;/gi;
+
+const originalVersionOneLineage: SchemaLineage = {
+  checksum: versionOneChecksum,
+  tableDefinitions: definitionsFromSql(versionOneSql, tableDefinitionPattern),
+  indexDefinitions: definitionsFromSql(versionOneSql, indexDefinitionPattern),
+};
+
+const hardenedVersionOneLineage: SchemaLineage = {
+  checksum: historicalVersionOneChecksum,
+  tableDefinitions: definitionsFromSql(historicalVersionOneSql, tableDefinitionPattern),
+  indexDefinitions: definitionsFromSql(historicalVersionOneSql, indexDefinitionPattern),
+};
+
+const schemaLineages = new Map<string, SchemaLineage>([
+  [originalVersionOneLineage.checksum, originalVersionOneLineage],
+  [hardenedVersionOneLineage.checksum, hardenedVersionOneLineage],
+]);
+
+function appliedVersionOneChecksum(database: Database): string | null {
+  const row = database
+    .query("SELECT checksum FROM schema_migrations WHERE version = 1")
+    .get() as { checksum: string | null } | null;
+  return row?.checksum ?? null;
+}
+
+function schemaLineageFor(database: Database, hasChecksum: boolean): SchemaLineage {
+  if (!hasChecksum) {
+    return originalVersionOneLineage;
+  }
+  const checksum = appliedVersionOneChecksum(database);
+  const lineage = checksum === null ? undefined : schemaLineages.get(checksum);
+  if (lineage === undefined) {
+    fail("migration 1 checksum does not identify a supported schema lineage");
+  }
+  return lineage;
+}
+
+function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIndexes: boolean): void {
+  for (const [table, expectedSql] of lineage.tableDefinitions) {
+    const actual = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) as { sql: string } | null;
+    if (actual === null || normalizedSql(actual.sql) !== expectedSql) {
+      fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
+    }
+  }
+
+  if (!checkIndexes) {
+    return;
+  }
+
+  const actualIndexes = new Map(
+    (
+      database
+        .query("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
+        .all() as Array<{ name: string; sql: string }>
+    ).map((index) => [index.name, normalizedSql(index.sql)]),
+  );
+  if (actualIndexes.size !== lineage.indexDefinitions.size) {
+    fail("migration 1 checksum does not match the schema lineage indexes");
+  }
+  for (const [name, expectedSql] of lineage.indexDefinitions) {
+    if (actualIndexes.get(name) !== expectedSql) {
+      fail(`migration 1 checksum does not match the schema lineage index ${name}`);
+    }
+  }
+}
+
+function assertPreVersionTwoLineage(database: Database, hasChecksum: boolean): void {
+  const lineage = schemaLineageFor(database, hasChecksum);
+  assertLineageSchema(database, lineage, true);
 }
 
 const requiredTriggerDefinitions = [
@@ -538,6 +732,7 @@ export function runMigrations(database: Database): void {
         checksum: string | null;
       }>,
     );
+    assertLineageSchema(database, schemaLineageFor(database, true), false);
     assertRequiredSchema(database);
   });
 
