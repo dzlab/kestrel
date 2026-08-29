@@ -77,6 +77,22 @@ test("registry rejects malformed tool schemas instead of silently accepting argu
   expect(() => new ToolRegistry([tool])).toThrow(ValidationError);
 });
 
+test("registry rejects tool schemas whose root is not an object", () => {
+  const tool = {
+    definition: {
+      name: "scalar-input",
+      description: "scalar input",
+      capability: "filesystem",
+      inputSchema: { type: "string" },
+    },
+    async execute() {
+      return { ok: true, content: "executed" };
+    },
+  };
+
+  expect(() => new ToolRegistry([tool])).toThrow(ValidationError);
+});
+
 test("lists and reads workspace files with a bounded read", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "small.txt"), "hello");
@@ -735,7 +751,8 @@ test("patch fails closed when a target parent directory is replaced after instal
     const backups = readdirSync(originalParent).filter((name) => name.endsWith(".bak"));
     expect(backups).toHaveLength(1);
     expect(readFileSync(join(originalParent, backups[0]!), "utf8")).toBe("original\n");
-    expect(result.content).toContain("recovery backup");
+    expect(result.content).toContain("held original patch parent");
+    expect(result.content).not.toContain(`nested/${backups[0]}`);
   });
 });
 

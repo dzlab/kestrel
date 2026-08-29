@@ -112,6 +112,9 @@ export class ToolRegistry {
     if (typeof tool.definition.capability !== "string" || tool.definition.capability.length === 0) {
       throw new ValidationError(`tool definition capability must be non-empty: ${name}`);
     }
+    if (!isRecord(tool.definition.inputSchema) || tool.definition.inputSchema.type !== "object") {
+      throw new ValidationError(`tool ${name} inputSchema must be an object schema`);
+    }
     validateSchemaDefinition(tool.definition.inputSchema, `tool ${name} inputSchema`);
     this.tools.set(name, tool);
   }

@@ -525,7 +525,7 @@ async function unlinkVerifiedPath(
 }
 
 type PatchRecoveryItem = {
-  change: { existed: boolean; originalFd: number | null };
+  change: { existed: boolean; originalFd: number | null; path: string };
   parent: ReturnType<typeof openSecureParent>;
   tempFd: number | null;
   backupName: string | null;
@@ -534,6 +534,18 @@ type PatchRecoveryItem = {
   backupMade: boolean;
   backupRetained: boolean;
 };
+
+function retainedRecoveryLocation(workspace: string, item: PatchRecoveryItem): string {
+  if (item.backupName !== null) {
+    try {
+      revalidateSecureParent(workspace, item.parent);
+      return relativePath(workspace, join(dirname(item.change.path), item.backupName));
+    } catch {
+      // The held parent may have been renamed, so its original pathname is stale.
+    }
+  }
+  return "the held original patch parent";
+}
 
 function recoverySourceFd(item: PatchRecoveryItem): number {
   const sourceFd = item.change.existed ? item.change.originalFd : item.tempFd;
@@ -804,7 +816,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
               error = new ToolExecutionError("patch recovery backup could not be retained", { cause: recoveryError });
             }
             throw new ToolExecutionError(
-              `patch applied but backup cleanup failed; recovery backup retained at ${relativePath(context.workspace, join(dirname(item.change.path), item.backupName))}`,
+              `patch applied but backup cleanup failed; recovery backup retained at ${retainedRecoveryLocation(context.workspace, item)}`,
               { cause: error },
             );
           }
@@ -879,9 +891,9 @@ function patchTool(hooks: PatchHooks = {}): Tool {
               item.backupMade = false;
             } else if (item.backupRetained) {
               rollbackFailures.push(
-                `${relativePath(context.workspace, item.change.path)} recovery backup retained at ${relativePath(
+                `${relativePath(context.workspace, item.change.path)} recovery backup retained at ${retainedRecoveryLocation(
                   context.workspace,
-                  join(dirname(item.change.path), item.backupName),
+                  item,
                 )}`,
               );
             } else {
@@ -907,7 +919,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       if (rollbackFailures.length > 0) {
         const retained = staged
           .filter((item) => item.backupRetained && item.backupName !== null)
-          .map((item) => relativePath(context.workspace, join(dirname(item.change.path), item.backupName!)));
+          .map((item) => retainedRecoveryLocation(context.workspace, item));
         throw new ToolExecutionError(
           `patch failed and rollback was incomplete: ${rollbackFailures.join("; ")}; recovery backup retained at ${retained.join(", ") || "the original patch directory"}`,
           { cause: error },
