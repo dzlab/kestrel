@@ -10,6 +10,8 @@ export const MAX_SEARCH_MATCHES = 100;
 export type ToolContext = {
   workspace: string;
   runId: string;
+  toolCallId?: string;
+  approvalConsumed?: boolean;
   taskId?: string | null;
   userId?: string;
   repository: Repository;

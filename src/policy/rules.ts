@@ -31,6 +31,7 @@ const knownRules: Readonly<Record<string, Rule>> = {
   "self.modify": { capability: "self-modification", risk: "high" },
   "self.upgrade": { capability: "self-modification", risk: "high" },
   "self.apply": { capability: "self-modification", risk: "high" },
+  "self.status": { capability: "self-inspection", risk: "low" },
   "memory.search": { capability: "memory", risk: "low" },
   "memory.save": { capability: "memory", risk: "standard" },
   "schedule.list": { capability: "scheduler", risk: "low" },
@@ -221,7 +222,7 @@ function hasExternalPath(args: Record<string, unknown>, workspace: string): bool
 function selfModifying(definition: ToolDefinition, args: Record<string, unknown>, context: PolicyContext): boolean {
   const capability = definition.capability.toLowerCase().replace(/_/gu, "-");
   if (capability === "self-modification" || capability === "self") return true;
-  if (definition.name.startsWith("self.")) return true;
+  if (definition.name.startsWith("self.") && definition.name !== "self.status") return true;
   if (args.selfModifying === true || args.selfModification === true) return true;
   const operation = args.operation;
   if (typeof operation === "string" && /self[- ]?modif|upgrade|apply/iu.test(operation)) return true;

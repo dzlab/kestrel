@@ -10,6 +10,7 @@ import { createSearchTool } from "./search";
 import { createShellTools } from "./shell";
 import { createMemoryTools } from "../memory/tools";
 import { createScheduleTools } from "./schedule";
+import { createUpgradeTools } from "../upgrade/tools";
 import { boundToolResult } from "./types";
 import { isTrustedBuiltInTool } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
@@ -127,13 +128,21 @@ export class ToolRegistry {
   private readonly policyContext?: ToolRegistryOptions["policyContext"];
 
   constructor(
-    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool(), ...createShellTools(), ...createMemoryTools(), ...createScheduleTools()],
+    tools?: readonly Tool[],
     options: ToolRegistryOptions = {},
   ) {
     this.policyEngine = options.policyEngine ?? new PolicyEngine();
     this.approvals = options.approvals;
     this.policyContext = options.policyContext;
-    for (const tool of tools) {
+    const registeredTools = tools ?? [
+      ...createFilesystemTools(),
+      createSearchTool(),
+      ...createShellTools(),
+      ...createMemoryTools(),
+      ...createScheduleTools(),
+      ...createUpgradeTools(options.approvals),
+    ];
+    for (const tool of registeredTools) {
       this.register(tool);
     }
   }
@@ -211,8 +220,13 @@ export class ToolRegistry {
         return failure(new ApprovalRequiredError(`approval required for ${call.name} (${call.id})`));
       }
     }
+    const executionContext: ToolContext = {
+      ...context,
+      toolCallId: call.id,
+      approvalConsumed: decision.requiresApproval,
+    };
     try {
-      return boundToolResult(await tool.execute(call.arguments, context));
+      return boundToolResult(await tool.execute(call.arguments, executionContext));
     } catch (error) {
       return boundToolResult(failure(error));
     }
