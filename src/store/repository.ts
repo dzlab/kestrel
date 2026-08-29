@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { PersistenceError, ValidationError } from "../errors";
 import type { Message, RunStatus, ToolCall } from "../protocol/types";
+import { immediateTransaction } from "./transaction";
 
 type Row = Record<string, unknown>;
 
@@ -62,11 +63,27 @@ export type ScheduleRecord = {
   enabled?: boolean;
   claimedBy?: string | null;
   claimedAt?: number | null;
+  leaseToken?: string | null;
   lastError?: string | null;
   createdAt?: number;
 };
 
+export const SCHEDULE_LEASE_TIMEOUT_MS = 60_000;
+
 function json(value: unknown): string {
+  return JSON.stringify(value) ?? "null";
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
   return JSON.stringify(value) ?? "null";
 }
 
@@ -96,34 +113,6 @@ function parseTaskStatus(value: unknown): TaskStatus {
     throw new PersistenceError(`invalid persisted task status: ${String(value)}`);
   }
   return value as TaskStatus;
-}
-
-function isBusyError(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) {
-    return false;
-  }
-  const candidate = error as { code?: unknown; message?: unknown };
-  return candidate.code === "SQLITE_BUSY" || /SQLITE_BUSY|database is locked/i.test(String(candidate.message));
-}
-
-function pause(milliseconds: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
-
-function immediateTransaction<T>(database: Database, callback: () => T): T {
-  let delay = 1;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      return database.transaction(callback).immediate();
-    } catch (error) {
-      if (!isBusyError(error) || attempt === 3) {
-        throw error;
-      }
-      pause(delay);
-      delay *= 2;
-    }
-  }
-  throw new PersistenceError("immediate transaction retry loop exhausted");
 }
 
 function taskFromRow(row: Row): TaskRecord {
@@ -158,10 +147,19 @@ function approvalFromRow(row: Row): ApprovalRecord {
     riskLevel: String(row.risk_level),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
-    decision: String(row.decision) as ApprovalDecision,
+    decision: parseApprovalDecision(row.decision),
     requestedAt: Number(row.requested_at),
     resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? null : Number(row.resolved_at),
   };
+}
+
+const approvalDecisions: readonly ApprovalDecision[] = ["pending", "approved", "denied"];
+
+function parseApprovalDecision(value: unknown): ApprovalDecision {
+  if (typeof value !== "string" || !approvalDecisions.includes(value as ApprovalDecision)) {
+    throw new PersistenceError(`invalid persisted approval decision: ${String(value)}`);
+  }
+  return value as ApprovalDecision;
 }
 
 function memoryFromRow(row: Row): MemoryRecord {
@@ -179,15 +177,19 @@ function memoryFromRow(row: Row): MemoryRecord {
 }
 
 function scheduleFromRow(row: Row): ScheduleRecord {
+  if (row.enabled !== 0 && row.enabled !== 1) {
+    throw new PersistenceError(`invalid persisted schedule enabled value: ${String(row.enabled)}`);
+  }
   return {
     id: String(row.id),
     prompt: String(row.prompt),
     nextRunAt: row.next_run_at === null || row.next_run_at === undefined ? null : Number(row.next_run_at),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     cron: row.cron === null || row.cron === undefined ? null : String(row.cron),
-    enabled: Number(row.enabled) === 1,
+    enabled: row.enabled === 1,
     claimedBy: row.claimed_by === null || row.claimed_by === undefined ? null : String(row.claimed_by),
     claimedAt: row.claimed_at === null || row.claimed_at === undefined ? null : Number(row.claimed_at),
+    leaseToken: row.lease_token === null || row.lease_token === undefined ? null : String(row.lease_token),
     lastError: row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
     createdAt: Number(row.created_at),
   };
@@ -204,7 +206,7 @@ export class StoreRepository {
   }): TaskRecord {
     const id = randomUUID();
     const timestamp = Date.now();
-    const transaction = this.database.transaction(() => {
+    immediateTransaction(this.database, () => {
       this.database
         .query(
           `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
@@ -215,7 +217,6 @@ export class StoreRepository {
         .query("INSERT INTO events (task_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
         .run(id, "created", json(input), timestamp);
     });
-    transaction();
 
     return taskFromRow(this.database.query("SELECT * FROM tasks WHERE id = ?").get(id) as Row);
   }
@@ -256,15 +257,31 @@ export class StoreRepository {
   }
 
   recordToolCall(runId: string, call: ToolCall, state: string): boolean {
+    const argumentsJson = canonicalJson(call.arguments);
     const result = this.database
       .query(
         `INSERT INTO tool_calls (run_id, call_id, name, arguments, state, created_at)
          VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT (call_id) DO NOTHING`,
       )
-      .run(runId, call.id, call.name, json(call.arguments), state, Date.now());
+      .run(runId, call.id, call.name, argumentsJson, state, Date.now());
 
-    return result.changes === 1;
+    if (result.changes === 1) {
+      return true;
+    }
+
+    const existing = this.database
+      .query("SELECT run_id, name, arguments FROM tool_calls WHERE call_id = ?")
+      .get(call.id) as { run_id: string; name: string; arguments: string } | null;
+    if (
+      existing === null ||
+      existing.run_id !== runId ||
+      existing.name !== call.name ||
+      canonicalArguments(existing.arguments) !== argumentsJson
+    ) {
+      throw new PersistenceError(`tool call ID ${call.id} conflicts with an existing call`);
+    }
+    return false;
   }
 
   finishToolCall(runId: string, callId: string, result: unknown, state: string): void {
@@ -365,8 +382,8 @@ export class StoreRepository {
     this.database
       .query(
         `INSERT INTO schedules
-          (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, last_error, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -377,32 +394,37 @@ export class StoreRepository {
         input.enabled === false ? 0 : 1,
         input.claimedBy ?? null,
         input.claimedAt ?? null,
+        input.leaseToken ?? null,
         input.lastError ?? null,
         input.createdAt ?? Date.now(),
       );
   }
 
   claimDueSchedule(now: number, owner: string): ScheduleRecord | null {
+    const staleBefore = now - SCHEDULE_LEASE_TIMEOUT_MS;
     return immediateTransaction(this.database, () => {
       const row = this.database
         .query(
           `SELECT id FROM schedules
-           WHERE enabled = 1 AND next_run_at <= ? AND claimed_by IS NULL
+           WHERE enabled = 1 AND next_run_at <= ?
+             AND (claimed_by IS NULL OR (claimed_at IS NOT NULL AND claimed_at <= ?))
            ORDER BY next_run_at, id
            LIMIT 1`,
         )
-        .get(now) as { id: string } | null;
+        .get(now, staleBefore) as { id: string } | null;
       if (row === null) {
         return null;
       }
 
+      const leaseToken = randomUUID();
       const updated = this.database
         .query(
           `UPDATE schedules
-           SET claimed_by = ?, claimed_at = ?
-           WHERE id = ? AND enabled = 1 AND next_run_at <= ? AND claimed_by IS NULL`,
+           SET claimed_by = ?, claimed_at = ?, lease_token = ?
+           WHERE id = ? AND enabled = 1 AND next_run_at <= ?
+             AND (claimed_by IS NULL OR (claimed_at IS NOT NULL AND claimed_at <= ?))`,
         )
-        .run(owner, now, row.id, now);
+        .run(owner, now, leaseToken, row.id, now, staleBefore);
       if (updated.changes !== 1) {
         return null;
       }
@@ -411,16 +433,35 @@ export class StoreRepository {
     });
   }
 
-  finishSchedule(id: string, owner: string, nextRunAt: number | null, error: string | null): boolean {
+  finishSchedule(
+    id: string,
+    owner: string,
+    leaseToken: string,
+    nextRunAt: number | null,
+    error: string | null,
+  ): boolean {
     const update = this.database
       .query(
         `UPDATE schedules
-         SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL,
+         SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL,
              enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
-         WHERE id = ? AND claimed_by = ?`,
+         WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
       )
-      .run(nextRunAt, error, nextRunAt, id, owner);
+      .run(nextRunAt, error, nextRunAt, id, owner, leaseToken);
     return update.changes === 1;
+  }
+
+  getSchedule(id: string): ScheduleRecord | null {
+    const row = this.database.query("SELECT * FROM schedules WHERE id = ?").get(id) as Row | null;
+    return row === null ? null : scheduleFromRow(row);
+  }
+}
+
+function canonicalArguments(value: string): string {
+  try {
+    return canonicalJson(parseJson(value));
+  } catch (error) {
+    throw new PersistenceError("persisted tool-call arguments are not valid JSON", { cause: error });
   }
 }
 

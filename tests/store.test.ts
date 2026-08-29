@@ -11,7 +11,7 @@ import {
   migrations,
   versionOneChecksum,
 } from "../src/store/migrations";
-import { StoreRepository } from "../src/store/repository";
+import { SCHEDULE_LEASE_TIMEOUT_MS, StoreRepository } from "../src/store/repository";
 import type { Message, ToolCall } from "../src/protocol/types";
 
 function withDatabase<T>(callback: (path: string, open: () => Database) => T): T | Promise<T> {
@@ -456,6 +456,44 @@ test("recordToolCall is idempotent by call ID", () => {
   });
 });
 
+test("recordToolCall treats object-key order as an identical replay", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    const run = createRun(repository);
+
+    expect(repository.recordToolCall(run.id, { id: "ordered-call", name: "fs.read", arguments: { a: 1, b: 2 } }, "pending")).toBe(true);
+    expect(repository.recordToolCall(run.id, { id: "ordered-call", name: "fs.read", arguments: { b: 2, a: 1 } }, "running")).toBe(false);
+  });
+});
+
+test("recordToolCall rejects the same ID for a different run", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const firstRun = createRun(repository);
+    const secondRun = createRun(repository);
+    const call: ToolCall = { id: "shared-call", name: "fs.read", arguments: { path: "README.md" } };
+
+    repository.recordToolCall(firstRun.id, call, "pending");
+
+    expect(() => repository.recordToolCall(secondRun.id, call, "pending")).toThrow(PersistenceError);
+  });
+});
+
+test("recordToolCall rejects the same ID for different canonical arguments", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const run = createRun(repository);
+    const firstCall: ToolCall = { id: "argument-call", name: "fs.read", arguments: { path: "README.md" } };
+    const conflictingCall: ToolCall = { id: "argument-call", name: "fs.read", arguments: { path: "secrets.txt" } };
+
+    repository.recordToolCall(run.id, firstCall, "pending");
+
+    expect(() => repository.recordToolCall(run.id, conflictingCall, "pending")).toThrow(PersistenceError);
+  });
+});
+
 test("pending approvals survive reopening the database", () => {
   withDatabase((_path, open) => {
     const firstDatabase = open();
@@ -494,8 +532,27 @@ test("claimDueSchedule returns a due job only once", () => {
       enabled: true,
     });
 
-    expect(repository.claimDueSchedule(1_000, "worker-a")).toMatchObject({ id: "schedule-1" });
+    const claim = repository.claimDueSchedule(1_000, "worker-a");
+    expect(claim).toMatchObject({ id: "schedule-1", claimedBy: "worker-a", claimedAt: 1_000 });
+    expect(claim?.leaseToken).toEqual(expect.any(String));
     expect(repository.claimDueSchedule(1_000, "worker-b")).toBeNull();
+  });
+});
+
+test("claimDueSchedule reclaims a stale lease with a new fencing token", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    repository.createSchedule({ id: "recoverable-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    const firstClaim = repository.claimDueSchedule(1_000, "owner-a");
+    const secondClaim = repository.claimDueSchedule(1_000 + SCHEDULE_LEASE_TIMEOUT_MS + 1, "owner-b");
+
+    expect(firstClaim?.leaseToken).toEqual(expect.any(String));
+    expect(secondClaim).toMatchObject({ id: "recoverable-schedule", claimedBy: "owner-b" });
+    expect(secondClaim?.leaseToken).toEqual(expect.any(String));
+    expect(secondClaim?.leaseToken).not.toBe(firstClaim?.leaseToken);
+    expect(repository.getSchedule("recoverable-schedule")?.leaseToken).toBe(secondClaim?.leaseToken);
   });
 });
 
@@ -567,10 +624,23 @@ test("finishSchedule requires the current lease owner", () => {
       nextRunAt: 1_000,
       enabled: true,
     });
-    repository.claimDueSchedule(1_000, "owner-a");
+    const claim = repository.claimDueSchedule(1_000, "owner-a");
 
-    expect(repository.finishSchedule("leased-schedule", "owner-b", null, null)).toBe(false);
-    expect(repository.finishSchedule("leased-schedule", "owner-a", null, null)).toBe(true);
+    expect(repository.finishSchedule("leased-schedule", "owner-b", "wrong-token", null, null)).toBe(false);
+    expect(repository.finishSchedule("leased-schedule", "owner-a", claim!.leaseToken!, null, null)).toBe(true);
+  });
+});
+
+test("finishSchedule rejects a late completion from a reclaimed lease", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    repository.createSchedule({ id: "fenced-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    const firstClaim = repository.claimDueSchedule(1_000, "owner-a")!;
+    const secondClaim = repository.claimDueSchedule(1_000 + SCHEDULE_LEASE_TIMEOUT_MS + 1, "owner-b")!;
+
+    expect(repository.finishSchedule("fenced-schedule", "owner-a", firstClaim.leaseToken!, null, null)).toBe(false);
+    expect(repository.finishSchedule("fenced-schedule", "owner-b", secondClaim.leaseToken!, null, null)).toBe(true);
   });
 });
 
@@ -616,6 +686,59 @@ test("migration rejects a checksum mismatch", () => {
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/checksum/i);
+  });
+});
+
+test("migration rejects a schema ledger without its primary key", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("ALTER TABLE schema_migrations RENAME TO schema_migrations_original");
+    database.exec(
+      "CREATE TABLE schema_migrations (version INTEGER, checksum TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    );
+    database.exec(
+      "INSERT INTO schema_migrations (version, checksum, applied_at) SELECT version, checksum, applied_at FROM schema_migrations_original",
+    );
+    database.exec("DROP TABLE schema_migrations_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/primary key|schema_migrations/i);
+  });
+});
+
+test("migration rejects duplicate schema ledger versions explicitly", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("ALTER TABLE schema_migrations RENAME TO schema_migrations_original");
+    database.exec("CREATE TABLE schema_migrations (version INTEGER, checksum TEXT, applied_at INTEGER)");
+    database.exec(
+      "INSERT INTO schema_migrations (version, checksum, applied_at) SELECT version, checksum, applied_at FROM schema_migrations_original",
+    );
+    database.exec(
+      "INSERT INTO schema_migrations (version, checksum, applied_at) SELECT version, checksum, applied_at FROM schema_migrations_original WHERE version = 1",
+    );
+    database.exec("DROP TABLE schema_migrations_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/duplicate.*version|schema_migrations/i);
+  });
+});
+
+test("migration rejects nullable schema ledger checksum and applied timestamp", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("ALTER TABLE schema_migrations RENAME TO schema_migrations_original");
+    database.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT, applied_at INTEGER)");
+    database.exec(
+      "INSERT INTO schema_migrations (version, checksum, applied_at) SELECT version, checksum, applied_at FROM schema_migrations_original",
+    );
+    database.exec("DROP TABLE schema_migrations_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/not null|schema_migrations/i);
   });
 });
 
@@ -778,6 +901,7 @@ test("fresh databases apply the complete migration history", () => {
     expect(versions).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
+      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
     ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
@@ -785,6 +909,21 @@ test("fresh databases apply the complete migration history", () => {
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_schedules_due'").get()).toEqual({
       name: "idx_schedules_due",
     });
+  });
+});
+
+test("fresh databases keep tool-call uniqueness in one explicit index", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const table = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'")
+      .get() as { sql: string };
+    expect(table.sql).not.toMatch(/call_id\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i);
+    expect(
+      (database.query("PRAGMA index_list('tool_calls')").all() as Array<{ name: string }>).filter(
+        (index) => index.name === "idx_tool_calls_call_id",
+      ),
+    ).toHaveLength(1);
   });
 });
 
@@ -807,10 +946,12 @@ test("legacy version-1 databases upgrade without losing data", () => {
     expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1 },
       { version: 2 },
+      { version: 3 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
+      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -837,12 +978,42 @@ test("hardened historical version-one databases upgrade without losing data", ()
     expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1 },
       { version: 2 },
+      { version: 3 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
+      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
     ]);
     expectCurrentSchema(database);
+  });
+});
+
+test("version-two databases with a legacy nullable checksum upgrade to the hardened ledger", () => {
+  withDatabase((path, open) => {
+    createHistoricalDatabase(path, historicalVersionOneSqlFrom0fed, null, () => {});
+    const database = new Database(path);
+    database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
+    database.query("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run(versionOneChecksum);
+    database.exec(migrations[1].sql);
+    database
+      .query("INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)")
+      .run(2, migrationChecksum(migrations[1].sql), Date.now());
+    database.close();
+
+    const upgraded = open();
+    expect(upgraded.query("PRAGMA table_info('schema_migrations')").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "checksum", notnull: 1 }),
+        expect.objectContaining({ name: "applied_at", notnull: 1 }),
+        expect.objectContaining({ name: "version", pk: 1 }),
+      ]),
+    );
+    expect(upgraded.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
+      { version: 1 },
+      { version: 2 },
+      { version: 3 },
+    ]);
   });
 });
 
@@ -874,5 +1045,78 @@ test("required persisted task and run statuses are checked by SQLite", () => {
 
     expect(() => database.query("UPDATE tasks SET status = ? WHERE id = ?").run("unknown", task.id)).toThrow();
     expect(() => database.query("UPDATE runs SET status = ? WHERE id = ?").run("unknown", run.id)).toThrow();
+  });
+});
+
+test("approval and schedule persisted domains are checked by SQLite", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO approvals
+             (call_id, arguments_hash, capability, risk_level, decision, requested_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run("call-domain", "hash", "shell.exec", "high", "unknown", 1),
+    ).toThrow();
+    expect(() =>
+      database
+        .query(
+          `INSERT INTO schedules (id, prompt, next_run_at, enabled, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run("schedule-domain", "Run once", 1_000, 2, 1),
+    ).toThrow();
+  });
+});
+
+test("decoding rejects tampered approval and schedule domains", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    database.exec("PRAGMA ignore_check_constraints = ON");
+    database
+      .query(
+        `INSERT INTO approvals
+           (call_id, arguments_hash, capability, risk_level, decision, requested_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("tampered-approval", "hash", "shell.exec", "high", "unknown", 1);
+    database
+      .query(
+        `INSERT INTO schedules (id, prompt, next_run_at, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("tampered-schedule", "Run once", 1_000, 2, 1);
+
+    expect(() => repository.getApproval("tampered-approval", "hash")).toThrow(PersistenceError);
+    expect(() => repository.getSchedule("tampered-schedule")).toThrow(PersistenceError);
+  });
+});
+
+test("task, message, and event writes remain safe across database connections", async () => {
+  await withDatabase(async (_path, open) => {
+    const firstDatabase = open();
+    const secondDatabase = open();
+    const first = new StoreRepository(firstDatabase);
+    const second = new StoreRepository(secondDatabase);
+    const task = first.createTask({ title: "Contention", prompt: "Write", workspace: "/tmp/workspace", maxSteps: 1 });
+    const run = first.startRun(task.id, "contention-run");
+
+    await Promise.all([
+      Promise.resolve().then(() => {
+        second.createTask({ title: "Contention 2", prompt: "Write", workspace: "/tmp/workspace", maxSteps: 1 });
+        second.appendMessage(run.id, { role: "user", content: "from second" });
+        second.appendEvent(run.id, "second", { ok: true });
+      }),
+      Promise.resolve().then(() => {
+        first.appendMessage(run.id, { role: "assistant", content: "from first" });
+        first.appendEvent(run.id, "first", { ok: true });
+      }),
+    ]);
+
+    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM messages WHERE run_id = ?").get(run.id)).toEqual({ count: 2 });
+    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM events WHERE run_id = ?").get(run.id)).toEqual({ count: 2 });
   });
 });

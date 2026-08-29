@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { PersistenceError } from "../errors";
+import { immediateTransaction } from "./transaction";
 
 export type Migration = {
   version: number;
@@ -234,6 +235,12 @@ const versionTwoSql = `
       BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
     `;
 
+const versionThreeSql = `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_call_id ON tool_calls(call_id);
+      CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
+      CREATE INDEX IF NOT EXISTS idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -243,6 +250,7 @@ export const historicalVersionOneChecksum =
 export const migrations: readonly Migration[] = [
   { version: 1, sql: versionOneSql },
   { version: 2, sql: versionTwoSql, prepare: prepareVersionTwo },
+  { version: 3, sql: versionThreeSql, prepare: prepareVersionThree },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -317,6 +325,7 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "enabled", type: "INTEGER" },
     { name: "claimed_by", type: "TEXT" },
     { name: "claimed_at", type: "INTEGER" },
+    { name: "lease_token", type: "TEXT" },
     { name: "last_error", type: "TEXT" },
     { name: "created_at", type: "INTEGER" },
   ],
@@ -434,7 +443,7 @@ function prepareVersionTwo(database: Database): void {
     return;
   }
 
-  database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
+  database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''");
   const updated = database
     .query("UPDATE schema_migrations SET checksum = ? WHERE version = 1")
     .run(versionOneChecksum);
@@ -443,7 +452,83 @@ function prepareVersionTwo(database: Database): void {
   }
 }
 
-type TableInfoRow = { name: string; type: string };
+function prepareVersionThree(database: Database): void {
+  const ledgerColumns = tableInfo(database, "schema_migrations");
+  if (ledgerColumns.some((column) => column.name === "checksum" && column.notnull !== 1)) {
+    database.exec(`
+      CREATE TABLE schema_migrations_v3 (
+        version INTEGER PRIMARY KEY,
+        checksum TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      INSERT INTO schema_migrations_v3 (version, checksum, applied_at)
+        SELECT version, checksum, applied_at FROM schema_migrations;
+      DROP TABLE schema_migrations;
+      ALTER TABLE schema_migrations_v3 RENAME TO schema_migrations;
+    `);
+  }
+
+  database.exec(`
+    CREATE TABLE schedules_v3 (
+      id TEXT PRIMARY KEY,
+      task_id TEXT REFERENCES tasks(id),
+      prompt TEXT NOT NULL,
+      cron TEXT,
+      next_run_at INTEGER,
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      lease_token TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO schedules_v3
+      (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
+    SELECT id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, NULL, last_error, created_at
+    FROM schedules;
+    DROP TABLE schedules;
+    ALTER TABLE schedules_v3 RENAME TO schedules;
+
+    CREATE TABLE approvals_v3 (
+      call_id TEXT NOT NULL,
+      arguments_hash TEXT NOT NULL,
+      task_id TEXT REFERENCES tasks(id),
+      run_id TEXT REFERENCES runs(id),
+      capability TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+      requested_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      PRIMARY KEY (call_id, arguments_hash)
+    );
+    INSERT INTO approvals_v3
+      (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision, requested_at, resolved_at)
+    SELECT call_id, arguments_hash, task_id, run_id, capability, risk_level, decision, requested_at, resolved_at
+    FROM approvals;
+    DROP TABLE approvals;
+    ALTER TABLE approvals_v3 RENAME TO approvals;
+
+    CREATE TABLE tool_calls_v3 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      call_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      arguments TEXT NOT NULL,
+      state TEXT NOT NULL,
+      result TEXT,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER
+    );
+    INSERT INTO tool_calls_v3
+      (id, run_id, call_id, name, arguments, state, result, created_at, finished_at)
+    SELECT id, run_id, call_id, name, arguments, state, result, created_at, finished_at
+    FROM tool_calls;
+    DROP TABLE tool_calls;
+    ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
+  `);
+}
+
+type TableInfoRow = { name: string; type: string; notnull: number; pk: number };
 
 function tableInfo(database: Database, table: string): TableInfoRow[] {
   return database.query(`PRAGMA table_info('${table}')`).all() as TableInfoRow[];
@@ -455,9 +540,18 @@ function hasTable(database: Database, table: string): boolean {
     .get(table) !== null;
 }
 
-function assertSchemaMigrationsShape(database: Database): boolean {
+function assertSchemaMigrationsShape(database: Database, allowLegacyNullableChecksum = false): boolean {
   if (!hasTable(database, "schema_migrations")) {
     fail("schema_migrations table is missing");
+  }
+
+  const duplicate = database
+    .query(
+      "SELECT version FROM schema_migrations GROUP BY version HAVING COUNT(*) > 1 LIMIT 1",
+    )
+    .get() as { version: number } | null;
+  if (duplicate !== null) {
+    fail(`schema_migrations contains duplicate version ${duplicate.version}`);
   }
 
   const columns = tableInfo(database, "schema_migrations");
@@ -475,6 +569,16 @@ function assertSchemaMigrationsShape(database: Database): boolean {
     if (actual.type.toUpperCase() !== requiredColumn.type) {
       fail(`schema_migrations column ${requiredColumn.name} has an altered declared type`);
     }
+    if (requiredColumn.name === "version" && actual.pk !== 1) {
+      fail("schema_migrations version must be the primary key");
+    }
+    if (
+      (requiredColumn.name === "checksum" || requiredColumn.name === "applied_at") &&
+      actual.notnull !== 1 &&
+      !(requiredColumn.name === "checksum" && allowLegacyNullableChecksum)
+    ) {
+      fail(`schema_migrations column ${requiredColumn.name} must be NOT NULL`);
+    }
   }
   return expected.length === requiredTableColumns.schema_migrations.length;
 }
@@ -491,7 +595,7 @@ function assertTableColumns(database: Database, table: string, expected: readonl
     if (actualColumn?.name !== requiredColumn.name) {
       fail(`required table ${table} has an altered column layout`);
     }
-    if (actualColumn.type.toUpperCase() !== requiredColumn.type) {
+    if (actualColumn === undefined || actualColumn.type.toUpperCase() !== requiredColumn.type) {
       fail(`required table ${table} column ${requiredColumn.name} has an altered declared type`);
     }
   }
@@ -523,31 +627,20 @@ function normalizedSql(sql: string): string {
 
 type SchemaLineage = {
   checksum: string;
-  tableDefinitions: ReadonlyMap<string, string>;
-  indexDefinitions: ReadonlyMap<string, string>;
+  hasIndexes: boolean;
+  hasInlineStatusChecks: boolean;
 };
-
-function definitionsFromSql(sql: string, pattern: RegExp): ReadonlyMap<string, string> {
-  const definitions = new Map<string, string>();
-  for (const match of sql.matchAll(pattern)) {
-    definitions.set(match[1], normalizedSql(match[0]));
-  }
-  return definitions;
-}
-
-const tableDefinitionPattern = /CREATE TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([\s\S]*?\)\s*;/gi;
-const indexDefinitionPattern = /CREATE\s+(?:UNIQUE\s+)?INDEX\s+([A-Za-z_][A-Za-z0-9_]*)\s+ON\s+[A-Za-z_][A-Za-z0-9_]*\s*\([\s\S]*?\)\s*;/gi;
 
 const originalVersionOneLineage: SchemaLineage = {
   checksum: versionOneChecksum,
-  tableDefinitions: definitionsFromSql(versionOneSql, tableDefinitionPattern),
-  indexDefinitions: definitionsFromSql(versionOneSql, indexDefinitionPattern),
+  hasIndexes: false,
+  hasInlineStatusChecks: false,
 };
 
 const hardenedVersionOneLineage: SchemaLineage = {
   checksum: historicalVersionOneChecksum,
-  tableDefinitions: definitionsFromSql(historicalVersionOneSql, tableDefinitionPattern),
-  indexDefinitions: definitionsFromSql(historicalVersionOneSql, indexDefinitionPattern),
+  hasIndexes: true,
+  hasInlineStatusChecks: true,
 };
 
 const schemaLineages = new Map<string, SchemaLineage>([
@@ -575,11 +668,31 @@ function schemaLineageFor(database: Database, hasChecksum: boolean): SchemaLinea
 }
 
 function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIndexes: boolean): void {
-  for (const [table, expectedSql] of lineage.tableDefinitions) {
-    const actual = database
+  const legacyColumns = Object.fromEntries(
+    Object.entries(requiredTableColumns).map(([table, columns]) => [
+      table,
+      columns.filter((column) => column.name !== "lease_token"),
+    ]),
+  ) as Record<string, readonly ColumnDefinition[]>;
+  if (checkIndexes) {
+    for (const [table, columns] of Object.entries(legacyColumns)) {
+      if (table === "schema_migrations") {
+        continue;
+      }
+      if (!hasTable(database, table)) {
+        fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
+      }
+      assertTableColumns(database, table, columns);
+      assertForeignKeys(database, table, requiredForeignKeys[table]);
+    }
+  }
+
+  for (const table of ["tasks", "runs"]) {
+    const row = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(table) as { sql: string } | null;
-    if (actual === null || normalizedSql(actual.sql) !== expectedSql) {
+    const hasCheck = row !== null && normalizedSql(row.sql).includes("status text not null check");
+    if (hasCheck !== lineage.hasInlineStatusChecks) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
     }
   }
@@ -588,20 +701,23 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
     return;
   }
 
-  const actualIndexes = new Map(
-    (
-      database
-        .query("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
-        .all() as Array<{ name: string; sql: string }>
-    ).map((index) => [index.name, normalizedSql(index.sql)]),
-  );
-  if (actualIndexes.size !== lineage.indexDefinitions.size) {
-    fail("migration 1 checksum does not match the schema lineage indexes");
-  }
-  for (const [name, expectedSql] of lineage.indexDefinitions) {
-    if (actualIndexes.get(name) !== expectedSql) {
-      fail(`migration 1 checksum does not match the schema lineage index ${name}`);
+  const actualIndexes = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
+    .all() as Array<{ name: string }>;
+  if (lineage.hasIndexes) {
+    if (actualIndexes.length !== requiredIndexes.length) {
+      fail("migration 1 checksum does not match the schema lineage indexes");
     }
+    for (const index of requiredIndexes) {
+      const actual = database
+        .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(index.name) as { sql: string | null } | null;
+      if (actual === null || actual.sql === null || normalizedSql(actual.sql) !== index.sql) {
+        fail(`migration 1 checksum does not match the schema lineage index ${index.name}`);
+      }
+    }
+  } else if (actualIndexes.length !== 0) {
+    fail("migration 1 checksum does not match the schema lineage indexes");
   }
 }
 
@@ -629,6 +745,11 @@ const requiredTriggerDefinitions = [
   },
 ] as const;
 
+const requiredTableChecks = [
+  { table: "schedules", fragment: "check (enabled in (0, 1))" },
+  { table: "approvals", fragment: "check (decision in ('pending', 'approved', 'denied'))" },
+] as const;
+
 function assertRequiredSchema(database: Database): void {
   for (const [table, columns] of Object.entries(requiredTableColumns)) {
     if (!hasTable(database, table)) {
@@ -636,6 +757,15 @@ function assertRequiredSchema(database: Database): void {
     }
     assertTableColumns(database, table, columns);
     assertForeignKeys(database, table, requiredForeignKeys[table]);
+  }
+
+  for (const requiredCheck of requiredTableChecks) {
+    const actual = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(requiredCheck.table) as { sql: string } | null;
+    if (actual === null || !normalizedSql(actual.sql).includes(requiredCheck.fragment)) {
+      fail(`required table constraint is missing or altered: ${requiredCheck.table}`);
+    }
   }
 
   for (const index of requiredIndexes) {
@@ -700,6 +830,19 @@ function assertRequiredSchema(database: Database): void {
     fail("runs contains an invalid persisted status");
   }
 
+  if (
+    database
+      .query("SELECT 1 AS invalid FROM approvals WHERE decision NOT IN ('pending', 'approved', 'denied') LIMIT 1")
+      .get() !== null
+  ) {
+    fail("approvals contains an invalid persisted decision");
+  }
+  if (
+    database.query("SELECT 1 AS invalid FROM schedules WHERE enabled NOT IN (0, 1) LIMIT 1").get() !== null
+  ) {
+    fail("schedules contains an invalid persisted enabled value");
+  }
+
   const foreignKeyViolations = database.query("PRAGMA foreign_key_check").all();
   if (foreignKeyViolations.length > 0) {
     fail(`foreign-key integrity check failed with ${foreignKeyViolations.length} violation(s)`);
@@ -726,7 +869,7 @@ function assertAppliedChecksums(
 }
 
 export function runMigrations(database: Database): void {
-  const transaction = database.transaction(() => {
+  immediateTransaction(database, () => {
     database.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -734,7 +877,10 @@ export function runMigrations(database: Database): void {
       );
     `);
 
-    let hasChecksum = assertSchemaMigrationsShape(database);
+    const versionThreeApplied = database
+      .query("SELECT 1 AS applied FROM schema_migrations WHERE version = 3")
+      .get() !== null;
+    let hasChecksum = assertSchemaMigrationsShape(database, !versionThreeApplied);
     const knownMigrations = new Map(migrations.map((migration) => [migration.version, migration]));
     const versionRows = database.query("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{
       version: number;
@@ -796,7 +942,6 @@ export function runMigrations(database: Database): void {
     assertRequiredSchema(database);
   });
 
-  transaction.immediate();
 }
 
 export const migrate = runMigrations;
