@@ -52,6 +52,9 @@ type NativeError = Error & { code?: string; errno?: number };
 type DirectoryOpenError = NativeError & { created?: string[] };
 
 const DIRENT_HEADER_BYTES = 21;
+const DIRENT_MIN_RECORD_BYTES = 24;
+const DIRENT_MAX_RECORD_BYTES = 1024; // Darwin DIRBLKSIZ-compatible bounded record size.
+const DIRENT_MAX_NAME_BYTES = 255;
 
 function errno(): number {
   const pointer = native.symbols.__error();
@@ -165,6 +168,28 @@ function directoryEntryType(value: number): SecureEntryType {
   return "special";
 }
 
+export type NativeDirentHeader = { recordLength: number; nameLength: number; type: number };
+
+export function validateNativeDirentHeader(header: Uint8Array): NativeDirentHeader {
+  if (header.byteLength < DIRENT_HEADER_BYTES) {
+    throw new ToolExecutionError("directory contained an invalid entry");
+  }
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const recordLength = view.getUint16(16, true);
+  const nameLength = view.getUint16(18, true);
+  if (
+    recordLength < DIRENT_MIN_RECORD_BYTES ||
+    recordLength > DIRENT_MAX_RECORD_BYTES ||
+    recordLength % 4 !== 0 ||
+    nameLength === 0 ||
+    nameLength > DIRENT_MAX_NAME_BYTES ||
+    DIRENT_HEADER_BYTES + nameLength + 1 > recordLength
+  ) {
+    throw new ToolExecutionError("directory contained an invalid entry");
+  }
+  return { recordLength, nameLength, type: view.getUint8(20) };
+}
+
 export function safeDirectoryEntries(workspace: string, path: string): SecureEntry[] {
   const { fd } = openDirectory(workspace, path, false);
   const directory = native.symbols.fdopendir(fd);
@@ -177,12 +202,8 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
     while (true) {
       const entry = native.symbols.readdir(directory);
       if (!entry) break;
-      const view = new DataView(toArrayBuffer(entry, 0, DIRENT_HEADER_BYTES));
-      const recordLength = view.getUint16(16, true);
-      const nameLength = view.getUint16(18, true);
-      if (recordLength < 24 || nameLength === 0 || nameLength >= recordLength - DIRENT_HEADER_BYTES) {
-        throw new ToolExecutionError("directory contained an invalid entry");
-      }
+      const header = new Uint8Array(toArrayBuffer(entry, 0, DIRENT_HEADER_BYTES));
+      const { recordLength, nameLength, type } = validateNativeDirentHeader(header);
       const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
       const nameBytes = record.subarray(DIRENT_HEADER_BYTES, DIRENT_HEADER_BYTES + nameLength);
       if (nameBytes.includes(0) || record[DIRENT_HEADER_BYTES + nameLength] !== 0) {
@@ -190,7 +211,7 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
       }
       const name = Buffer.from(nameBytes).toString("utf8");
       if (name !== "." && name !== "..") {
-        entries.push({ name, type: directoryEntryType(view.getUint8(20)) });
+        entries.push({ name, type: directoryEntryType(type) });
       }
     }
   } finally {

@@ -16,8 +16,9 @@ import { join } from "node:path";
 import { ValidationError } from "../src/errors";
 import { createFilesystemTools, resolveWorkspacePath } from "../src/tools/filesystem";
 import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
-import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES } from "../src/tools/types";
+import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES, boundToolResult } from "../src/tools/types";
 import type { ToolContext } from "../src/tools/types";
+import { validateNativeDirentHeader } from "../src/tools/secure-fs";
 
 const libc = dlopen("/usr/lib/libSystem.B.dylib", {
   mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
@@ -546,7 +547,12 @@ test("enforces one aggregate serialized ToolResult budget", async () => {
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     async execute() {
-      return { ok: true, content: "c".repeat(MAX_TOOL_OUTPUT_BYTES), data: "d".repeat(MAX_TOOL_OUTPUT_BYTES) };
+      return {
+        ok: true,
+        content: "c".repeat(MAX_TOOL_OUTPUT_BYTES),
+        data: "d".repeat(MAX_TOOL_OUTPUT_BYTES),
+        redactions: ["r".repeat(MAX_TOOL_OUTPUT_BYTES)],
+      };
     },
   };
 
@@ -555,9 +561,32 @@ test("enforces one aggregate serialized ToolResult budget", async () => {
     { id: "aggregate-budget", name: "oversized-result", arguments: {} },
     { workspace: "/tmp", runId: "run-budget", repository: {} } as ToolContext,
   );
-  const dataBytes = result.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(result.data), "utf8");
-  expect(Buffer.byteLength(result.content, "utf8") + dataBytes).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
+  expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
   expect(result.data).not.toBe("d".repeat(MAX_TOOL_OUTPUT_BYTES));
+});
+
+test("bounds redactions within the complete serialized ToolResult envelope", () => {
+  const result = boundToolResult({
+    ok: false,
+    content: "useful output",
+    data: { kind: "summary" },
+    redactions: ["r".repeat(MAX_TOOL_OUTPUT_BYTES)],
+  });
+
+  expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
+  expect(result.content).toBe("useful output");
+  expect(result.data).toEqual({ kind: "summary" });
+  expect(result.redactions).toHaveLength(1);
+  expect(result.redactions?.[0]).not.toBe("r".repeat(MAX_TOOL_OUTPUT_BYTES));
+});
+
+test("rejects a native dirent record length above the bounded Darwin record size", () => {
+  const header = new Uint8Array(21);
+  const view = new DataView(header.buffer);
+  view.setUint16(16, 1025, true);
+  view.setUint16(18, 1, true);
+
+  expect(() => validateNativeDirentHeader(header)).toThrow("invalid entry");
 });
 
 test("direct search honors ignored directories and rejects special files", async () => {

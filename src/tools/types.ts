@@ -40,15 +40,44 @@ export function truncateUtf8(value: string, maxBytes: number): string {
 
 export function boundToolResult(result: ToolResult): ToolResult {
   const hasData = Object.prototype.hasOwnProperty.call(result, "data") && result.data !== undefined;
-  const content = truncateUtf8(result.content, MAX_TOOL_OUTPUT_BYTES);
-  const remainingDataBytes = Math.max(0, MAX_TOOL_OUTPUT_BYTES - Buffer.byteLength(content, "utf8"));
-  const data = hasData ? boundToolData(result.data, remainingDataBytes) : undefined;
-  const { data: _originalData, ...withoutData } = result;
+  const hasRedactions = Object.prototype.hasOwnProperty.call(result, "redactions") && result.redactions !== undefined;
+  const fieldShareBytes = Math.floor(MAX_TOOL_OUTPUT_BYTES / (1 + Number(hasData) + Number(hasRedactions)));
+  const data = hasData ? boundToolData(result.data, fieldShareBytes) : undefined;
+  const redactions = hasRedactions ? boundToolData(result.redactions, fieldShareBytes) : undefined;
   return {
-    ...withoutData,
-    content,
+    ok: result.ok,
+    content: boundToolContent(
+      result.ok,
+      result.content,
+      data,
+      Array.isArray(redactions) ? (redactions as string[]) : undefined,
+    ),
     ...(data === undefined ? {} : { data }),
+    ...(Array.isArray(redactions) ? { redactions: redactions as string[] } : {}),
   };
+}
+
+function boundToolContent(ok: boolean, value: string, data: unknown, redactions: string[] | undefined): string {
+  let low = 0;
+  let high = Buffer.byteLength(value, "utf8");
+  let best = "";
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = truncateUtf8(value, middle);
+    const bytes = jsonByteLength({
+      ok,
+      content: candidate,
+      ...(data === undefined ? {} : { data }),
+      ...(redactions === undefined ? {} : { redactions }),
+    });
+    if (bytes !== null && bytes <= MAX_TOOL_OUTPUT_BYTES) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
 }
 
 function jsonByteLength(value: unknown): number | null {
