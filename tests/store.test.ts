@@ -273,6 +273,19 @@ function createHistoricalDatabase(
   database.close();
 }
 
+function createVersionTwoDatabase(path: string, seed: (database: Database) => void): void {
+  createHistoricalDatabase(path, historicalVersionOneSqlFrom0fed, null, () => {});
+  const database = new Database(path);
+  database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT NOT NULL DEFAULT ''");
+  database.query("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run(versionOneChecksum);
+  database.exec(migrations[1].sql);
+  database
+    .query("INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)")
+    .run(2, migrationChecksum(migrations[1].sql), Date.now());
+  seed(database);
+  database.close();
+}
+
 function expectCurrentSchema(database: Database): void {
   expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()).toEqual(
     expect.arrayContaining([
@@ -553,6 +566,38 @@ test("claimDueSchedule reclaims a stale lease with a new fencing token", () => {
     expect(secondClaim?.leaseToken).toEqual(expect.any(String));
     expect(secondClaim?.leaseToken).not.toBe(firstClaim?.leaseToken);
     expect(repository.getSchedule("recoverable-schedule")?.leaseToken).toBe(secondClaim?.leaseToken);
+  });
+});
+
+test("createSchedule rejects a half-populated lease tuple", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+
+    expect(() =>
+      repository.createSchedule({
+        id: "malformed-input-schedule",
+        prompt: "Run once",
+        nextRunAt: 1_000,
+        enabled: true,
+        claimedBy: "owner-a",
+        claimedAt: null,
+      }),
+    ).toThrow(PersistenceError);
+  });
+});
+
+test("claimDueSchedule safely reclaims a malformed claimed row", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    repository.createSchedule({ id: "malformed-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    database.exec("PRAGMA ignore_check_constraints = ON");
+    database.query("UPDATE schedules SET claimed_by = ?, claimed_at = NULL WHERE id = ?").run("dead-worker", "malformed-schedule");
+
+    const claim = repository.claimDueSchedule(1_000, "owner-b");
+    expect(claim).toMatchObject({ id: "malformed-schedule", claimedBy: "owner-b", claimedAt: 1_000 });
+    expect(claim?.leaseToken).toEqual(expect.any(String));
   });
 });
 
@@ -1016,6 +1061,153 @@ test("migration rejects an approval table with an altered decision CHECK", () =>
   });
 });
 
+test("migration rejects a persisted half-populated schedule lease", () => {
+  withDatabase((path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    repository.createSchedule({ id: "malformed-migration-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+    database.exec("PRAGMA ignore_check_constraints = ON");
+    database
+      .query("UPDATE schedules SET claimed_by = ?, claimed_at = NULL WHERE id = ?")
+      .run("dead-worker", "malformed-migration-schedule");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/lease|claim|schedule|schema/i);
+  });
+});
+
+test("migration rejects a messages table without AUTOINCREMENT", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_messages_run_sequence");
+    database.exec("ALTER TABLE messages RENAME TO messages_original");
+    database.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      )
+    `);
+    database.exec("INSERT INTO messages SELECT * FROM messages_original");
+    database.exec("DROP TABLE messages_original");
+    database.exec("CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence_number)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/messages|schema|autoincrement/i);
+  });
+});
+
+test("migration rejects an events table with an altered default", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_events_task_created");
+    database.exec("DROP INDEX idx_events_run_created");
+    database.exec("ALTER TABLE events RENAME TO events_original");
+    database.exec(`
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    database.exec("INSERT INTO events SELECT * FROM events_original");
+    database.exec("DROP TABLE events_original");
+    database.exec("CREATE INDEX idx_events_task_created ON events(task_id, created_at)");
+    database.exec("CREATE INDEX idx_events_run_created ON events(run_id, created_at)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/events|schema|default/i);
+  });
+});
+
+test("migration rejects a tool_calls table without AUTOINCREMENT", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_tool_calls_call_id");
+    database.exec("ALTER TABLE tool_calls RENAME TO tool_calls_original");
+    database.exec(`
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      )
+    `);
+    database.exec("INSERT INTO tool_calls SELECT * FROM tool_calls_original");
+    database.exec("DROP TABLE tool_calls_original");
+    database.exec("CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/tool.?calls|schema|autoincrement/i);
+  });
+});
+
+test("migration rejects a memories table with an altered default", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("DROP INDEX idx_memories_created");
+    database.exec("ALTER TABLE memories RENAME TO memories_original");
+    database.exec(`
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    database.exec("INSERT INTO memories SELECT * FROM memories_original");
+    database.exec("DROP TABLE memories_original");
+    database.exec("CREATE INDEX idx_memories_created ON memories(created_at)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/memories|schema|default/i);
+  });
+});
+
+test("migration rejects a schema ledger with an altered default", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("ALTER TABLE schema_migrations RENAME TO schema_migrations_original");
+    database.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL,
+        checksum TEXT NOT NULL DEFAULT 'tampered'
+      )
+    `);
+    database.exec("INSERT INTO schema_migrations SELECT * FROM schema_migrations_original");
+    database.exec("DROP TABLE schema_migrations_original");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/schema_migrations|schema|default/i);
+  });
+});
+
 test("migration rejects altered foreign-key actions", () => {
   withDatabase((path, open) => {
     open().close();
@@ -1113,6 +1305,7 @@ test("fresh databases apply the complete migration history", () => {
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
+      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
     ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
@@ -1165,11 +1358,13 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 1 },
       { version: 2 },
       { version: 3 },
+      { version: 4 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
+      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1197,13 +1392,47 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 1 },
       { version: 2 },
       { version: 3 },
+      { version: 4 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
+      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
     ]);
     expectCurrentSchema(database);
+  });
+});
+
+test("version-three rebuild preserves store indexes, guards, and tool-call AUTOINCREMENT", () => {
+  withDatabase((path, open) => {
+    createVersionTwoDatabase(path, (database) => {
+      database
+        .query(
+          `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("v3-task", "V3", "Preserve schema", "/tmp/workspace", 1, "pending", 1, 1);
+      database
+        .query("INSERT INTO runs (id, task_id, idempotency_key, status, started_at) VALUES (?, ?, ?, ?, ?)")
+        .run("v3-run", "v3-task", "v3-key", "running", 1);
+      database
+        .query(
+          `INSERT INTO tool_calls
+             (id, run_id, call_id, name, arguments, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(41, "v3-run", "v3-call-old", "fs.read", "{}", "completed", 1);
+      database.query("DELETE FROM tool_calls WHERE id = ?").run(41);
+    });
+
+    const database = open();
+    expectCurrentSchema(database);
+    expect(database.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'trigger'").get()).toEqual({ count: 4 });
+
+    const repository = new StoreRepository(database);
+    expect(repository.recordToolCall("v3-run", { id: "v3-call-new", name: "fs.read", arguments: {} }, "pending")).toBe(true);
+    expect(database.query("SELECT id FROM tool_calls WHERE call_id = ?").get("v3-call-new")).toEqual({ id: 42 });
   });
 });
 
@@ -1231,6 +1460,7 @@ test("version-two databases with a legacy nullable checksum upgrade to the harde
       { version: 1 },
       { version: 2 },
       { version: 3 },
+      { version: 4 },
     ]);
   });
 });
@@ -1332,5 +1562,37 @@ test("contended writes use bounded SQLITE_BUSY handling across database connecti
 
     expect(firstDatabase.query("SELECT COUNT(*) AS count FROM messages WHERE run_id = ?").get(run.id)).toEqual({ count: 1 });
     expect(firstDatabase.query("SELECT COUNT(*) AS count FROM events WHERE run_id = ?").get(run.id)).toEqual({ count: 1 });
+  });
+});
+
+test("a transient cross-process lock is retried until the write succeeds", async () => {
+  await withDatabase(async (path, open) => {
+    const firstDatabase = open();
+    const secondDatabase = open();
+    const firstRepository = new StoreRepository(firstDatabase);
+    const secondRepository = new StoreRepository(secondDatabase);
+    const task = firstRepository.createTask({ title: "Retry", prompt: "Retry", workspace: "/tmp/workspace", maxSteps: 1 });
+    const run = firstRepository.startRun(task.id, "retry-run");
+
+    const child = Bun.spawn([
+      process.execPath,
+      "-e",
+      `import {Database} from "bun:sqlite";
+const database = new Database(process.argv[1]);
+database.exec("PRAGMA busy_timeout = 0");
+database.exec("BEGIN IMMEDIATE");
+console.log("locked");
+setTimeout(() => { database.exec("ROLLBACK"); database.close(); }, 20);`,
+      path,
+    ], { stdout: "pipe", stderr: "pipe" });
+    const output = await new Response(child.stdout).text();
+    expect(output).toContain("locked");
+
+    secondDatabase.exec("PRAGMA busy_timeout = 0");
+    secondRepository.appendEvent(run.id, "retried", { ok: true });
+    expect(firstDatabase.query("SELECT type FROM events WHERE run_id = ?").all(run.id)).toEqual([
+      { type: "retried" },
+    ]);
+    expect(await child.exited).toBe(0);
   });
 });

@@ -241,6 +241,17 @@ const versionThreeSql = `
       CREATE INDEX IF NOT EXISTS idx_approvals_call_hash ON approvals(call_id, arguments_hash);
     `;
 
+const versionFourSql = `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_call_id ON tool_calls(call_id);
+      CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
+      CREATE INDEX IF NOT EXISTS idx_messages_run_sequence ON messages(run_id, sequence_number);
+      CREATE INDEX IF NOT EXISTS idx_events_task_created ON events(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_run_created ON events(run_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+      CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
+      CREATE INDEX IF NOT EXISTS idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -251,6 +262,7 @@ export const migrations: readonly Migration[] = [
   { version: 1, sql: versionOneSql },
   { version: 2, sql: versionTwoSql, prepare: prepareVersionTwo },
   { version: 3, sql: versionThreeSql, prepare: prepareVersionThree },
+  { version: 4, sql: versionFourSql, prepare: prepareVersionFour },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -499,16 +511,20 @@ function prepareVersionTwo(database: Database): void {
 }
 
 function prepareVersionThree(database: Database): void {
+  assertScheduleLeaseTuples(database);
+  const toolCallsSequence = database
+    .query("SELECT seq FROM sqlite_sequence WHERE name = 'tool_calls'")
+    .get() as { seq: number } | null;
   const ledgerColumns = tableInfo(database, "schema_migrations");
   if (ledgerColumns.some((column) => column.name === "checksum" && column.notnull !== 1)) {
     database.exec(`
       CREATE TABLE schema_migrations_v3 (
         version INTEGER PRIMARY KEY,
-        checksum TEXT NOT NULL,
-        applied_at INTEGER NOT NULL
+        applied_at INTEGER NOT NULL,
+        checksum TEXT NOT NULL DEFAULT ''
       );
-      INSERT INTO schema_migrations_v3 (version, checksum, applied_at)
-        SELECT version, checksum, applied_at FROM schema_migrations;
+      INSERT INTO schema_migrations_v3 (version, applied_at, checksum)
+        SELECT version, applied_at, checksum FROM schema_migrations;
       DROP TABLE schema_migrations;
       ALTER TABLE schema_migrations_v3 RENAME TO schema_migrations;
     `);
@@ -526,7 +542,8 @@ function prepareVersionThree(database: Database): void {
       claimed_at INTEGER,
       lease_token TEXT,
       last_error TEXT,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
     );
     INSERT INTO schedules_v3
       (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
@@ -572,12 +589,64 @@ function prepareVersionThree(database: Database): void {
     DROP TABLE tool_calls;
     ALTER TABLE tool_calls_v3 RENAME TO tool_calls;
   `);
+
+  if (toolCallsSequence !== null) {
+    const currentSequence = database
+      .query("SELECT seq FROM sqlite_sequence WHERE name = 'tool_calls'")
+      .get() as { seq: number } | null;
+    if (currentSequence === null) {
+      database.query("INSERT INTO sqlite_sequence (name, seq) VALUES ('tool_calls', ?)").run(toolCallsSequence.seq);
+    } else if (currentSequence.seq < toolCallsSequence.seq) {
+      database.query("UPDATE sqlite_sequence SET seq = ? WHERE name = 'tool_calls'").run(toolCallsSequence.seq);
+    }
+  }
+}
+
+function prepareVersionFour(database: Database): void {
+  assertScheduleLeaseTuples(database);
+
+  database.exec(`
+    CREATE TABLE schedules_v4 (
+      id TEXT PRIMARY KEY,
+      task_id TEXT REFERENCES tasks(id),
+      prompt TEXT NOT NULL,
+      cron TEXT,
+      next_run_at INTEGER,
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      lease_token TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
+    );
+    INSERT INTO schedules_v4
+      (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
+    SELECT id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at
+    FROM schedules;
+    DROP TABLE schedules;
+    ALTER TABLE schedules_v4 RENAME TO schedules;
+  `);
 }
 
 type TableInfoRow = { name: string; type: string; notnull: number; pk: number };
 
 function tableInfo(database: Database, table: string): TableInfoRow[] {
   return database.query(`PRAGMA table_info('${table}')`).all() as TableInfoRow[];
+}
+
+function assertScheduleLeaseTuples(database: Database): void {
+  const malformed = database
+    .query(
+      `SELECT id FROM schedules
+       WHERE (claimed_by IS NULL AND claimed_at IS NOT NULL)
+          OR (claimed_by IS NOT NULL AND claimed_at IS NULL)
+       LIMIT 1`,
+    )
+    .get() as { id: string } | null;
+  if (malformed !== null) {
+    fail(`schedule ${malformed.id} has a malformed lease tuple`);
+  }
 }
 
 function hasTable(database: Database, table: string): boolean {
@@ -721,7 +790,9 @@ function assertTableUniqueConstraints(database: Database): void {
 function normalizedSql(sql: string): string {
   return sql
     .toLowerCase()
+    .replace(/"/g, "")
     .replace(/\s+/g, " ")
+    .replace(/\s*([(),])\s*/g, "$1")
     .replace(/\s*;\s*$/, "")
     .trim();
 }
@@ -851,7 +922,7 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
       const actual = database
         .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get(index.name) as { sql: string | null } | null;
-      if (actual === null || actual.sql === null || normalizedSql(actual.sql) !== index.sql) {
+      if (actual === null || actual.sql === null || normalizedSql(actual.sql) !== normalizedSql(index.sql)) {
         fail(`migration 1 checksum does not match the schema lineage index ${index.name}`);
       }
     }
@@ -899,7 +970,8 @@ const requiredTableDefinitions = [
         claimed_at INTEGER,
         lease_token TEXT,
         last_error TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
       )
     `),
   },
@@ -922,6 +994,83 @@ const requiredTableDefinitions = [
   },
 ] as const;
 
+const requiredCurrentTableDefinitions = [
+  {
+    table: "messages",
+    sql: normalizedSql(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        sequence_number INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, sequence_number)
+      )
+    `),
+  },
+  {
+    table: "events",
+    sql: normalizedSql(`
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `),
+  },
+  {
+    table: "tool_calls",
+    sql: normalizedSql(`
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      )
+    `),
+  },
+  {
+    table: "memories",
+    sql: normalizedSql(`
+      CREATE TABLE memories (
+        id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        confidence REAL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `),
+  },
+] as const;
+
+const currentSchemaMigrationsDefinition = normalizedSql(`
+  CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL,
+    checksum TEXT NOT NULL DEFAULT ''
+  )
+`);
+
+const historicalSchemaMigrationsDefinition = normalizedSql(`
+  CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    checksum TEXT NOT NULL,
+    applied_at INTEGER NOT NULL
+  )
+`);
+
 function assertRequiredSchema(database: Database): void {
   for (const [table, columns] of Object.entries(requiredTableColumns)) {
     if (!hasTable(database, table)) {
@@ -937,6 +1086,28 @@ function assertRequiredSchema(database: Database): void {
       .get(requiredTable.table) as { sql: string } | null;
     if (actual === null || normalizedSql(actual.sql) !== requiredTable.sql) {
       fail(`required table constraint is missing or altered: ${requiredTable.table}`);
+    }
+  }
+
+  const expectedSchemaMigrationsDefinition = appliedVersionOneChecksum(database) === historicalVersionOneChecksum
+    ? historicalSchemaMigrationsDefinition
+    : currentSchemaMigrationsDefinition;
+  const schemaMigrationsDefinition = database
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get() as { sql: string } | null;
+  if (
+    schemaMigrationsDefinition === null ||
+    normalizedSql(schemaMigrationsDefinition.sql) !== expectedSchemaMigrationsDefinition
+  ) {
+    fail("schema_migrations has an altered table definition");
+  }
+
+  for (const requiredTable of requiredCurrentTableDefinitions) {
+    const actual = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(requiredTable.table) as { sql: string } | null;
+    if (actual === null || normalizedSql(actual.sql) !== requiredTable.sql) {
+      fail(`required table definition is missing or altered: ${requiredTable.table}`);
     }
   }
 
@@ -969,7 +1140,11 @@ function assertRequiredSchema(database: Database): void {
     const actualDefinition = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
       .get(index.name) as { sql: string | null } | null;
-    if (actualDefinition === null || actualDefinition.sql === null || normalizedSql(actualDefinition.sql) !== index.sql) {
+    if (
+      actualDefinition === null ||
+      actualDefinition.sql === null ||
+      normalizedSql(actualDefinition.sql) !== normalizedSql(index.sql)
+    ) {
       fail(`required index is missing or altered: ${index.name}`);
     }
   }
@@ -1042,6 +1217,32 @@ function assertRequiredSchema(database: Database): void {
     toolCallUniqueIndexes[0]?.name !== "idx_tool_calls_call_id"
   ) {
     fail("tool_calls must have exactly one non-partial unique call_id constraint");
+  }
+
+  assertScheduleLeaseTuples(database);
+
+  const expectedTables = new Set([...Object.keys(requiredTableColumns), "sqlite_sequence"]);
+  const unexpectedTable = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    .all() as Array<{ name: string }>;
+  if (unexpectedTable.some((table) => !expectedTables.has(table.name))) {
+    fail("database contains an unexpected table");
+  }
+
+  const unexpectedIndex = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
+    .all() as Array<{ name: string }>;
+  const expectedIndexNames: Set<string> = new Set(requiredIndexes.map((index) => index.name));
+  if (unexpectedIndex.some((index) => !expectedIndexNames.has(index.name))) {
+    fail("database contains an unexpected index");
+  }
+
+  const actualTriggers = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    .all() as Array<{ name: string }>;
+  const expectedTriggerNames: Set<string> = new Set(requiredTriggerDefinitions.map((trigger) => trigger.name));
+  if (actualTriggers.some((trigger) => !expectedTriggerNames.has(trigger.name))) {
+    fail("database contains an unexpected trigger");
   }
 
   const foreignKeyViolations = database.query("PRAGMA foreign_key_check").all();

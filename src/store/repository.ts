@@ -180,6 +180,11 @@ function scheduleFromRow(row: Row): ScheduleRecord {
   if (row.enabled !== 0 && row.enabled !== 1) {
     throw new PersistenceError(`invalid persisted schedule enabled value: ${String(row.enabled)}`);
   }
+  const hasClaimedBy = row.claimed_by !== null && row.claimed_by !== undefined;
+  const hasClaimedAt = row.claimed_at !== null && row.claimed_at !== undefined;
+  if (hasClaimedBy !== hasClaimedAt) {
+    throw new PersistenceError(`invalid persisted schedule lease tuple for ${String(row.id)}`);
+  }
   return {
     id: String(row.id),
     prompt: String(row.prompt),
@@ -224,19 +229,21 @@ export class StoreRepository {
   startRun(taskId: string, idempotencyKey: string): RunRecord {
     const id = randomUUID();
     const startedAt = Date.now();
-    this.database
-      .query(
-        `INSERT INTO runs (id, task_id, idempotency_key, status, started_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (task_id, idempotency_key) DO NOTHING`,
-      )
-      .run(id, taskId, idempotencyKey, "running", startedAt);
-
-    return runFromRow(
+    return immediateTransaction(this.database, () => {
       this.database
-        .query("SELECT * FROM runs WHERE task_id = ? AND idempotency_key = ?")
-        .get(taskId, idempotencyKey) as Row,
-    );
+        .query(
+          `INSERT INTO runs (id, task_id, idempotency_key, status, started_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (task_id, idempotency_key) DO NOTHING`,
+        )
+        .run(id, taskId, idempotencyKey, "running", startedAt);
+
+      return runFromRow(
+        this.database
+          .query("SELECT * FROM runs WHERE task_id = ? AND idempotency_key = ?")
+          .get(taskId, idempotencyKey) as Row,
+      );
+    });
   }
 
   appendMessage(runId: string, message: Message): void {
@@ -251,78 +258,86 @@ export class StoreRepository {
   }
 
   appendEvent(runId: string, type: string, payload: unknown): void {
-    this.database
-      .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-      .run(runId, type, json(payload), Date.now());
+    immediateTransaction(this.database, () => {
+      this.database
+        .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(runId, type, json(payload), Date.now());
+    });
   }
 
   recordToolCall(runId: string, call: ToolCall, state: string): boolean {
     const argumentsJson = canonicalJson(call.arguments);
-    const result = this.database
-      .query(
-        `INSERT INTO tool_calls (run_id, call_id, name, arguments, state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (call_id) DO NOTHING`,
-      )
-      .run(runId, call.id, call.name, argumentsJson, state, Date.now());
+    return immediateTransaction(this.database, () => {
+      const result = this.database
+        .query(
+          `INSERT INTO tool_calls (run_id, call_id, name, arguments, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (call_id) DO NOTHING`,
+        )
+        .run(runId, call.id, call.name, argumentsJson, state, Date.now());
 
-    if (result.changes === 1) {
-      return true;
-    }
+      if (result.changes === 1) {
+        return true;
+      }
 
-    const existing = this.database
-      .query("SELECT run_id, name, arguments FROM tool_calls WHERE call_id = ?")
-      .get(call.id) as { run_id: string; name: string; arguments: string } | null;
-    if (
-      existing === null ||
-      existing.run_id !== runId ||
-      existing.name !== call.name ||
-      canonicalArguments(existing.arguments) !== argumentsJson
-    ) {
-      throw new PersistenceError(`tool call ID ${call.id} conflicts with an existing call`);
-    }
-    return false;
+      const existing = this.database
+        .query("SELECT run_id, name, arguments FROM tool_calls WHERE call_id = ?")
+        .get(call.id) as { run_id: string; name: string; arguments: string } | null;
+      if (
+        existing === null ||
+        existing.run_id !== runId ||
+        existing.name !== call.name ||
+        canonicalArguments(existing.arguments) !== argumentsJson
+      ) {
+        throw new PersistenceError(`tool call ID ${call.id} conflicts with an existing call`);
+      }
+      return false;
+    });
   }
 
   finishToolCall(runId: string, callId: string, result: unknown, state: string): void {
-    const update = this.database
-      .query(
-        `UPDATE tool_calls
-         SET result = ?, state = ?, finished_at = ?
-         WHERE run_id = ? AND call_id = ?`,
-      )
-      .run(json(result), state, Date.now(), runId, callId);
-    if (update.changes !== 1) {
-      throw new PersistenceError(`tool call ${callId} was not found for run ${runId}`);
-    }
+    immediateTransaction(this.database, () => {
+      const update = this.database
+        .query(
+          `UPDATE tool_calls
+           SET result = ?, state = ?, finished_at = ?
+           WHERE run_id = ? AND call_id = ?`,
+        )
+        .run(json(result), state, Date.now(), runId, callId);
+      if (update.changes !== 1) {
+        throw new PersistenceError(`tool call ${callId} was not found for run ${runId}`);
+      }
+    });
   }
 
   saveApproval(input: ApprovalRecord): void {
-    this.database
-      .query(
-        `INSERT INTO approvals
-          (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision, requested_at, resolved_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (call_id, arguments_hash) DO UPDATE SET
-           task_id = excluded.task_id,
-           run_id = excluded.run_id,
-           capability = excluded.capability,
-           risk_level = excluded.risk_level,
-           decision = excluded.decision,
-           requested_at = excluded.requested_at,
-           resolved_at = excluded.resolved_at`,
-      )
-      .run(
-        input.callId,
-        input.argumentsHash,
-        input.taskId ?? null,
-        input.runId ?? null,
-        input.capability,
-        input.riskLevel,
-        input.decision,
-        input.requestedAt,
-        input.resolvedAt ?? null,
-      );
+    immediateTransaction(this.database, () => {
+      this.database
+        .query(
+          `INSERT INTO approvals
+            (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision, requested_at, resolved_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (call_id, arguments_hash) DO UPDATE SET
+             task_id = excluded.task_id,
+             run_id = excluded.run_id,
+             capability = excluded.capability,
+             risk_level = excluded.risk_level,
+             decision = excluded.decision,
+             requested_at = excluded.requested_at,
+             resolved_at = excluded.resolved_at`,
+        )
+        .run(
+          input.callId,
+          input.argumentsHash,
+          input.taskId ?? null,
+          input.runId ?? null,
+          input.capability,
+          input.riskLevel,
+          input.decision,
+          input.requestedAt,
+          input.resolvedAt ?? null,
+        );
+    });
   }
 
   getApproval(callId: string, argumentsHash: string): ApprovalRecord | null {
@@ -334,31 +349,33 @@ export class StoreRepository {
 
   saveMemory(input: MemoryRecord): void {
     const timestamp = Date.now();
-    this.database
-      .query(
-        `INSERT INTO memories
-          (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (id) DO UPDATE SET
-           task_id = excluded.task_id,
-           run_id = excluded.run_id,
-           kind = excluded.kind,
-           content = excluded.content,
-           metadata = excluded.metadata,
-           confidence = excluded.confidence,
-           updated_at = excluded.updated_at`,
-      )
-      .run(
-        input.id,
-        input.taskId ?? null,
-        input.runId ?? null,
-        input.kind,
-        input.content,
-        json(input.metadata ?? {}),
-        input.confidence ?? null,
-        input.createdAt ?? timestamp,
-        input.updatedAt ?? timestamp,
-      );
+    immediateTransaction(this.database, () => {
+      this.database
+        .query(
+          `INSERT INTO memories
+            (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (id) DO UPDATE SET
+             task_id = excluded.task_id,
+             run_id = excluded.run_id,
+             kind = excluded.kind,
+             content = excluded.content,
+             metadata = excluded.metadata,
+             confidence = excluded.confidence,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.id,
+          input.taskId ?? null,
+          input.runId ?? null,
+          input.kind,
+          input.content,
+          json(input.metadata ?? {}),
+          input.confidence ?? null,
+          input.createdAt ?? timestamp,
+          input.updatedAt ?? timestamp,
+        );
+    });
   }
 
   searchMemories(query: string, limit: number): MemoryRecord[] {
@@ -379,25 +396,32 @@ export class StoreRepository {
   }
 
   createSchedule(input: ScheduleRecord): void {
-    this.database
-      .query(
-        `INSERT INTO schedules
-          (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.id,
-        input.taskId ?? null,
-        input.prompt,
-        input.cron ?? null,
-        input.nextRunAt,
-        input.enabled === false ? 0 : 1,
-        input.claimedBy ?? null,
-        input.claimedAt ?? null,
-        input.leaseToken ?? null,
-        input.lastError ?? null,
-        input.createdAt ?? Date.now(),
-      );
+    const hasClaimedBy = input.claimedBy !== null && input.claimedBy !== undefined;
+    const hasClaimedAt = input.claimedAt !== null && input.claimedAt !== undefined;
+    if (hasClaimedBy !== hasClaimedAt) {
+      throw new PersistenceError("schedule claimed_by and claimed_at must be both set or both null");
+    }
+    immediateTransaction(this.database, () => {
+      this.database
+        .query(
+          `INSERT INTO schedules
+            (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.taskId ?? null,
+          input.prompt,
+          input.cron ?? null,
+          input.nextRunAt,
+          input.enabled === false ? 0 : 1,
+          input.claimedBy ?? null,
+          input.claimedAt ?? null,
+          input.leaseToken ?? null,
+          input.lastError ?? null,
+          input.createdAt ?? Date.now(),
+        );
+    });
   }
 
   claimDueSchedule(now: number, owner: string): ScheduleRecord | null {
@@ -407,7 +431,7 @@ export class StoreRepository {
         .query(
           `SELECT id FROM schedules
            WHERE enabled = 1 AND next_run_at <= ?
-             AND (claimed_by IS NULL OR (claimed_at IS NOT NULL AND claimed_at <= ?))
+             AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?)
            ORDER BY next_run_at, id
            LIMIT 1`,
         )
@@ -422,7 +446,7 @@ export class StoreRepository {
           `UPDATE schedules
            SET claimed_by = ?, claimed_at = ?, lease_token = ?
            WHERE id = ? AND enabled = 1 AND next_run_at <= ?
-             AND (claimed_by IS NULL OR (claimed_at IS NOT NULL AND claimed_at <= ?))`,
+             AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?)`,
         )
         .run(owner, now, leaseToken, row.id, now, staleBefore);
       if (updated.changes !== 1) {
@@ -440,15 +464,17 @@ export class StoreRepository {
     nextRunAt: number | null,
     error: string | null,
   ): boolean {
-    const update = this.database
-      .query(
-        `UPDATE schedules
-         SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL,
-             enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
-         WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
-      )
-      .run(nextRunAt, error, nextRunAt, id, owner, leaseToken);
-    return update.changes === 1;
+    return immediateTransaction(this.database, () => {
+      const update = this.database
+        .query(
+          `UPDATE schedules
+           SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL,
+               enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
+           WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
+        )
+        .run(nextRunAt, error, nextRunAt, id, owner, leaseToken);
+      return update.changes === 1;
+    });
   }
 
   getSchedule(id: string): ScheduleRecord | null {
