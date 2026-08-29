@@ -778,6 +778,17 @@ test("migration rejects a partial unique tool-call index", () => {
   });
 });
 
+test("migration rejects redundant tool-call uniqueness constraints", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("CREATE UNIQUE INDEX idx_tool_calls_call_id_duplicate ON tool_calls(call_id)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/unique|tool.?call|index/i);
+  });
+});
+
 test("migration rejects existing foreign-key violations", () => {
   withDatabase((path, open) => {
     open().close();
@@ -817,6 +828,60 @@ test("migration rejects a same-name table with an altered declared type", () => 
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/declared type|schema|tasks/i);
+  });
+});
+
+test("migration rejects a required table with a missing primary key", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("ALTER TABLE tool_calls RENAME TO tool_calls_original");
+    database.exec(`
+      CREATE TABLE tool_calls (
+        id INTEGER,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      )
+    `);
+    database.exec("DROP TABLE tool_calls_original");
+    database.exec("CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/primary key|tool.?calls|schema/i);
+  });
+});
+
+test("migration rejects a required NOT NULL column made nullable", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("ALTER TABLE tool_calls RENAME TO tool_calls_original");
+    database.exec(`
+      CREATE TABLE tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        call_id TEXT,
+        name TEXT NOT NULL,
+        arguments TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      )
+    `);
+    database.exec("DROP TABLE tool_calls_original");
+    database.exec("CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id)");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/not null|tool.?calls|schema/i);
   });
 });
 
@@ -872,6 +937,18 @@ test("migration rejects a same-name status guard with altered behavior", () => {
   });
 });
 
+test("migration rejects a historical status expression with altered behavior", () => {
+  withDatabase((path) => {
+    const alteredHistoricalSql = historicalVersionOneSqlFrom0084a0f.replace(
+      "status IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')",
+      "status IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') OR 1 = 1",
+    );
+    createHistoricalDatabase(path, alteredHistoricalSql, historicalVersionOneChecksum, () => {});
+
+    expect(() => openDatabase(path)).toThrow(/lineage|schema|status|checksum/i);
+  });
+});
+
 test("migration rejects a current schema carrying the historical v1 checksum", () => {
   withDatabase((path, open) => {
     open().close();
@@ -915,15 +992,22 @@ test("fresh databases apply the complete migration history", () => {
 test("fresh databases keep tool-call uniqueness in one explicit index", () => {
   withDatabase((_path, open) => {
     const database = open();
-    const table = database
-      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'")
-      .get() as { sql: string };
-    expect(table.sql).not.toMatch(/call_id\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i);
-    expect(
-      (database.query("PRAGMA index_list('tool_calls')").all() as Array<{ name: string }>).filter(
-        (index) => index.name === "idx_tool_calls_call_id",
-      ),
-    ).toHaveLength(1);
+    const indexes = database.query("PRAGMA index_list('tool_calls')").all() as Array<{
+      name: string;
+      unique: number;
+      partial: number;
+    }>;
+    const callIdUniqueIndexes = indexes.filter((index) => {
+      if (Number(index.unique) !== 1 || Number(index.partial) !== 0) {
+        return false;
+      }
+      const columns = database.query(`PRAGMA index_info('${index.name}')`).all() as Array<{ name: string; seqno: number }>;
+      return columns.sort((left, right) => left.seqno - right.seqno).map((column) => column.name).join(",") === "call_id";
+    });
+
+    expect(callIdUniqueIndexes).toEqual([
+      expect.objectContaining({ name: "idx_tool_calls_call_id", unique: 1, partial: 0 }),
+    ]);
   });
 });
 
@@ -1095,8 +1179,8 @@ test("decoding rejects tampered approval and schedule domains", () => {
   });
 });
 
-test("task, message, and event writes remain safe across database connections", async () => {
-  await withDatabase(async (_path, open) => {
+test("contended writes use bounded SQLITE_BUSY handling across database connections", () => {
+  withDatabase((_path, open) => {
     const firstDatabase = open();
     const secondDatabase = open();
     const first = new StoreRepository(firstDatabase);
@@ -1104,19 +1188,15 @@ test("task, message, and event writes remain safe across database connections", 
     const task = first.createTask({ title: "Contention", prompt: "Write", workspace: "/tmp/workspace", maxSteps: 1 });
     const run = first.startRun(task.id, "contention-run");
 
-    await Promise.all([
-      Promise.resolve().then(() => {
-        second.createTask({ title: "Contention 2", prompt: "Write", workspace: "/tmp/workspace", maxSteps: 1 });
-        second.appendMessage(run.id, { role: "user", content: "from second" });
-        second.appendEvent(run.id, "second", { ok: true });
-      }),
-      Promise.resolve().then(() => {
-        first.appendMessage(run.id, { role: "assistant", content: "from first" });
-        first.appendEvent(run.id, "first", { ok: true });
-      }),
-    ]);
+    firstDatabase.exec("BEGIN IMMEDIATE");
+    secondDatabase.exec("PRAGMA busy_timeout = 0");
+    expect(() => second.appendMessage(run.id, { role: "user", content: "blocked" })).toThrow(/busy|locked/i);
+    firstDatabase.exec("ROLLBACK");
 
-    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM messages WHERE run_id = ?").get(run.id)).toEqual({ count: 2 });
-    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM events WHERE run_id = ?").get(run.id)).toEqual({ count: 2 });
+    second.appendMessage(run.id, { role: "assistant", content: "after release" });
+    second.appendEvent(run.id, "second", { ok: true });
+
+    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM messages WHERE run_id = ?").get(run.id)).toEqual({ count: 1 });
+    expect(firstDatabase.query("SELECT COUNT(*) AS count FROM events WHERE run_id = ?").get(run.id)).toEqual({ count: 1 });
   });
 });

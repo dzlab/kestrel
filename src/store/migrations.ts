@@ -342,6 +342,30 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
   ],
 };
 
+const requiredPrimaryKeys: Readonly<Record<string, Readonly<Record<string, number>>>> = {
+  schema_migrations: { version: 1 },
+  tasks: { id: 1 },
+  runs: { id: 1 },
+  messages: { id: 1 },
+  tool_calls: { id: 1 },
+  events: { id: 1 },
+  memories: { id: 1 },
+  schedules: { id: 1 },
+  approvals: { call_id: 1, arguments_hash: 2 },
+};
+
+const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
+  schema_migrations: ["checksum", "applied_at"],
+  tasks: ["title", "prompt", "workspace", "max_steps", "status", "created_at", "updated_at"],
+  runs: ["task_id", "idempotency_key", "status", "started_at"],
+  messages: ["run_id", "sequence_number", "payload", "created_at"],
+  tool_calls: ["run_id", "call_id", "name", "arguments", "state", "created_at"],
+  events: ["type", "payload", "created_at"],
+  memories: ["kind", "content", "metadata", "created_at", "updated_at"],
+  schedules: ["prompt", "enabled", "created_at"],
+  approvals: ["call_id", "arguments_hash", "capability", "risk_level", "decision", "requested_at"],
+};
+
 type ForeignKeyDefinition = { table: string; from: string; to: string };
 
 const requiredForeignKeys: Readonly<Record<string, readonly ForeignKeyDefinition[]>> = {
@@ -569,15 +593,16 @@ function assertSchemaMigrationsShape(database: Database, allowLegacyNullableChec
     if (actual.type.toUpperCase() !== requiredColumn.type) {
       fail(`schema_migrations column ${requiredColumn.name} has an altered declared type`);
     }
-    if (requiredColumn.name === "version" && actual.pk !== 1) {
-      fail("schema_migrations version must be the primary key");
+    const expectedPrimaryKey = requiredPrimaryKeys.schema_migrations[requiredColumn.name] ?? 0;
+    if (actual.pk !== expectedPrimaryKey) {
+      fail(`schema_migrations column ${requiredColumn.name} has altered primary-key metadata`);
     }
+    const expectedNotNull = requiredNotNullColumns.schema_migrations.includes(requiredColumn.name) ? 1 : 0;
     if (
-      (requiredColumn.name === "checksum" || requiredColumn.name === "applied_at") &&
-      actual.notnull !== 1 &&
-      !(requiredColumn.name === "checksum" && allowLegacyNullableChecksum)
+      actual.notnull !== expectedNotNull &&
+      !(requiredColumn.name === "checksum" && allowLegacyNullableChecksum && actual.notnull === 0)
     ) {
-      fail(`schema_migrations column ${requiredColumn.name} must be NOT NULL`);
+      fail(`schema_migrations column ${requiredColumn.name} has altered NOT NULL metadata`);
     }
   }
   return expected.length === requiredTableColumns.schema_migrations.length;
@@ -597,6 +622,14 @@ function assertTableColumns(database: Database, table: string, expected: readonl
     }
     if (actualColumn === undefined || actualColumn.type.toUpperCase() !== requiredColumn.type) {
       fail(`required table ${table} column ${requiredColumn.name} has an altered declared type`);
+    }
+    const expectedPrimaryKey = requiredPrimaryKeys[table]?.[requiredColumn.name] ?? 0;
+    if (actualColumn.pk !== expectedPrimaryKey) {
+      fail(`required table ${table} column ${requiredColumn.name} has altered primary-key metadata`);
+    }
+    const expectedNotNull = requiredNotNullColumns[table]?.includes(requiredColumn.name) ? 1 : 0;
+    if (actualColumn.notnull !== expectedNotNull) {
+      fail(`required table ${table} column ${requiredColumn.name} has altered NOT NULL metadata`);
     }
   }
 }
@@ -642,6 +675,41 @@ const hardenedVersionOneLineage: SchemaLineage = {
   hasIndexes: true,
   hasInlineStatusChecks: true,
 };
+
+const taskStatusValues = "'pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted'";
+const runStatusValues = "'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted'";
+
+function expectedLineageTableSql(table: "tasks" | "runs", hasInlineStatusChecks: boolean): string {
+  const status = table === "tasks" ? taskStatusValues : runStatusValues;
+  const statusColumn = hasInlineStatusChecks
+    ? `status TEXT NOT NULL CHECK (status IN (${status}))`
+    : "status TEXT NOT NULL";
+  if (table === "tasks") {
+    return normalizedSql(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        max_steps INTEGER NOT NULL,
+        ${statusColumn},
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+  }
+  return normalizedSql(`
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      idempotency_key TEXT NOT NULL,
+      ${statusColumn},
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      UNIQUE (task_id, idempotency_key)
+    )
+  `);
+}
 
 const schemaLineages = new Map<string, SchemaLineage>([
   [originalVersionOneLineage.checksum, originalVersionOneLineage],
@@ -691,8 +759,10 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
     const row = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(table) as { sql: string } | null;
-    const hasCheck = row !== null && normalizedSql(row.sql).includes("status text not null check");
-    if (hasCheck !== lineage.hasInlineStatusChecks) {
+    if (
+      row === null ||
+      normalizedSql(row.sql) !== expectedLineageTableSql(table as "tasks" | "runs", lineage.hasInlineStatusChecks)
+    ) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
     }
   }
@@ -772,9 +842,14 @@ function assertRequiredSchema(database: Database): void {
     const indexes = database.query(`PRAGMA index_list('${index.table}')`).all() as Array<{
       name: string;
       unique: number;
+      partial: number;
     }>;
     const actual = indexes.find((candidate) => candidate.name === index.name);
-    if (actual === undefined || Number(actual.unique) !== (index.unique ? 1 : 0)) {
+    if (
+      actual === undefined ||
+      Number(actual.unique) !== (index.unique ? 1 : 0) ||
+      Number(actual.partial) !== 0
+    ) {
       fail(`required index is missing or altered: ${index.name}`);
     }
 
@@ -841,6 +916,28 @@ function assertRequiredSchema(database: Database): void {
     database.query("SELECT 1 AS invalid FROM schedules WHERE enabled NOT IN (0, 1) LIMIT 1").get() !== null
   ) {
     fail("schedules contains an invalid persisted enabled value");
+  }
+
+  const toolCallIndexes = database.query("PRAGMA index_list('tool_calls')").all() as Array<{
+    name: string;
+    unique: number;
+    partial: number;
+  }>;
+  const toolCallUniqueIndexes = toolCallIndexes.filter((index) => {
+    if (Number(index.unique) !== 1 || Number(index.partial) !== 0) {
+      return false;
+    }
+    const columns = database.query(`PRAGMA index_info('${index.name}')`).all() as Array<{
+      name: string;
+      seqno: number;
+    }>;
+    return columns.sort((left, right) => left.seqno - right.seqno).map((column) => column.name).join(",") === "call_id";
+  });
+  if (
+    toolCallUniqueIndexes.length !== 1 ||
+    toolCallUniqueIndexes[0]?.name !== "idx_tool_calls_call_id"
+  ) {
+    fail("tool_calls must have exactly one non-partial unique call_id constraint");
   }
 
   const foreignKeyViolations = database.query("PRAGMA foreign_key_check").all();
