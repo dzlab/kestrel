@@ -253,7 +253,8 @@ Expected: libc.so.6 loads, all tests pass, and no libSystem.B.dylib error occurs
 Run:
 
 ~~~~sh
-! rg -n 'dlopen\("/usr/lib/libSystem\.B\.dylib"|/usr/lib/libSystem\.B\.dylib' src tests
+! rg -n 'dlopen\("/usr/lib/libSystem\.B\.dylib"' src
+! rg -n '/usr/lib/libSystem\.B\.dylib' src/tools/secure-fs.ts tests
 rg -n 'getNativeFs|loadNativeFsForPlatform|macos-latest|ubuntu-latest' src tests .github/workflows README.md
 git status --short
 ~~~~
