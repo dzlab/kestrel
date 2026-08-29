@@ -65,6 +65,7 @@ test("exposes portable native filesystem constants and errno names", () => {
 test("decodes Darwin and Linux dirent fixtures with the same name and type", () => {
   if (!isSupportedPlatform(process.platform)) return;
 
+  // Keep the platform explicit so this pure top-level decoder exercises both ABI layouts on either host.
   for (const platform of supportedPlatforms) {
     expect(decodeDirent(platform, fixtures[platform].bytes)).toMatchObject({ name: "entry", type: 4 });
   }
@@ -72,8 +73,6 @@ test("decodes Darwin and Linux dirent fixtures with the same name and type", () 
 
 test("rejects oversized and unterminated native dirent records", () => {
   if (!isSupportedPlatform(process.platform)) return;
-
-  const nativeFs = getNativeFs();
 
   for (const platform of supportedPlatforms) {
     const fixture = fixtures[platform];
@@ -83,8 +82,8 @@ test("rejects oversized and unterminated native dirent records", () => {
     const missingNulOffset = fixture.nameOffset + "entry".length;
 
     view.setUint16(16, 0xffff, true);
-    missingNul[missingNulOffset] = 0x78;
-    expect(missingNul[missingNulOffset]).toBe(0x78);
+    missingNul.fill(0x78, missingNulOffset);
+    expect(missingNul.slice(missingNulOffset).every((byte) => byte !== 0)).toBe(true);
 
     expect(() => decodeDirent(platform, oversized)).toThrow(/invalid|record/i);
     expect(() => decodeDirent(platform, missingNul)).toThrow(/invalid|NUL|terminat/i);
