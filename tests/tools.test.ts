@@ -126,6 +126,76 @@ test("writes a file and applies a unified patch without a shell", async () => {
   });
 });
 
+test("patch treats a deleted line beginning with -- as hunk content", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "markers.txt"), "-- old\nkeep\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "ambiguous-deletion",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/markers.txt\n+++ b/markers.txt\n@@ -1,2 +1,2 @@\n--- old\n+-- new\n keep\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace, "markers.txt"), "utf8")).toBe("-- new\nkeep\n");
+  });
+});
+
+test("patch validates the new hunk range and supports zero-count insertion offsets", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "range.txt"), "a\nb\n");
+    const invalid = await createToolRegistry().execute(
+      {
+        id: "bad-new-range",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/range.txt\n+++ b/range.txt\n@@ -1,1 +3,1 @@\n-a\n+x\n",
+        },
+      },
+      context,
+    );
+    expect(invalid.ok).toBe(false);
+    expect(readFileSync(join(workspace, "range.txt"), "utf8")).toBe("a\nb\n");
+
+    const inserted = await createToolRegistry().execute(
+      {
+        id: "insert-at-start",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/range.txt\n+++ b/range.txt\n@@ -0,0 +1,1 @@\n+x\n",
+        },
+      },
+      context,
+    );
+    expect(inserted.ok).toBe(true);
+    expect(readFileSync(join(workspace, "range.txt"), "utf8")).toBe("x\na\nb\n");
+  });
+});
+
+test("patch validates new ranges across multiple hunks with unchanged gaps", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "multi.txt"), "a\nb\nc\nd\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "multi-hunk-range",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "--- a/multi.txt\n+++ b/multi.txt\n@@ -1,1 +1,1 @@\n a\n@@ -4,1 +4,1 @@\n-d\n+D\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace, "multi.txt"), "utf8")).toBe("a\nb\nc\nD\n");
+  });
+});
+
 test("rejects traversal and symlink escapes", async () => {
   await withWorkspace(async (workspace, context) => {
     const outside = mkdtempSync(join(tmpdir(), "kestrel-outside-"));
@@ -245,6 +315,50 @@ test("patch-created files preserve the patch newline semantics", async () => {
   });
 });
 
+test("patch validates newline markers and source newline semantics", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "source.txt"), "old");
+    const missingSourceMarker = await createToolRegistry().execute(
+      {
+        id: "missing-source-marker",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        },
+      },
+      context,
+    );
+    expect(missingSourceMarker.ok).toBe(false);
+    expect(readFileSync(join(workspace, "source.txt"), "utf8")).toBe("old");
+
+    const markerAtStart = await createToolRegistry().execute(
+      {
+        id: "marker-at-start",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/source.txt\n+++ b/source.txt\n@@ -0,0 +0,0 @@\n\\ No newline at end of file\n",
+        },
+      },
+      context,
+    );
+    expect(markerAtStart.ok).toBe(false);
+
+    const valid = await createToolRegistry().execute(
+      {
+        id: "preserve-no-newline",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+        },
+      },
+      context,
+    );
+    expect(valid.ok).toBe(true);
+    expect(readFileSync(join(workspace, "source.txt"), "utf8")).toBe("new");
+  });
+});
+
 test("patch rejects non-empty lines between headers and hunks", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "target.txt"), "before\n");
@@ -337,6 +451,36 @@ test("patch rolls back earlier files when a later commit operation fails", async
   });
 });
 
+test("patch rollback preserves pre-existing directories", async () => {
+  await withWorkspace(async (workspace, context) => {
+    mkdirSync(join(workspace, "pre-existing"));
+    writeFileSync(join(workspace, "safe.txt"), "original\n");
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("safe.txt")) throw new Error("force rollback");
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "preserve-directory",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "--- /dev/null\n+++ b/pre-existing/child.txt\n@@ -0,0 +1 @@\n+child\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(existsSync(join(workspace, "pre-existing"))).toBe(true);
+    expect(existsSync(join(workspace, "pre-existing", "child.txt"))).toBe(false);
+  });
+});
+
 test("patch validates deletion contents before unlinking", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "keep.txt"), "actual\n");
@@ -390,6 +534,57 @@ test("bounds structured tool data as well as content", async () => {
       MAX_TOOL_OUTPUT_BYTES,
     );
     expect(result.data).not.toHaveLength(1_000);
+  });
+});
+
+test("enforces one aggregate serialized ToolResult budget", async () => {
+  const tool = {
+    definition: {
+      name: "oversized-result",
+      description: "returns oversized result fields",
+      capability: "filesystem",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    },
+    async execute() {
+      return { ok: true, content: "c".repeat(MAX_TOOL_OUTPUT_BYTES), data: "d".repeat(MAX_TOOL_OUTPUT_BYTES) };
+    },
+  };
+
+  const registry = new ToolRegistry([tool]);
+  const result = await registry.execute(
+    { id: "aggregate-budget", name: "oversized-result", arguments: {} },
+    { workspace: "/tmp", runId: "run-budget", repository: {} } as ToolContext,
+  );
+  const dataBytes = result.data === undefined ? 0 : Buffer.byteLength(JSON.stringify(result.data), "utf8");
+  expect(Buffer.byteLength(result.content, "utf8") + dataBytes).toBeLessThanOrEqual(MAX_TOOL_OUTPUT_BYTES);
+  expect(result.data).not.toBe("d".repeat(MAX_TOOL_OUTPUT_BYTES));
+});
+
+test("direct search honors ignored directories and rejects special files", async () => {
+  await withWorkspace(async (workspace, context) => {
+    mkdirSync(join(workspace, ".git"));
+    mkdirSync(join(workspace, "node_modules"));
+    writeFileSync(join(workspace, ".git", "ignored.txt"), "needle\n");
+    writeFileSync(join(workspace, "node_modules", "ignored.txt"), "needle\n");
+    const fifo = join(workspace, "pipe");
+    expect(libc.symbols.mkfifo(fifo, 0o600)).toBe(0);
+    const registry = createToolRegistry();
+
+    for (const path of [".git", "node_modules", ".git/ignored.txt", "node_modules/ignored.txt"]) {
+      const ignored = await registry.execute(
+        { id: `ignored-${path}`, name: "search.text", arguments: { query: "needle", path } },
+        context,
+      );
+      expect(ignored.ok).toBe(true);
+      expect(ignored.data).toEqual([]);
+    }
+
+    const special = await registry.execute(
+      { id: "special-search", name: "search.text", arguments: { query: "needle", path: "pipe" } },
+      context,
+    );
+    expect(special.ok).toBe(false);
+    expect(special.content).toContain("regular file");
   });
 });
 

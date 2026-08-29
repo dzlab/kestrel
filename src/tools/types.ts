@@ -40,10 +40,14 @@ export function truncateUtf8(value: string, maxBytes: number): string {
 
 export function boundToolResult(result: ToolResult): ToolResult {
   const hasData = Object.prototype.hasOwnProperty.call(result, "data") && result.data !== undefined;
+  const content = truncateUtf8(result.content, MAX_TOOL_OUTPUT_BYTES);
+  const remainingDataBytes = Math.max(0, MAX_TOOL_OUTPUT_BYTES - Buffer.byteLength(content, "utf8"));
+  const data = hasData ? boundToolData(result.data, remainingDataBytes) : undefined;
+  const { data: _originalData, ...withoutData } = result;
   return {
-    ...result,
-    content: truncateUtf8(result.content, MAX_TOOL_OUTPUT_BYTES),
-    ...(hasData ? { data: boundToolData(result.data) } : {}),
+    ...withoutData,
+    content,
+    ...(data === undefined ? {} : { data }),
   };
 }
 
@@ -56,10 +60,14 @@ function jsonByteLength(value: unknown): number | null {
   }
 }
 
-function boundArray(value: unknown[], maxBytes: number): unknown[] {
+function boundArray(value: unknown[], maxBytes: number): unknown[] | undefined {
+  if (maxBytes < 2) return undefined;
   const bounded: unknown[] = [];
   for (const item of value) {
-    const candidate = boundToolData(item, Math.max(0, maxBytes - 2));
+    const currentBytes = jsonByteLength(bounded) ?? 2;
+    const separatorBytes = bounded.length === 0 ? 0 : 1;
+    const candidate = boundToolData(item, Math.max(0, maxBytes - currentBytes - separatorBytes));
+    if (candidate === undefined) break;
     const next = [...bounded, candidate];
     const nextBytes = jsonByteLength(next);
     if (nextBytes !== null && nextBytes <= maxBytes) {
@@ -68,31 +76,38 @@ function boundArray(value: unknown[], maxBytes: number): unknown[] {
       break;
     }
   }
-  return bounded;
+  return jsonByteLength(bounded) !== null && jsonByteLength(bounded)! <= maxBytes ? bounded : undefined;
 }
 
-function boundObject(value: Record<string, unknown>, maxBytes: number): Record<string, unknown> {
+function boundObject(value: Record<string, unknown>, maxBytes: number): Record<string, unknown> | undefined {
+  if (maxBytes < 2) return undefined;
   const bounded: Record<string, unknown> = {};
   for (const key of Object.keys(value).sort()) {
-    const candidate = boundToolData(value[key], Math.max(0, maxBytes - 2));
+    const currentBytes = jsonByteLength(bounded) ?? 2;
+    const separatorBytes = Object.keys(bounded).length === 0 ? 0 : 1;
+    const keyBytes = Buffer.byteLength(JSON.stringify(key), "utf8");
+    const candidate = boundToolData(value[key], Math.max(0, maxBytes - currentBytes - separatorBytes - keyBytes - 1));
+    if (candidate === undefined) continue;
     const next = { ...bounded, [key]: candidate };
     const nextBytes = jsonByteLength(next);
     if (nextBytes !== null && nextBytes <= maxBytes) {
       bounded[key] = candidate;
     }
   }
-  return bounded;
+  return jsonByteLength(bounded) !== null && jsonByteLength(bounded)! <= maxBytes ? bounded : undefined;
 }
 
-function boundToolData(value: unknown, maxBytes = MAX_TOOL_OUTPUT_BYTES): unknown {
-  const currentBytes = jsonByteLength(value);
-  if (currentBytes !== null && currentBytes <= maxBytes) return value;
-
-  if (typeof value === "string") return truncateJsonString(value, maxBytes);
+function boundToolData(value: unknown, maxBytes: number): unknown | undefined {
+  if (maxBytes < 0) return undefined;
+  if (typeof value === "string") {
+    const bounded = truncateJsonString(value, maxBytes);
+    return jsonByteLength(bounded) !== null && jsonByteLength(bounded)! <= maxBytes ? bounded : undefined;
+  }
   if (Array.isArray(value)) return boundArray(value, maxBytes);
   if (typeof value === "object" && value !== null) return boundObject(value as Record<string, unknown>, maxBytes);
 
-  return null;
+  const serialized = jsonByteLength(value);
+  return serialized !== null && serialized <= maxBytes ? value : undefined;
 }
 
 function truncateJsonString(value: string, maxBytes: number): string {

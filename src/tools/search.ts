@@ -1,13 +1,12 @@
 import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
-import { ValidationError } from "../errors";
+import { ToolExecutionError, ValidationError } from "../errors";
 import { readWorkspaceText, resolveWorkspacePath, safeDirectoryEntries, workspacePathInfo } from "./filesystem";
 import type { Tool } from "./types";
 import {
   MAX_READ_BYTES,
   MAX_SEARCH_MATCHES,
   MAX_TOOL_OUTPUT_BYTES,
-  boundToolResult,
 } from "./types";
 import type { ToolContext, ToolResult } from "./types";
 
@@ -28,6 +27,11 @@ function boundedMatches(matches: Match[]): Match[] {
     bounded.push(match);
   }
   return bounded;
+}
+
+function isIgnoredPath(workspace: string, path: string): boolean {
+  const remainder = relative(realpathSync(workspace), path);
+  return remainder.split(sep).some((component) => component === ".git" || component === "node_modules");
 }
 
 async function collectFiles(workspace: string, root: string, files: string[]): Promise<void> {
@@ -58,10 +62,12 @@ const searchTool: Tool = {
     if (query.length === 0) throw new ValidationError("query must be non-empty");
     const requestedPath = args.path === undefined ? "." : stringArgument(args, "path");
     const root = resolveWorkspacePath(context.workspace, requestedPath);
+    if (isIgnoredPath(context.workspace, root)) return { ok: true, content: "[]", data: [] };
     const rootInfo = workspacePathInfo(context.workspace, root);
     const files: string[] = [];
     if (rootInfo.isDirectory()) await collectFiles(context.workspace, root, files);
     else if (rootInfo.isFile()) files.push(root);
+    else throw new ToolExecutionError("search target is not a regular file or directory");
 
     const matches: Match[] = [];
     for (const file of files) {
@@ -75,7 +81,7 @@ const searchTool: Tool = {
       }
     }
     const bounded = boundedMatches(matches);
-    return boundToolResult({ ok: true, content: JSON.stringify(bounded), data: bounded });
+    return { ok: true, content: JSON.stringify(bounded), data: bounded };
   },
 };
 

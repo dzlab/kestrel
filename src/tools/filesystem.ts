@@ -6,9 +6,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
 import type { Tool } from "./types";
-import {
-  boundToolResult,
-} from "./types";
+import { MAX_TOOL_OUTPUT_BYTES } from "./types";
 import type { ToolContext, ToolResult } from "./types";
 import {
   closeSecureFile,
@@ -136,7 +134,7 @@ function relativePath(workspace: string, filePath: string): string {
 }
 
 function result(content: string, data?: unknown): ToolResult {
-  return boundToolResult({ ok: true, content, ...(data === undefined ? {} : { data }) });
+  return { ok: true, content, ...(data === undefined ? {} : { data }) };
 }
 
 async function readWorkspaceTextForPatch(workspace: string, path: string): Promise<string> {
@@ -164,7 +162,18 @@ const listTool: Tool = {
         name: entry.name,
         type: entry.type,
       }));
-    return result(JSON.stringify(entries), entries);
+    const bounded: typeof entries = [];
+    const serializedItems: string[] = [];
+    let serializedBytes = 2;
+    for (const entry of entries) {
+      const serialized = JSON.stringify(entry);
+      const nextBytes = serializedBytes + (serializedItems.length === 0 ? 0 : 1) + Buffer.byteLength(serialized, "utf8");
+      if (nextBytes > MAX_TOOL_OUTPUT_BYTES) break;
+      bounded.push(entry);
+      serializedItems.push(serialized);
+      serializedBytes = nextBytes;
+    }
+    return result(`[${serializedItems.join(",")}]`, bounded);
   },
 };
 
@@ -197,8 +206,10 @@ const writeTool: Tool = {
   },
 };
 
-type Hunk = { oldStart: number; oldCount: number; newCount: number; lines: string[] };
+type HunkLine = { marker: " " | "+" | "-"; text: string; noNewline: boolean };
+type Hunk = { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: HunkLine[] };
 type FilePatch = { oldPath: string | null; newPath: string | null; hunks: Hunk[] };
+type DirectoryOpenFailure = Error & { created?: string[] };
 
 function patchPath(value: string): string | null {
   const token = value.slice(4).split("\t", 1)[0];
@@ -211,8 +222,13 @@ function patchPath(value: string): string | null {
   return token;
 }
 
+function isFileHeaderAt(lines: string[], index: number): boolean {
+  return lines[index]?.startsWith("--- ") === true && lines[index + 1]?.startsWith("+++ ") === true;
+}
+
 function parsePatch(patch: string): FilePatch[] {
   const lines = patch.replace(/\r\n/gu, "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
   const files: FilePatch[] = [];
   let index = 0;
   while (index < lines.length) {
@@ -220,21 +236,21 @@ function parsePatch(patch: string): FilePatch[] {
       index += 1;
       continue;
     }
-    const oldPath = patchPath(lines[index]);
-    index += 1;
-    if (index >= lines.length || !lines[index].startsWith("+++ ")) {
+    if (!isFileHeaderAt(lines, index)) {
       throw new ValidationError("unified patch is missing its target header");
     }
+    const oldPath = patchPath(lines[index]);
+    index += 1;
     const newPath = patchPath(lines[index]);
     index += 1;
     const hunks: Hunk[] = [];
-    while (index < lines.length && !lines[index].startsWith("--- ")) {
-      const header = lines[index];
-      if (!header.startsWith("@@ ")) {
-        if (header.trim().length > 0) throw new ValidationError("unexpected unified patch line");
+    while (index < lines.length && !isFileHeaderAt(lines, index)) {
+      if (lines[index] === "") {
         index += 1;
         continue;
       }
+      const header = lines[index];
+      if (!header.startsWith("@@ ")) throw new ValidationError("unexpected unified patch line");
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u.exec(header);
       if (match === null) {
         throw new ValidationError("invalid unified patch hunk header");
@@ -254,33 +270,45 @@ function parsePatch(patch: string): FilePatch[] {
         throw new ValidationError("unified patch hunk range is invalid");
       }
       index += 1;
-      const hunkLines: string[] = [];
-      while (index < lines.length && !lines[index].startsWith("@@ ") && !lines[index].startsWith("--- ")) {
-        const line = lines[index];
-        if (line === "" && index === lines.length - 1) {
-          index += 1;
-          break;
-        }
-        if (line !== "\\ No newline at end of file" && !line.startsWith(" ") && !line.startsWith("+") && !line.startsWith("-")) {
-          throw new ValidationError("invalid unified patch line");
-        }
-        hunkLines.push(line);
-        index += 1;
-      }
+      const hunkLines: HunkLine[] = [];
       let consumedOld = 0;
       let producedNew = 0;
-      for (const line of hunkLines) {
-        if (line === "\\ No newline at end of file") continue;
-        if (line.startsWith("+")) producedNew += 1;
+      while (consumedOld < oldCount || producedNew < newCount) {
+        if (index >= lines.length) throw new ValidationError("unified patch hunk line counts do not match");
+        const line = lines[index];
+        if (line === "\\ No newline at end of file") {
+          const previous = hunkLines.at(-1);
+          if (previous === undefined || previous.noNewline) {
+            throw new ValidationError("invalid unified patch newline marker");
+          }
+          previous.noNewline = true;
+          index += 1;
+          continue;
+        }
+        const marker = line[0];
+        if (marker !== " " && marker !== "+" && marker !== "-") {
+          throw new ValidationError("invalid unified patch line");
+        }
+        hunkLines.push({ marker, text: line.slice(1), noNewline: false });
+        if (marker === "+") producedNew += 1;
         else {
           consumedOld += 1;
-          if (line.startsWith(" ")) producedNew += 1;
+          if (marker === " ") producedNew += 1;
         }
+        index += 1;
+      }
+      if (lines[index] === "\\ No newline at end of file") {
+        const previous = hunkLines.at(-1);
+        if (previous === undefined || previous.noNewline) {
+          throw new ValidationError("invalid unified patch newline marker");
+        }
+        previous.noNewline = true;
+        index += 1;
       }
       if (consumedOld !== oldCount || producedNew !== newCount) {
         throw new ValidationError("unified patch hunk line counts do not match");
       }
-      hunks.push({ oldStart, oldCount, newCount, lines: hunkLines });
+      hunks.push({ oldStart, oldCount, newStart, newCount, lines: hunkLines });
     }
     if (oldPath === null && newPath === null) {
       throw new ValidationError("patch must target a file");
@@ -311,33 +339,38 @@ function applyHunks(original: string, hunks: Hunk[]): string {
   let cursor = 0;
   for (const hunk of hunks) {
     const start = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
-    if (start < cursor || start > oldLines.length) throw new ValidationError("patch hunk is out of order");
+    const newStart = hunk.newStart === 0 ? 0 : hunk.newStart - 1;
+    if (start < cursor || start > oldLines.length) {
+      throw new ValidationError("patch hunk is out of order");
+    }
     output.push(...oldLines.slice(cursor, start));
+    if (newStart !== output.length) throw new ValidationError("patch hunk is out of order");
     cursor = start;
-    for (let lineIndex = 0; lineIndex < hunk.lines.length; lineIndex += 1) {
-      const line = hunk.lines[lineIndex]!;
-      if (line === "\\ No newline at end of file") {
-        const previous = hunk.lines[lineIndex - 1];
-        if ((previous?.startsWith("+") || previous?.startsWith(" ")) && output.length > 0) {
-          output[output.length - 1]!.newline = false;
+    for (const line of hunk.lines) {
+      if (line.marker === " ") {
+        const source = oldLines[cursor];
+        if (source?.text !== line.text) throw new ValidationError("patch context does not match file");
+        if (source.newline !== !line.noNewline) {
+          throw new ValidationError("patch source newline marker does not match file");
         }
-        continue;
-      }
-      const marker = line[0];
-      const text = line.slice(1);
-      if (marker === " ") {
-        if (oldLines[cursor]?.text !== text) throw new ValidationError("patch context does not match file");
-        output.push(oldLines[cursor]!);
+        output.push({ text: source.text, newline: source.newline });
         cursor += 1;
-      } else if (marker === "-") {
-        if (oldLines[cursor]?.text !== text) throw new ValidationError("patch deletion does not match file");
+      } else if (line.marker === "-") {
+        const source = oldLines[cursor];
+        if (source?.text !== line.text) throw new ValidationError("patch deletion does not match file");
+        if (source.newline !== !line.noNewline) {
+          throw new ValidationError("patch source newline marker does not match file");
+        }
         cursor += 1;
       } else {
-        output.push({ text, newline: true });
+        output.push({ text: line.text, newline: !line.noNewline });
       }
     }
   }
   output.push(...oldLines.slice(cursor));
+  if (output.some((line, index) => index < output.length - 1 && !line.newline)) {
+    throw new ValidationError("patch output has an invalid newline marker");
+  }
   const patched = output.map((line) => line.text).join("\n");
   return output.at(-1)?.newline === true && patched.length > 0 ? `${patched}\n` : patched;
 }
@@ -425,7 +458,13 @@ function patchTool(hooks: PatchHooks = {}): Tool {
     let transactionCommitted = false;
     try {
       for (const change of changes) {
-        const parent = openSecureParent(context.workspace, change.path, true);
+        let parent: ReturnType<typeof openSecureParent>;
+        try {
+          parent = openSecureParent(context.workspace, change.path, true);
+        } catch (error) {
+          for (const directory of (error as DirectoryOpenFailure).created ?? []) createdDirectories.add(directory);
+          throw error;
+        }
         for (const directory of parent.created) createdDirectories.add(directory);
         let tempName: string | null = null;
         try {

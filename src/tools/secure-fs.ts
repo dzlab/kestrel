@@ -10,7 +10,7 @@ import {
   writeSync,
 } from "node:fs";
 import { relative, resolve, sep } from "node:path";
-import { CString, dlopen, FFIType, toArrayBuffer } from "bun:ffi";
+import { dlopen, FFIType, toArrayBuffer } from "bun:ffi";
 import { ToolExecutionError, ValidationError } from "../errors";
 import { MAX_READ_BYTES, truncateUtf8 } from "./types";
 
@@ -49,6 +49,9 @@ const errnoNames: Record<number, string> = {
 };
 
 type NativeError = Error & { code?: string; errno?: number };
+type DirectoryOpenError = NativeError & { created?: string[] };
+
+const DIRENT_HEADER_BYTES = 21;
 
 function errno(): number {
   const pointer = native.symbols.__error();
@@ -120,24 +123,34 @@ function openDirectory(workspace: string, path: string, create: boolean): { fd: 
   const created: string[] = [];
   try {
     for (const component of components) {
-      let nextFd: number;
+      let nextFd: number | null = null;
       try {
-        nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
+        let createdNow = false;
+        try {
+          nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
+        } catch (error) {
+          if (!create || (error as NativeError).code !== "ENOENT") throw error;
+          const made = native.symbols.mkdirat(currentFd, component, 0o755);
+          createdNow = made >= 0;
+          if (!createdNow && errnoNames[errno()] !== "EEXIST") throwNative("mkdir", component);
+          if (createdNow) created.push(`${currentPath}${sep}${component}`);
+          nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
+        }
+        if (createdNow) fchmodSync(nextFd, 0o755);
+        const previousFd = currentFd;
+        currentFd = nextFd;
+        nextFd = null;
+        closeFd(previousFd);
+        currentPath = `${currentPath}${sep}${component}`;
       } catch (error) {
-        if (!create || (error as NativeError).code !== "ENOENT") throw error;
-        const made = native.symbols.mkdirat(currentFd, component, 0o755);
-        if (made < 0 && errnoNames[errno()] !== "EEXIST") throwNative("mkdir", component);
-        nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
-        fchmodSync(nextFd, 0o755);
-        created.push(`${currentPath}${sep}${component}`);
+        if (nextFd !== null) closeFd(nextFd);
+        throw error;
       }
-      closeFd(currentFd);
-      currentFd = nextFd;
-      currentPath = `${currentPath}${sep}${component}`;
     }
     return { fd: currentFd, created };
   } catch (error) {
     closeFd(currentFd);
+    (error as DirectoryOpenError).created = created;
     throw error;
   }
 }
@@ -164,13 +177,18 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
     while (true) {
       const entry = native.symbols.readdir(directory);
       if (!entry) break;
-      const view = new DataView(toArrayBuffer(entry, 0, 32));
+      const view = new DataView(toArrayBuffer(entry, 0, DIRENT_HEADER_BYTES));
       const recordLength = view.getUint16(16, true);
       const nameLength = view.getUint16(18, true);
-      if (recordLength < 24 || nameLength === 0 || nameLength > recordLength - 21) {
+      if (recordLength < 24 || nameLength === 0 || nameLength >= recordLength - DIRENT_HEADER_BYTES) {
         throw new ToolExecutionError("directory contained an invalid entry");
       }
-      const name = new CString(entry, 21).slice(0, nameLength);
+      const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
+      const nameBytes = record.subarray(DIRENT_HEADER_BYTES, DIRENT_HEADER_BYTES + nameLength);
+      if (nameBytes.includes(0) || record[DIRENT_HEADER_BYTES + nameLength] !== 0) {
+        throw new ToolExecutionError("directory contained an invalid entry");
+      }
+      const name = Buffer.from(nameBytes).toString("utf8");
       if (name !== "." && name !== "..") {
         entries.push({ name, type: directoryEntryType(view.getUint8(20)) });
       }
