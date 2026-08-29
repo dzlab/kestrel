@@ -262,6 +262,10 @@ const versionFiveSql = `
         WHERE tool = '' AND EXISTS (SELECT 1 FROM tool_calls WHERE tool_calls.call_id = approvals.call_id);
     `;
 
+const versionSixSql = `
+      ALTER TABLE approvals ADD COLUMN version INTEGER NOT NULL DEFAULT 0;
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -274,6 +278,7 @@ export const migrations: readonly Migration[] = [
   { version: 3, sql: versionThreeSql, prepare: prepareVersionThree },
   { version: 4, sql: versionFourSql, prepare: prepareVersionFour },
   { version: 5, sql: versionFiveSql },
+  { version: 6, sql: versionSixSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -366,6 +371,7 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "expires_at", type: "INTEGER" },
     { name: "consumed_at", type: "INTEGER" },
     { name: "expired_at", type: "INTEGER" },
+    { name: "version", type: "INTEGER" },
   ],
 };
 
@@ -390,7 +396,7 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   events: ["type", "payload", "created_at"],
   memories: ["kind", "content", "metadata", "created_at", "updated_at"],
   schedules: ["prompt", "enabled", "created_at"],
-  approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at"],
+  approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at", "version"],
 };
 
 const legacyApprovalColumns: readonly ColumnDefinition[] = [
@@ -1188,6 +1194,7 @@ const currentApprovalTableDefinition = {
       expires_at INTEGER NOT NULL DEFAULT 0,
       consumed_at INTEGER,
       expired_at INTEGER,
+      version INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (call_id, arguments_hash)
     )
   `),

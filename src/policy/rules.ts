@@ -233,7 +233,10 @@ function selfModifying(definition: ToolDefinition, args: Record<string, unknown>
         const candidates = [...pathValues(args), ...patchPathValues(args.patch)];
         return context.selfPaths.some((path) => {
           const configured = isAbsolute(path) ? resolve(path) : resolve(root, path);
-          return isWithin(root, configured) && candidates.some((candidate) => resolve(root, candidate) === configured);
+          return isWithin(root, configured) && candidates.some((candidate) => {
+            const target = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
+            return target === configured || isWithin(configured, target);
+          });
         });
       } catch {
         return true;

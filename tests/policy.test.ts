@@ -329,3 +329,104 @@ test("two managers cannot consume the same durable approval", () => {
   secondDatabase.close();
   rmSync(directory, { recursive: true, force: true });
 });
+
+test("stale durable managers cannot overwrite newer approval decisions or expiry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kestrel-approval-cas-"));
+  const path = join(directory, "approvals.sqlite");
+  const firstDatabase = openDatabase(path);
+  const secondDatabase = openDatabase(path);
+  const firstRepository = new StoreRepository(firstDatabase);
+  const secondRepository = new StoreRepository(secondDatabase);
+  const task = firstRepository.createTask({ title: "cas", prompt: "cas", workspace: directory, maxSteps: 1 });
+  const run = firstRepository.startRun(task.id, "cas-run");
+  const input = {
+    callId: "cas-call",
+    runId: run.id,
+    tool: "shell.exec",
+    capability: "shell",
+    risk: "high" as const,
+    summary: "cas shell",
+    arguments: { command: "printf cas" },
+    createdAt: 1_000,
+    expiresAt: 2_000,
+  };
+  const stale = new ApprovalManager(secondRepository, { now: () => 1_000 });
+  const current = new ApprovalManager(firstRepository, { now: () => 1_000 });
+  stale.request(input);
+  current.request(input);
+  expect(current.approve(input.callId, 1_001).status).toBe("approved");
+  expect(firstRepository.getApproval(input.callId, hashToolCall(input.tool, input.arguments))?.version).toBe(1);
+  expect(() => stale.deny(input.callId, 1_002)).toThrow(/not pending/i);
+  expect(stale.get(input.callId)).toMatchObject({ status: "approved" });
+
+  const expiryInput = { ...input, callId: "cas-expiry-call", expiresAt: 1_500, arguments: { command: "printf expiry" } };
+  stale.request(expiryInput);
+  current.request(expiryInput);
+  current.deny(expiryInput.callId, 1_003);
+  expect(stale.get(expiryInput.callId)).toMatchObject({ status: "denied", expiresAt: 1_500 });
+  expect(() => stale.approve(expiryInput.callId, 1_600)).toThrow(/not pending|denied/i);
+
+  firstDatabase.close();
+  secondDatabase.close();
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test("legacy approvals without a tool_calls row remain actionable by call ID and preserve expiry", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kestrel-approval-legacy-"));
+  const path = join(directory, "approvals.sqlite");
+  const firstDatabase = openDatabase(path);
+  const firstRepository = new StoreRepository(firstDatabase);
+  const task = firstRepository.createTask({ title: "legacy", prompt: "legacy", workspace: directory, maxSteps: 1 });
+  const run = firstRepository.startRun(task.id, "legacy-run");
+  const argumentsValue = { command: "printf legacy" };
+  const argumentsHash = hashToolCall("shell.exec", argumentsValue);
+  firstRepository.saveApproval({
+    callId: "legacy-call",
+    argumentsHash,
+    taskId: task.id,
+    runId: run.id,
+    capability: "shell.exec",
+    riskLevel: "high",
+    decision: "pending",
+    requestedAt: 1_000,
+    expiresAt: 1_234,
+  });
+  firstDatabase.close();
+
+  const secondDatabase = openDatabase(path);
+  const restarted = new ApprovalManager(new StoreRepository(secondDatabase), { now: () => 1_001 });
+  expect(restarted.get("legacy-call")).toMatchObject({ tool: "shell.exec", expiresAt: 1_234, status: "pending" });
+  expect(restarted.approve("legacy-call", 1_002).status).toBe("approved");
+  expect(restarted.consume("legacy-call", argumentsValue, 1_003)).toBe(true);
+  expect(restarted.consume("legacy-call", argumentsValue, 1_004)).toBe(false);
+
+  const expiredInput = {
+    callId: "legacy-expired",
+    runId: run.id,
+    tool: "shell.exec",
+    capability: "shell.exec",
+    risk: "high" as const,
+    summary: "legacy expiry",
+    arguments: { command: "printf expired" },
+    createdAt: 1_000,
+    expiresAt: 2_000,
+  };
+  const expiredHash = hashToolCall("shell.exec", expiredInput.arguments);
+  const repository = new StoreRepository(secondDatabase);
+  repository.saveApproval({
+    callId: expiredInput.callId,
+    argumentsHash: expiredHash,
+    taskId: task.id,
+    runId: run.id,
+    capability: "shell.exec",
+    riskLevel: "high",
+    decision: "approved",
+    requestedAt: 1_000,
+    expiresAt: expiredInput.expiresAt,
+  });
+  expect(restarted.consume(expiredInput.callId, expiredInput.arguments, 2_001)).toBe(false);
+  expect(repository.getApproval(expiredInput.callId, expiredHash)).toMatchObject({ expiredAt: 2_001 });
+
+  secondDatabase.close();
+  rmSync(directory, { recursive: true, force: true });
+});

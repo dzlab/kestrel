@@ -5,6 +5,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
+import { registerTrustedBuiltInTool } from "./types";
 import type { Tool } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES } from "./types";
 import type { ToolContext, ToolResult } from "./types";
@@ -162,7 +163,7 @@ function fileDefinition(name: string, description: string, properties: Record<st
   };
 }
 
-const listTool: Tool = {
+const listTool: Tool = registerTrustedBuiltInTool({
   definition: fileDefinition("fs.list", "List entries in a workspace directory.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
@@ -185,18 +186,18 @@ const listTool: Tool = {
     }
     return result(`[${serializedItems.join(",")}]`, bounded);
   },
-};
+});
 
-const readTool: Tool = {
+const readTool: Tool = registerTrustedBuiltInTool({
   definition: fileDefinition("fs.read", "Read bounded UTF-8 text from a workspace file.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
     const read = readWorkspaceText(context.workspace, path);
     return result(read.content, { path: relativePath(context.workspace, path), truncated: read.truncated });
   },
-};
+});
 
-const writeTool: Tool = {
+const writeTool: Tool = registerTrustedBuiltInTool({
   definition: fileDefinition(
     "fs.write",
     "Write UTF-8 text to a workspace file.",
@@ -214,7 +215,7 @@ const writeTool: Tool = {
       bytes: Buffer.byteLength(content, "utf8"),
     });
   },
-};
+});
 
 type HunkLine = { marker: " " | "+" | "-"; text: string; noNewline: boolean };
 type Hunk = { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: HunkLine[] };
@@ -577,7 +578,7 @@ function ensureRecoveryBackup(item: PatchRecoveryItem): void {
 }
 
 function patchTool(hooks: PatchHooks = {}): Tool {
-  return {
+  return registerTrustedBuiltInTool({
   definition: fileDefinition("fs.patch", "Apply a unified patch to workspace files.", { patch: { type: "string" } }, ["patch"]),
   async execute(args, context) {
     const patches = parsePatch(stringArgument(args, "patch"));
@@ -962,7 +963,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       closeSecureFile(transactionLock);
     }
     },
-  };
+  });
 }
 
 export function createFilesystemTools(hooks?: PatchHooks): Tool[] {

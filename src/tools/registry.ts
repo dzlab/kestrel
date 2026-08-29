@@ -3,9 +3,12 @@ import { ApprovalManager } from "../policy/approvals";
 import { PolicyEngine } from "../policy/rules";
 import type { PolicyContext } from "../policy/types";
 import { parseToolCall } from "../protocol/validation";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createFilesystemTools } from "./filesystem";
 import { createSearchTool } from "./search";
 import { boundToolResult } from "./types";
+import { isTrustedBuiltInTool } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
 
 export type ToolRegistryOptions = {
@@ -13,6 +16,9 @@ export type ToolRegistryOptions = {
   approvals?: ApprovalManager;
   policyContext?: PolicyContext | ((context: ToolContext, call: ReturnType<typeof parseToolCall>) => PolicyContext);
 };
+
+const automaticBuiltInNames = new Set(["fs.list", "fs.read", "fs.write", "fs.patch", "search.text"]);
+const agentRepository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -151,8 +157,11 @@ export class ToolRegistry {
     if (tool === undefined) {
       throw new ValidationError(`unknown tool: ${call.name}`);
     }
+    if (automaticBuiltInNames.has(call.name) && !isTrustedBuiltInTool(tool)) {
+      throw new PolicyError(`untrusted implementation cannot impersonate automatic tool: ${call.name}`);
+    }
     validateSchema(call.arguments, tool.definition.inputSchema, "arguments");
-    const policyContext = typeof this.policyContext === "function"
+    const configuredPolicyContext = typeof this.policyContext === "function"
       ? this.policyContext(context, call)
       : this.policyContext ?? {
           workspace: context.workspace,
@@ -160,6 +169,10 @@ export class ToolRegistry {
           taskId: context.taskId ?? null,
           now: Date.now(),
         };
+    const policyContext = {
+      ...configuredPolicyContext,
+      selfPaths: configuredPolicyContext.selfPaths ?? [agentRepository],
+    };
     let decision;
     try {
       decision = this.policyEngine.evaluate(tool, call.arguments, policyContext);

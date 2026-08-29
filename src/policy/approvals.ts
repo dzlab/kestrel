@@ -95,9 +95,15 @@ export class ApprovalManager {
       createdAt,
       expiresAt,
       status: "pending",
+      version: 0,
     };
     this.requests.set(id, created);
-    this.persist(created);
+    const stored = this.persist(created);
+    if (stored !== undefined) {
+      const restored = this.restore(stored, input);
+      this.requests.set(id, restored);
+      return this.current(restored);
+    }
     return { ...created };
   }
 
@@ -105,8 +111,23 @@ export class ApprovalManager {
     const request = this.resolve(id);
     this.expireIfNeeded(request, now);
     if (request.status !== "pending") throw new ValidationError(`approval ${request.id} is not pending`);
+    if (this.store !== undefined) {
+      const updated = this.store.updateApprovalDecision(
+        request.id,
+        request.argumentsHash,
+        request.version,
+        "pending",
+        "approved",
+        now,
+      );
+      if (updated === null) {
+        this.refresh(request);
+        throw new ValidationError(`approval ${request.id} is not pending`);
+      }
+      this.applyStoreRecord(request, updated);
+      return { ...request };
+    }
     request.status = "approved";
-    this.persist(request, now);
     return { ...request };
   }
 
@@ -114,14 +135,30 @@ export class ApprovalManager {
     const request = this.resolve(id);
     this.expireIfNeeded(request, now);
     if (request.status !== "pending") throw new ValidationError(`approval ${request.id} is not pending`);
+    if (this.store !== undefined) {
+      const updated = this.store.updateApprovalDecision(
+        request.id,
+        request.argumentsHash,
+        request.version,
+        "pending",
+        "denied",
+        now,
+      );
+      if (updated === null) {
+        this.refresh(request);
+        throw new ValidationError(`approval ${request.id} is not pending`);
+      }
+      this.applyStoreRecord(request, updated);
+      return { ...request };
+    }
     request.status = "denied";
-    this.persist(request, now);
     return { ...request };
   }
 
   isApproved(input: ApprovalLookup | string, argumentsHash?: string, now = this.now()): boolean {
     const request = this.lookup(input, argumentsHash);
     if (request === null) return false;
+    this.refresh(request);
     if (this.expireIfNeeded(request, now)) return false;
     return request.status === "approved";
   }
@@ -137,22 +174,16 @@ export class ApprovalManager {
       : input;
     if (lookup === null) return false;
     const request = this.lookup(lookup);
+    if (request !== null) this.refresh(request);
     if (request === null || this.expireIfNeeded(request, now) || request.status !== "approved") return false;
 
     if (this.store !== undefined) {
-      const consumed = this.store.consumeApproval(request.id, request.argumentsHash, now);
+      const consumed = this.store.consumeApproval(request.id, request.argumentsHash, now, request.version);
       if (consumed === null) {
-        const current = this.store.getApproval(request.id, request.argumentsHash);
-        if (current !== null) {
-          request.status = statusOf(current);
-          request.expiresAt = current.expiresAt ?? request.expiresAt;
-          request.consumedAt = current.consumedAt;
-          request.expiredAt = current.expiredAt;
-        }
+        this.refresh(request);
         return false;
       }
-      request.status = "consumed";
-      request.consumedAt = consumed.consumedAt;
+      this.applyStoreRecord(request, consumed);
       return true;
     }
 
@@ -168,15 +199,13 @@ export class ApprovalManager {
       request = this.restore(durable);
       this.requests.set(id, request);
     }
+    this.refresh(request);
     this.expireIfNeeded(request, this.now());
     return { ...request };
   }
 
   private restore(record: ApprovalStoreRecord, input?: ApprovalRequestInput): ApprovalRequest {
-    const tool = record.tool || input?.tool;
-    if (tool === undefined || tool.length === 0) {
-      throw new ValidationError(`persisted approval ${record.callId} has no tool`);
-    }
+    const tool = record.tool || input?.tool || record.capability || "legacy.approval";
     return {
       id: record.callId,
       runId: record.runId ?? input?.runId ?? "unknown",
@@ -189,6 +218,7 @@ export class ApprovalManager {
       createdAt: record.requestedAt,
       expiresAt: record.expiresAt ?? record.requestedAt + this.defaultExpiryMs,
       status: statusOf(record),
+      version: record.version ?? 0,
       ...(record.consumedAt === null || record.consumedAt === undefined ? {} : { consumedAt: record.consumedAt }),
       ...(record.expiredAt === null || record.expiredAt === undefined ? {} : { expiredAt: record.expiredAt }),
     };
@@ -210,11 +240,16 @@ export class ApprovalManager {
     if (typeof input === "string") {
       if (!this.requests.has(input)) this.get(input);
       const request = this.requests.get(input);
+      if (request !== undefined) this.refresh(request);
       if (request === undefined || argumentsHash === undefined || request.argumentsHash !== argumentsHash) return null;
       return request;
     }
     const existing = this.requests.get(input.id);
-    if (existing !== undefined) return sameHash(existing, input) ? existing : null;
+    if (existing !== undefined) {
+      if (!sameHash(existing, input)) return null;
+      this.refresh(existing);
+      return existing;
+    }
     let computed: string;
     try {
       computed = hashToolCall(input.tool, input.arguments);
@@ -241,19 +276,16 @@ export class ApprovalManager {
     if (request.status === "consumed" || request.status === "expired") return true;
     if (now < request.expiresAt) return false;
     if (this.store !== undefined) {
-      const expired = this.store.expireApproval(request.id, request.argumentsHash, now);
+      const expired = this.store.expireApproval(request.id, request.argumentsHash, now, request.version);
       if (expired !== null) {
-        request.status = statusOf(expired);
-        request.expiresAt = expired.expiresAt ?? request.expiresAt;
-        request.consumedAt = expired.consumedAt;
-        request.expiredAt = expired.expiredAt;
+        this.applyStoreRecord(request, expired);
       } else {
-        request.status = "expired";
+        this.refresh(request);
       }
     } else {
       request.status = "expired";
     }
-    return true;
+    return request.status === "expired";
   }
 
   private current(request: ApprovalRequest): ApprovalRequest {
@@ -261,10 +293,10 @@ export class ApprovalManager {
     return { ...request };
   }
 
-  private persist(request: ApprovalRequest, resolvedAt = request.status === "pending" ? null : this.now()): void {
-    if (this.store === undefined) return;
+  private persist(request: ApprovalRequest, resolvedAt = request.status === "pending" ? null : this.now()): ApprovalStoreRecord | undefined {
+    if (this.store === undefined) return undefined;
     const decision = request.status === "approved" || request.status === "denied" ? request.status : "pending";
-    this.store.saveApproval({
+    return this.store.saveApproval({
       callId: request.id,
       argumentsHash: request.argumentsHash,
       tool: request.tool,
@@ -278,7 +310,28 @@ export class ApprovalManager {
       resolvedAt,
       consumedAt: request.consumedAt,
       expiredAt: request.status === "expired" ? request.expiredAt : null,
+      version: request.version,
     });
+  }
+
+  private refresh(request: ApprovalRequest): void {
+    if (this.store === undefined) return;
+    const current = this.store.getApproval(request.id, request.argumentsHash);
+    if (current !== null) this.applyStoreRecord(request, current);
+  }
+
+  private applyStoreRecord(request: ApprovalRequest, record: ApprovalStoreRecord): void {
+    request.tool = record.tool || request.tool || record.capability || "legacy.approval";
+    request.runId = record.runId ?? request.runId;
+    request.taskId = record.taskId ?? request.taskId;
+    request.capability = record.capability || request.capability;
+    request.risk = isRisk(record.riskLevel) ? record.riskLevel : request.risk;
+    request.createdAt = record.requestedAt;
+    request.expiresAt = record.expiresAt ?? request.expiresAt;
+    request.status = statusOf(record);
+    request.version = record.version ?? request.version;
+    request.consumedAt = record.consumedAt;
+    request.expiredAt = record.expiredAt;
   }
 }
 

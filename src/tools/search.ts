@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
 import { readWorkspaceText, resolveWorkspacePath, safeDirectoryEntries, workspacePathInfo } from "./filesystem";
+import { registerTrustedBuiltInTool } from "./types";
 import type { Tool } from "./types";
 import {
   MAX_READ_BYTES,
@@ -45,7 +46,7 @@ async function collectFiles(workspace: string, root: string, files: string[]): P
   }
 }
 
-const searchTool: Tool = {
+const searchTool: Tool = registerTrustedBuiltInTool({
   definition: {
     name: "search.text",
     description: "Search bounded UTF-8 text files in the workspace.",
@@ -83,7 +84,7 @@ const searchTool: Tool = {
     const bounded = boundedMatches(matches);
     return { ok: true, content: JSON.stringify(bounded), data: bounded };
   },
-};
+});
 
 export function createSearchTool(): Tool {
   return searchTool;
