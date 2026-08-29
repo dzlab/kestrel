@@ -1,4 +1,9 @@
 import { resolveWorkspacePath } from "./filesystem";
+import {
+  closeSecureDirectory,
+  openSecureDirectoryPath,
+  revalidateSecureDirectory,
+} from "./secure-fs";
 import { registerTrustedBuiltInTool } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES, truncateUtf8 } from "./types";
@@ -10,9 +15,26 @@ import {
 } from "../runtime/process";
 import { ValidationError } from "../errors";
 
-const SAFE_ENV_KEYS = new Set(["PATH", "HOME"]);
+const SAFE_ENV_KEYS = new Set(["HOME"]);
 const CREDENTIAL_KEY = /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|AUTH|AWS_|GITHUB_TOKEN)/iu;
 const FALLBACK_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const SHELL_EXECUTABLES = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "fish",
+  "ksh",
+  "csh",
+  "tcsh",
+  "cmd",
+  "cmd.exe",
+  "powershell",
+  "powershell.exe",
+  "pwsh",
+  "pwsh.exe",
+]);
+const BACKGROUND_LAUNCHERS = new Set(["nohup", "setsid", "daemonize", "disown", "start"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -32,37 +54,36 @@ function timeoutArgument(args: Record<string, unknown>): number {
   return value;
 }
 
-function hasBackgroundOperator(command: string): boolean {
-  let quote: "single" | "double" | null = null;
-  let escaped = false;
-  for (let index = 0; index < command.length; index += 1) {
-    const character = command[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && quote !== "single") {
-      escaped = true;
-      continue;
-    }
-    if (character === "'" && quote !== "double") {
-      quote = quote === "single" ? null : "single";
-      continue;
-    }
-    if (character === '"' && quote !== "single") {
-      quote = quote === "double" ? null : "double";
-      continue;
-    }
-    if (
-      quote === null &&
-      character === "&" &&
-      command[index - 1] !== "&" &&
-      command[index + 1] !== "&" &&
-      command[index - 1] !== ">" &&
-      command[index + 1] !== ">"
-    ) return true;
+function executableName(value: string): string {
+  return value.replaceAll("\\", "/").split("/").at(-1)!.toLowerCase();
+}
+
+function shellArgument(argv: readonly string[]): string | null {
+  for (const argument of argv) {
+    if (SHELL_EXECUTABLES.has(executableName(argument))) return argument;
   }
-  return /(^|\s)(?:nohup|disown|setsid|daemonize)(?:\s|$)/u.test(command);
+  return null;
+}
+
+function validateShellArgv(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.some((argument) => typeof argument !== "string")) {
+    throw new ValidationError("argv must be a non-empty array of strings");
+  }
+  const argv = value as string[];
+  if (argv[0]!.length === 0) throw new ValidationError("argv executable must be non-empty");
+  const shell = shellArgument(argv);
+  if (shell !== null) {
+    throw new ValidationError(`nested shell launcher is not allowed: ${shell}`);
+  }
+  for (const argument of argv) {
+    if (BACKGROUND_LAUNCHERS.has(executableName(argument))) {
+      throw new ValidationError(`background or detached launcher is not allowed: ${argument}`);
+    }
+    if (["&", "&&", ";&", "&;"].includes(argument)) {
+      throw new ValidationError("background shell operators are not allowed");
+    }
+  }
+  return argv;
 }
 
 function scrubEnvironment(
@@ -70,14 +91,17 @@ function scrubEnvironment(
   cwd: string,
   context: ToolContext,
 ): Record<string, string> {
-  const environment: Record<string, string> = { PATH: process.env.PATH ?? FALLBACK_PATH };
+  const environment: Record<string, string> = { PATH: FALLBACK_PATH };
   if (requested !== undefined) {
     if (!isRecord(requested)) throw new ValidationError("env must be an object");
     for (const [key, value] of Object.entries(requested)) {
-      if (CREDENTIAL_KEY.test(key) || !SAFE_ENV_KEYS.has(key)) {
+      if (CREDENTIAL_KEY.test(key) || (key !== "PATH" && !SAFE_ENV_KEYS.has(key))) {
         throw new ValidationError(`environment key ${key} is not allowed by the safe environment allowlist`);
       }
       if (typeof value !== "string") throw new ValidationError(`environment value ${key} must be a string`);
+      if (key === "PATH" && value !== FALLBACK_PATH) {
+        throw new ValidationError("environment PATH is not allowed by the safe environment allowlist");
+      }
       environment[key] = value;
     }
   }
@@ -121,18 +145,23 @@ function processResult(result: Awaited<ReturnType<typeof runProcess>>, context: 
 }
 
 async function executeShell(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
-  const command = stringArgument(args, "command");
-  if (hasBackgroundOperator(command)) return { ok: false, content: "background or detached processes are not allowed" };
+  const argv = validateShellArgv(args.argv);
   const cwd = resolveWorkspacePath(context.workspace, typeof args.cwd === "string" ? args.cwd : ".");
-  const environment = scrubEnvironment(args.env, cwd, context);
-  const result = await runProcess({
-    argv: ["/bin/zsh", "-lc", command],
-    cwd,
-    env: environment,
-    timeoutMs: timeoutArgument(args),
-    signal: context.signal,
-  });
-  return processResult(result, context);
+  const directory = openSecureDirectoryPath(context.workspace, cwd);
+  try {
+    const environment = scrubEnvironment(args.env, cwd, context);
+    const result = await runProcess({
+      argv,
+      cwd,
+      cwdGuard: { revalidate: () => revalidateSecureDirectory(context.workspace, directory) },
+      env: environment,
+      timeoutMs: timeoutArgument(args),
+      signal: context.signal,
+    });
+    return processResult(result, context);
+  } finally {
+    closeSecureDirectory(directory);
+  }
 }
 
 async function executeBun(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
@@ -143,31 +172,37 @@ async function executeBun(args: Record<string, unknown>, context: ToolContext): 
     throw new ValidationError("args must be an array of strings");
   }
   const cwd = resolveWorkspacePath(context.workspace, typeof args.cwd === "string" ? args.cwd : ".");
-  const environment = scrubEnvironment(args.env, cwd, context);
-  const result = await runProcess({
-    argv: [process.execPath, "run", script, ...requestedArgs],
-    cwd,
-    env: environment,
-    timeoutMs: timeoutArgument(args),
-    signal: context.signal,
-  });
-  return processResult(result, context);
+  const directory = openSecureDirectoryPath(context.workspace, cwd);
+  try {
+    const environment = scrubEnvironment(args.env, cwd, context);
+    const result = await runProcess({
+      argv: [process.execPath, "run", script, ...requestedArgs],
+      cwd,
+      cwdGuard: { revalidate: () => revalidateSecureDirectory(context.workspace, directory) },
+      env: environment,
+      timeoutMs: timeoutArgument(args),
+      signal: context.signal,
+    });
+    return processResult(result, context);
+  } finally {
+    closeSecureDirectory(directory);
+  }
 }
 
 const shellTool: Tool = registerTrustedBuiltInTool({
   definition: {
     name: "shell.exec",
-    description: "Execute one approved shell command in the workspace.",
+    description: "Execute one approved process argv in the workspace.",
     capability: "shell",
     inputSchema: {
       type: "object",
       properties: {
-        command: { type: "string" },
+        argv: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
         timeoutMs: { type: "number" },
         env: { type: "object", additionalProperties: true },
       },
-      required: ["command"],
+      required: ["argv"],
       additionalProperties: false,
     },
   },

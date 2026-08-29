@@ -63,6 +63,7 @@ test("exposes exactly shell.exec and bun.run and gates both through approval", a
     const { registry, approvals } = approvedRegistry(workspace);
     const definitions = registry.definitions().filter(({ name }) => name === "shell.exec" || name === "bun.run");
     expect(definitions.map(({ name }) => name).sort()).toEqual(["bun.run", "shell.exec"]);
+    expect(definitions.find(({ name }) => name === "shell.exec")?.inputSchema).toMatchObject({ required: ["argv"] });
 
     const script = join(workspace, "args.ts");
     writeFileSync(script, "console.log(JSON.stringify(process.argv.slice(2)))\n");
@@ -96,7 +97,7 @@ test("executes shell input as one approved command with a scrubbed allowlist env
       id: "shell-env",
       name: "shell.exec",
       arguments: {
-        command: "env",
+        argv: ["/usr/bin/env"],
         env: { HOME: "/safe/home" },
       },
     };
@@ -124,7 +125,9 @@ test("reports nonzero exits with bounded stderr and exit metadata", async () => 
     const call = {
       id: "shell-failure",
       name: "shell.exec",
-      arguments: { command: "printf failure >&2; exit 7" },
+      arguments: {
+        argv: [process.execPath, "-e", "process.stderr.write('failure'); process.exit(7)"],
+      },
     };
     approve(approvals, call);
     const result = await registry.execute(call, workspaceContext(workspace));
@@ -139,7 +142,7 @@ test("terminates a process when the timeout expires", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-shell-"));
   try {
     const result = await tool("shell.exec").execute(
-      { command: "sleep 10", timeoutMs: 30 },
+      { argv: ["/bin/sleep", "10"], timeoutMs: 30 },
       workspaceContext(workspace),
     );
     const data = resultData(result);
@@ -156,7 +159,7 @@ test("terminates a process when its abort signal fires", async () => {
   const controller = new AbortController();
   try {
     const running = tool("shell.exec").execute(
-      { command: "sleep 10", timeoutMs: 5_000 },
+      { argv: ["/bin/sleep", "10"], timeoutMs: 5_000 },
       workspaceContext(workspace, controller.signal),
     );
     setTimeout(() => controller.abort(), 30);
@@ -199,10 +202,10 @@ test("rejects cwd traversal and symlink escape", async () => {
   try {
     symlinkSync(outside, join(workspace, "escape"));
     const shell = tool("shell.exec");
-    const traversal = await shell.execute({ command: "pwd", cwd: "../" }, workspaceContext(workspace));
+    const traversal = await shell.execute({ argv: ["/bin/pwd"], cwd: "../" }, workspaceContext(workspace));
     expect(traversal.ok).toBe(false);
     expect(traversal.content).toMatch(/traversal|outside|workspace/i);
-    const symlink = await shell.execute({ command: "pwd", cwd: "escape" }, workspaceContext(workspace));
+    const symlink = await shell.execute({ argv: ["/bin/pwd"], cwd: "escape" }, workspaceContext(workspace));
     expect(symlink.ok).toBe(false);
     expect(symlink.content).toMatch(/symlink|outside|workspace/i);
   } finally {
@@ -211,12 +214,25 @@ test("rejects cwd traversal and symlink escape", async () => {
   }
 });
 
-test("rejects background process requests", async () => {
+test("rejects nested shell and background launcher requests", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-shell-"));
   try {
-    const result = await tool("shell.exec").execute({ command: "sleep 1 &" }, workspaceContext(workspace));
-    expect(result.ok).toBe(false);
-    expect(result.content).toMatch(/background|detached/i);
+    const requests = [
+      ["/bin/sh", "-c", "sleep 1 &"],
+      ["/bin/bash", "-c", "'sleep 1 &'"],
+      ["/bin/zsh", "-lc", "sleep 1 &"],
+      ["/bin/dash", "-c", "sleep 1 &"],
+      ["/usr/bin/fish", "-c", "sleep 1 &"],
+      ["cmd.exe", "/c", "start /b sleep 1"],
+      ["powershell", "-Command", "Start-Job { Start-Sleep 1 }"],
+      ["pwsh", "-c", "Start-Job { Start-Sleep 1 }"],
+      ["/bin/sleep", "1", "&"],
+    ];
+    for (const argv of requests) {
+      const result = await tool("shell.exec").execute({ argv }, workspaceContext(workspace));
+      expect(result.ok).toBe(false);
+      expect(result.content).toMatch(/shell|background|detached|launcher/i);
+    }
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
@@ -226,11 +242,29 @@ test("rejects environment overrides outside the safe allowlist", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-shell-"));
   try {
     const result = await tool("shell.exec").execute(
-      { command: "true", env: { API_TOKEN: "secret" } },
+      { argv: ["/usr/bin/true"], env: { API_TOKEN: "secret" } },
       workspaceContext(workspace),
     );
     expect(result.ok).toBe(false);
     expect(result.content).toMatch(/environment|credential|allowlist/i);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("does not inherit PATH and rejects unapproved PATH overrides", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "kestrel-shell-"));
+  try {
+    const safe = await tool("shell.exec").execute({ argv: ["/usr/bin/env"] }, workspaceContext(workspace));
+    expect(safe.ok).toBe(true);
+    expect(String(resultData(safe).stdout)).toContain("PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+
+    const unsafe = await tool("shell.exec").execute(
+      { argv: ["/usr/bin/true"], env: { PATH: "/tmp" } },
+      workspaceContext(workspace),
+    );
+    expect(unsafe.ok).toBe(false);
+    expect(unsafe.content).toMatch(/PATH|environment|allowlist/i);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }

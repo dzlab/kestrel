@@ -247,7 +247,10 @@ function selfModifying(definition: ToolDefinition, args: Record<string, unknown>
 }
 
 function commandSignalsRisk(args: Record<string, unknown>): string | null {
-  const command = [args.command, args.cmd, args.script].find((value) => typeof value === "string");
+  const argv = Array.isArray(args.argv) && args.argv.every((value) => typeof value === "string")
+    ? args.argv.join(" ")
+    : undefined;
+  const command = [args.command, args.cmd, args.script, argv].find((value) => typeof value === "string");
   if (typeof command !== "string") return null;
   if (/(^|\s)(curl|wget|nc|netcat|ssh|scp)(\s|$)/iu.test(command)) return "network access";
   if (/(^|\s)(rm\s+-(?:[^\s]*r|[^\s]*f[^\s]*r)|find\b[^\n]*-delete)(\s|$)/iu.test(command)) return "destructive deletion";

@@ -134,6 +134,12 @@ export type SecureIdentity = { dev: bigint; ino: bigint };
 
 export type SecureCreatedDirectory = { path: string; identity: SecureIdentity };
 
+export type SecureDirectory = {
+  fd: number;
+  path: string;
+  identity: SecureIdentity;
+};
+
 export function secureFileIdentity(fd: number): SecureIdentity {
   const stat = fstatSync(fd, { bigint: true });
   return { dev: stat.dev, ino: stat.ino };
@@ -141,6 +147,38 @@ export function secureFileIdentity(fd: number): SecureIdentity {
 
 export function sameSecureIdentity(left: SecureIdentity | null, right: SecureIdentity | null): boolean {
   return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
+export function openSecureDirectoryPath(workspace: string, path: string): SecureDirectory {
+  const opened = openDirectory(workspace, path, false);
+  return {
+    fd: opened.fd,
+    path: resolve(path),
+    identity: secureFileIdentity(opened.fd),
+  };
+}
+
+export function closeSecureDirectory(directory: SecureDirectory): void {
+  closeFd(directory.fd);
+}
+
+export function revalidateSecureDirectory(workspace: string, directory: SecureDirectory): void {
+  let current: { fd: number; created: SecureCreatedDirectory[] };
+  try {
+    current = openDirectory(workspace, directory.path, false);
+  } catch (error) {
+    throw new ToolExecutionError("process cwd directory changed", { cause: error });
+  }
+  try {
+    if (!sameSecureIdentity(directory.identity, secureFileIdentity(directory.fd))) {
+      throw new ToolExecutionError("process cwd directory identity changed");
+    }
+    if (!sameSecureIdentity(directory.identity, secureFileIdentity(current.fd))) {
+      throw new ToolExecutionError("process cwd directory identity changed");
+    }
+  } finally {
+    closeFd(current.fd);
+  }
 }
 
 export function openPatchTransactionLock(workspace: string): number {
