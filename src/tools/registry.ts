@@ -1,9 +1,18 @@
-import { ValidationError } from "../errors";
+import { ApprovalRequiredError, PolicyError, ValidationError } from "../errors";
+import { ApprovalManager } from "../policy/approvals";
+import { PolicyEngine } from "../policy/rules";
+import type { PolicyContext } from "../policy/types";
 import { parseToolCall } from "../protocol/validation";
 import { createFilesystemTools } from "./filesystem";
 import { createSearchTool } from "./search";
 import { boundToolResult } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
+
+export type ToolRegistryOptions = {
+  policyEngine?: PolicyEngine;
+  approvals?: ApprovalManager;
+  policyContext?: PolicyContext | ((context: ToolContext, call: ReturnType<typeof parseToolCall>) => PolicyContext);
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -91,8 +100,17 @@ function failure(error: unknown): ToolResult {
 
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
+  private readonly policyEngine: PolicyEngine;
+  private readonly approvals?: ApprovalManager;
+  private readonly policyContext?: ToolRegistryOptions["policyContext"];
 
-  constructor(tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool()]) {
+  constructor(
+    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool()],
+    options: ToolRegistryOptions = {},
+  ) {
+    this.policyEngine = options.policyEngine ?? new PolicyEngine();
+    this.approvals = options.approvals;
+    this.policyContext = options.policyContext;
     for (const tool of tools) {
       this.register(tool);
     }
@@ -134,6 +152,36 @@ export class ToolRegistry {
       throw new ValidationError(`unknown tool: ${call.name}`);
     }
     validateSchema(call.arguments, tool.definition.inputSchema, "arguments");
+    const policyContext = typeof this.policyContext === "function"
+      ? this.policyContext(context, call)
+      : this.policyContext ?? {
+          workspace: context.workspace,
+          runId: context.runId,
+          taskId: context.taskId ?? null,
+          now: Date.now(),
+        };
+    let decision;
+    try {
+      decision = this.policyEngine.evaluate(tool, call.arguments, policyContext);
+    } catch (error) {
+      throw new PolicyError(`policy evaluation failed closed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!decision.allowed && !decision.requiresApproval) {
+      throw new PolicyError(decision.reason);
+    }
+    if (decision.requiresApproval) {
+      if (this.approvals === undefined) {
+        return failure(new ApprovalRequiredError(decision.reason));
+      }
+      const consumed = this.approvals.consume(
+        { id: call.id, tool: call.name, arguments: call.arguments },
+        undefined,
+        policyContext.now,
+      );
+      if (!consumed) {
+        return failure(new ApprovalRequiredError(`approval required for ${call.name} (${call.id})`));
+      }
+    }
     try {
       return boundToolResult(await tool.execute(call.arguments, context));
     } catch (error) {
@@ -146,8 +194,8 @@ export class ToolRegistry {
   }
 }
 
-export function createToolRegistry(): ToolRegistry {
-  return new ToolRegistry();
+export function createToolRegistry(options?: ToolRegistryOptions): ToolRegistry {
+  return new ToolRegistry(undefined, options);
 }
 
 export { ToolRegistry as Registry };

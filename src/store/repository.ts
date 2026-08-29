@@ -33,13 +33,17 @@ export type TaskStatus = "pending" | RunStatus;
 export type ApprovalRecord = {
   callId: string;
   argumentsHash: string;
+  tool?: string;
   capability: string;
   riskLevel: string;
   taskId?: string | null;
   runId?: string | null;
   decision: ApprovalDecision;
   requestedAt: number;
+  expiresAt?: number;
   resolvedAt?: number | null;
+  consumedAt?: number | null;
+  expiredAt?: number | null;
 };
 
 export type MemoryRecord = {
@@ -143,13 +147,17 @@ function approvalFromRow(row: Row): ApprovalRecord {
   return {
     callId: String(row.call_id),
     argumentsHash: String(row.arguments_hash),
+    tool: row.tool === null || row.tool === undefined ? undefined : String(row.tool),
     capability: String(row.capability),
     riskLevel: String(row.risk_level),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
     decision: parseApprovalDecision(row.decision),
     requestedAt: Number(row.requested_at),
+    expiresAt: row.expires_at === null || row.expires_at === undefined ? undefined : Number(row.expires_at),
     resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? null : Number(row.resolved_at),
+    consumedAt: row.consumed_at === null || row.consumed_at === undefined ? null : Number(row.consumed_at),
+    expiredAt: row.expired_at === null || row.expired_at === undefined ? null : Number(row.expired_at),
   };
 }
 
@@ -329,31 +337,52 @@ export class StoreRepository {
 
   saveApproval(input: ApprovalRecord): void {
     immediateTransaction(this.database, () => {
+      const existing = this.database
+        .query("SELECT decision FROM approvals WHERE call_id = ? AND arguments_hash = ?")
+        .get(input.callId, input.argumentsHash) as { decision: ApprovalDecision } | null;
       this.database
         .query(
           `INSERT INTO approvals
-            (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision, requested_at, resolved_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (call_id, arguments_hash, tool, task_id, run_id, capability, risk_level, decision, requested_at, expires_at, resolved_at, consumed_at, expired_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (call_id, arguments_hash) DO UPDATE SET
+             tool = excluded.tool,
              task_id = excluded.task_id,
              run_id = excluded.run_id,
              capability = excluded.capability,
              risk_level = excluded.risk_level,
              decision = excluded.decision,
              requested_at = excluded.requested_at,
-             resolved_at = excluded.resolved_at`,
+             expires_at = excluded.expires_at,
+             resolved_at = excluded.resolved_at,
+             consumed_at = excluded.consumed_at,
+             expired_at = excluded.expired_at`,
         )
         .run(
           input.callId,
           input.argumentsHash,
+          input.tool ?? "",
           input.taskId ?? null,
           input.runId ?? null,
           input.capability,
           input.riskLevel,
           input.decision,
           input.requestedAt,
+          input.expiresAt ?? input.requestedAt + 300_000,
           input.resolvedAt ?? null,
+          input.consumedAt ?? null,
+          input.expiredAt ?? null,
         );
+      const eventType = existing === null
+        ? "approval.requested"
+        : existing.decision !== input.decision && input.decision !== "pending"
+          ? `approval.${input.decision}`
+          : null;
+      if (eventType !== null) {
+        this.database
+          .query("INSERT INTO events (task_id, run_id, type, payload, created_at) SELECT task_id, run_id, ?, ?, ? FROM approvals WHERE call_id = ? AND arguments_hash = ?")
+          .run(eventType, json({ callId: input.callId, argumentsHash: input.argumentsHash }), input.resolvedAt ?? Date.now(), input.callId, input.argumentsHash);
+      }
     });
   }
 
@@ -362,6 +391,70 @@ export class StoreRepository {
       .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
       .get(callId, argumentsHash) as Row | null;
     return row === null ? null : approvalFromRow(row);
+  }
+
+  getApprovalByCallId(callId: string): ApprovalRecord | null {
+    const row = this.database
+      .query("SELECT * FROM approvals WHERE call_id = ? ORDER BY requested_at DESC LIMIT 1")
+      .get(callId) as Row | null;
+    return row === null ? null : approvalFromRow(row);
+  }
+
+  consumeApproval(callId: string, argumentsHash: string, now: number): ApprovalRecord | null {
+    return immediateTransaction(this.database, () => {
+      const current = this.database
+        .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
+        .get(callId, argumentsHash) as Row | null;
+      if (current === null) return null;
+      const record = approvalFromRow(current);
+      if (record.consumedAt !== null && record.consumedAt !== undefined) return null;
+      if (record.expiredAt !== null && record.expiredAt !== undefined) return null;
+      if (record.decision !== "approved") return null;
+      if (record.expiresAt === undefined || now >= record.expiresAt) {
+        return this.expireApprovalInTransaction(record, now);
+      }
+      const updated = this.database
+        .query(
+          `UPDATE approvals SET consumed_at = ?, resolved_at = ?
+           WHERE call_id = ? AND arguments_hash = ? AND decision = 'approved'
+             AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
+        )
+        .run(now, now, callId, argumentsHash, now);
+      if (updated.changes !== 1) return null;
+      const consumed = { ...record, consumedAt: now, resolvedAt: now };
+      this.appendApprovalEvent(consumed, "approval.consumed", now);
+      return consumed;
+    });
+  }
+
+  expireApproval(callId: string, argumentsHash: string, now: number): ApprovalRecord | null {
+    return immediateTransaction(this.database, () => {
+      const row = this.database
+        .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
+        .get(callId, argumentsHash) as Row | null;
+      return row === null ? null : this.expireApprovalInTransaction(approvalFromRow(row), now);
+    });
+  }
+
+  private expireApprovalInTransaction(record: ApprovalRecord, now: number): ApprovalRecord | null {
+    if (record.expiredAt !== null && record.expiredAt !== undefined) return record;
+    if (record.expiresAt === undefined || now < record.expiresAt) return record;
+    const updated = this.database
+      .query(
+        `UPDATE approvals SET expired_at = ?, resolved_at = ?
+         WHERE call_id = ? AND arguments_hash = ? AND decision IN ('pending', 'approved') AND expired_at IS NULL`,
+      )
+      .run(now, now, record.callId, record.argumentsHash);
+    if (updated.changes !== 1) return approvalFromRow(this.database.query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?").get(record.callId, record.argumentsHash) as Row);
+    const expired = { ...record, expiredAt: now, resolvedAt: now };
+    this.appendApprovalEvent(expired, "approval.expired", now);
+    return expired;
+  }
+
+  private appendApprovalEvent(record: ApprovalRecord, type: string, createdAt: number): void {
+    this.database
+      .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(record.taskId ?? null, record.runId ?? null, type, json({ callId: record.callId, argumentsHash: record.argumentsHash }), createdAt);
   }
 
   saveMemory(input: MemoryRecord): void {

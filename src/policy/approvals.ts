@@ -7,6 +7,7 @@ import type {
   ApprovalRequestInput,
   ApprovalStatus,
   ApprovalStore,
+  ApprovalStoreRecord,
   Risk,
 } from "./types";
 
@@ -17,8 +18,10 @@ function isRisk(value: string): value is Risk {
   return risks.includes(value as Risk);
 }
 
-function isApprovalStatus(value: string): value is Exclude<ApprovalStatus, "expired" | "consumed"> {
-  return value === "pending" || value === "approved" || value === "denied";
+function statusOf(record: ApprovalStoreRecord): ApprovalStatus {
+  if (record.consumedAt !== null && record.consumedAt !== undefined) return "consumed";
+  if (record.expiredAt !== null && record.expiredAt !== undefined) return "expired";
+  return record.decision;
 }
 
 function sameHash(request: ApprovalRequest, lookup: ApprovalLookup): boolean {
@@ -31,11 +34,14 @@ function sameHash(request: ApprovalRequest, lookup: ApprovalLookup): boolean {
 
 export class ApprovalManager {
   private readonly requests = new Map<string, ApprovalRequest>();
-  private readonly consumed = new Set<string>();
   private readonly defaultExpiryMs: number;
   private readonly now: () => number;
+  private readonly store?: ApprovalStore;
 
-  constructor(private readonly store?: ApprovalStore, options: ApprovalManagerOptions = {}) {
+  constructor(storeOrOptions?: ApprovalStore | ApprovalManagerOptions, options: ApprovalManagerOptions = {}) {
+    const looksLikeStore = storeOrOptions !== undefined && typeof (storeOrOptions as ApprovalStore).getApproval === "function";
+    this.store = looksLikeStore ? storeOrOptions as ApprovalStore : undefined;
+    if (!looksLikeStore && storeOrOptions !== undefined) options = storeOrOptions as ApprovalManagerOptions;
     this.defaultExpiryMs = options.defaultExpiryMs ?? DEFAULT_EXPIRY_MS;
     this.now = options.now ?? (() => Date.now());
     if (!Number.isInteger(this.defaultExpiryMs) || this.defaultExpiryMs <= 0) {
@@ -65,22 +71,14 @@ export class ApprovalManager {
       return this.current(existing);
     }
 
+    const durableById = this.store?.getApprovalByCallId(id);
+    if (durableById !== null && durableById !== undefined && durableById.argumentsHash !== argumentsHash) {
+      throw new ValidationError(`approval ID ${id} cannot be reused for changed arguments`);
+    }
+
     const durable = this.store?.getApproval(id, argumentsHash);
     if (durable !== null && durable !== undefined) {
-      const durableRisk = isRisk(durable.riskLevel) ? durable.riskLevel : input.risk;
-      const restored: ApprovalRequest = {
-        id,
-        runId: durable.runId ?? input.runId,
-        taskId: durable.taskId ?? input.taskId ?? null,
-        tool: input.tool,
-        capability: input.capability ?? durable.capability,
-        risk: durableRisk,
-        summary: input.summary,
-        argumentsHash,
-        createdAt: durable.requestedAt,
-        expiresAt: durable.requestedAt + this.defaultExpiryMs,
-        status: isApprovalStatus(durable.decision) ? durable.decision : "pending",
-      };
+      const restored = this.restore(durable, input);
       this.requests.set(id, restored);
       return this.current(restored);
     }
@@ -124,32 +122,84 @@ export class ApprovalManager {
   isApproved(input: ApprovalLookup | string, argumentsHash?: string, now = this.now()): boolean {
     const request = this.lookup(input, argumentsHash);
     if (request === null) return false;
-    if (request.status === "consumed" || this.consumed.has(request.id)) return false;
     if (this.expireIfNeeded(request, now)) return false;
     return request.status === "approved";
   }
 
   consume(input: ApprovalLookup | string, args?: Record<string, unknown>, now = this.now()): boolean {
-    const lookup = typeof input === "string" && args !== undefined ? { id: input, tool: this.resolve(input).tool, arguments: args } : input;
-    if (typeof lookup === "string") return false;
+    const lookup: ApprovalLookup | null = typeof input === "string"
+      ? args === undefined
+        ? null
+        : (() => {
+            const request = this.resolve(input);
+            return { id: input, tool: request.tool, arguments: args };
+          })()
+      : input;
+    if (lookup === null) return false;
     const request = this.lookup(lookup);
-    if (request === null || !this.isApproved(lookup, undefined, now)) return false;
-    this.consumed.add(request.id);
+    if (request === null || this.expireIfNeeded(request, now) || request.status !== "approved") return false;
+
+    if (this.store !== undefined) {
+      const consumed = this.store.consumeApproval(request.id, request.argumentsHash, now);
+      if (consumed === null) {
+        const current = this.store.getApproval(request.id, request.argumentsHash);
+        if (current !== null) {
+          request.status = statusOf(current);
+          request.expiresAt = current.expiresAt ?? request.expiresAt;
+          request.consumedAt = current.consumedAt;
+          request.expiredAt = current.expiredAt;
+        }
+        return false;
+      }
+      request.status = "consumed";
+      request.consumedAt = consumed.consumedAt;
+      return true;
+    }
+
     request.status = "consumed";
     return true;
   }
 
   get(id: string): ApprovalRequest | null {
-    const request = this.requests.get(id);
-    if (request === undefined) return null;
+    let request = this.requests.get(id);
+    if (request === undefined) {
+      const durable = this.store?.getApprovalByCallId(id);
+      if (durable === null || durable === undefined) return null;
+      request = this.restore(durable);
+      this.requests.set(id, request);
+    }
     this.expireIfNeeded(request, this.now());
     return { ...request };
   }
 
+  private restore(record: ApprovalStoreRecord, input?: ApprovalRequestInput): ApprovalRequest {
+    const tool = record.tool || input?.tool;
+    if (tool === undefined || tool.length === 0) {
+      throw new ValidationError(`persisted approval ${record.callId} has no tool`);
+    }
+    return {
+      id: record.callId,
+      runId: record.runId ?? input?.runId ?? "unknown",
+      taskId: record.taskId ?? input?.taskId ?? null,
+      tool,
+      capability: input?.capability ?? record.capability,
+      risk: isRisk(record.riskLevel) ? record.riskLevel : input?.risk ?? "high",
+      summary: input?.summary ?? `${tool} requires explicit approval`,
+      argumentsHash: record.argumentsHash,
+      createdAt: record.requestedAt,
+      expiresAt: record.expiresAt ?? record.requestedAt + this.defaultExpiryMs,
+      status: statusOf(record),
+      ...(record.consumedAt === null || record.consumedAt === undefined ? {} : { consumedAt: record.consumedAt }),
+      ...(record.expiredAt === null || record.expiredAt === undefined ? {} : { expiredAt: record.expiredAt }),
+    };
+  }
+
   private resolve(value: string | ApprovalRequest): ApprovalRequest {
     const id = typeof value === "string" ? value : value.id;
+    if (!this.requests.has(id) && this.get(id) === null) throw new ValidationError(`unknown approval: ${id}`);
     const request = this.requests.get(id);
     if (request === undefined) throw new ValidationError(`unknown approval: ${id}`);
+    this.expireIfNeeded(request, this.now());
     if (typeof value !== "string" && value.argumentsHash !== request.argumentsHash) {
       throw new ValidationError(`approval ${id} does not match its original arguments`);
     }
@@ -158,9 +208,10 @@ export class ApprovalManager {
 
   private lookup(input: ApprovalLookup | string, argumentsHash?: string): ApprovalRequest | null {
     if (typeof input === "string") {
+      if (!this.requests.has(input)) this.get(input);
       const request = this.requests.get(input);
-      if (request === undefined || argumentsHash === undefined) return null;
-      return request.argumentsHash === argumentsHash ? request : null;
+      if (request === undefined || argumentsHash === undefined || request.argumentsHash !== argumentsHash) return null;
+      return request;
     }
     const existing = this.requests.get(input.id);
     if (existing !== undefined) return sameHash(existing, input) ? existing : null;
@@ -172,30 +223,37 @@ export class ApprovalManager {
     }
     const durable = this.store?.getApproval(input.id, computed);
     if (durable === null || durable === undefined) return null;
-    const risk = isRisk(durable.riskLevel) ? durable.riskLevel : "high";
-    const restored: ApprovalRequest = {
+    const restored = this.restore(durable, {
       id: input.id,
       runId: durable.runId ?? "unknown",
-      taskId: durable.taskId ?? null,
+      taskId: durable.taskId,
       tool: input.tool,
       capability: durable.capability,
-      risk,
+      risk: isRisk(durable.riskLevel) ? durable.riskLevel : "high",
       summary: `${input.tool} requires explicit approval`,
-      argumentsHash: computed,
-      createdAt: durable.requestedAt,
-      expiresAt: durable.requestedAt + this.defaultExpiryMs,
-      status: isApprovalStatus(durable.decision) ? durable.decision : "pending",
-    };
+      arguments: input.arguments,
+    });
     this.requests.set(input.id, restored);
     return restored;
   }
 
   private expireIfNeeded(request: ApprovalRequest, now: number): boolean {
-    if ((request.status === "pending" || request.status === "approved") && now >= request.expiresAt) {
+    if (request.status === "consumed" || request.status === "expired") return true;
+    if (now < request.expiresAt) return false;
+    if (this.store !== undefined) {
+      const expired = this.store.expireApproval(request.id, request.argumentsHash, now);
+      if (expired !== null) {
+        request.status = statusOf(expired);
+        request.expiresAt = expired.expiresAt ?? request.expiresAt;
+        request.consumedAt = expired.consumedAt;
+        request.expiredAt = expired.expiredAt;
+      } else {
+        request.status = "expired";
+      }
+    } else {
       request.status = "expired";
-      return true;
     }
-    return request.status === "expired";
+    return true;
   }
 
   private current(request: ApprovalRequest): ApprovalRequest {
@@ -209,13 +267,17 @@ export class ApprovalManager {
     this.store.saveApproval({
       callId: request.id,
       argumentsHash: request.argumentsHash,
+      tool: request.tool,
       taskId: request.taskId,
       runId: request.runId,
       capability: request.capability,
       riskLevel: request.risk,
       decision,
       requestedAt: request.createdAt,
+      expiresAt: request.expiresAt,
       resolvedAt,
+      consumedAt: request.consumedAt,
+      expiredAt: request.status === "expired" ? request.expiredAt : null,
     });
   }
 }

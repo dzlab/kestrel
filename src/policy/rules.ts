@@ -158,12 +158,41 @@ function pathValues(value: unknown, key = ""): string[] {
   return [];
 }
 
+type PatchFacts = { paths: string[]; deletes: boolean; malformed: boolean };
+
+function patchFacts(value: unknown): PatchFacts {
+  if (typeof value !== "string") return { paths: [], deletes: false, malformed: true };
+  const lines = value.replace(/\r\n/gu, "\n").split("\n");
+  const paths: string[] = [];
+  let deletes = false;
+  let malformed = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const oldHeader = lines[index];
+    if (!oldHeader?.startsWith("--- ")) continue;
+    const oldPath = oldHeader.slice(4).split("\t", 1)[0]!.trim();
+    const newHeader = lines[index + 1];
+    if (!newHeader?.startsWith("+++ ")) {
+      continue;
+    }
+    const newPath = newHeader.slice(4).split("\t", 1)[0]!.trim();
+    index += 1;
+    if (oldPath.length === 0 || newPath.length === 0) {
+      malformed = true;
+      continue;
+    }
+    if (oldPath !== "/dev/null") paths.push(oldPath.replace(/^[ab]\//u, ""));
+    if (newPath === "/dev/null") {
+      deletes = true;
+    } else {
+      paths.push(newPath.replace(/^[ab]\//u, ""));
+    }
+  }
+  if (paths.length === 0) malformed = true;
+  return { paths, deletes, malformed };
+}
+
 function patchPathValues(value: unknown): string[] {
-  if (typeof value !== "string") return [];
-  return [...value.matchAll(/^(?:---|\+\+\+)\s+([^\t\n]+)(?:\t.*)?$/gmu)]
-    .map((match) => match[1]!.trim())
-    .filter((path) => path !== "/dev/null")
-    .map((path) => path.replace(/^[ab]\//u, ""));
+  return patchFacts(value).paths;
 }
 
 function hasExternalPath(args: Record<string, unknown>, workspace: string): boolean {
@@ -201,7 +230,11 @@ function selfModifying(definition: ToolDefinition, args: Record<string, unknown>
     if (workspace !== undefined) {
       try {
         const root = realpathSync(workspace);
-        return context.selfPaths.some((path) => isWithin(root, resolve(root, path)) && pathValues(args).some((candidate) => resolve(root, candidate) === resolve(root, path)));
+        const candidates = [...pathValues(args), ...patchPathValues(args.patch)];
+        return context.selfPaths.some((path) => {
+          const configured = isAbsolute(path) ? resolve(path) : resolve(root, path);
+          return isWithin(root, configured) && candidates.some((candidate) => resolve(root, candidate) === configured);
+        });
       } catch {
         return true;
       }
@@ -260,6 +293,11 @@ export class PolicyEngine {
     }
 
     const argumentsHash = hashToolCall(definition.name, args);
+    const patch = definition.name === "fs.patch" ? patchFacts(args.patch) : null;
+    if (patch?.malformed) return fail("patch paths are malformed", rule.capability);
+    if (patch?.deletes) {
+      return riskDecision("destructive", "high", true, "patch deletion requires approval", argumentsHash);
+    }
     if (hasExternalPath(args, context.workspace)) {
       return riskDecision(rule.capability, "high", true, "path is outside the workspace or contains an unsafe symlink", argumentsHash);
     }

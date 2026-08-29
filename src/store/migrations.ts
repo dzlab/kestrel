@@ -252,6 +252,16 @@ const versionFourSql = `
       CREATE INDEX IF NOT EXISTS idx_approvals_call_hash ON approvals(call_id, arguments_hash);
     `;
 
+const versionFiveSql = `
+      ALTER TABLE approvals ADD COLUMN tool TEXT NOT NULL DEFAULT '';
+      ALTER TABLE approvals ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE approvals ADD COLUMN consumed_at INTEGER;
+      ALTER TABLE approvals ADD COLUMN expired_at INTEGER;
+      UPDATE approvals SET expires_at = requested_at + 300000 WHERE expires_at = 0;
+      UPDATE approvals SET tool = (SELECT name FROM tool_calls WHERE tool_calls.call_id = approvals.call_id)
+        WHERE tool = '' AND EXISTS (SELECT 1 FROM tool_calls WHERE tool_calls.call_id = approvals.call_id);
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -263,6 +273,7 @@ export const migrations: readonly Migration[] = [
   { version: 2, sql: versionTwoSql, prepare: prepareVersionTwo },
   { version: 3, sql: versionThreeSql, prepare: prepareVersionThree },
   { version: 4, sql: versionFourSql, prepare: prepareVersionFour },
+  { version: 5, sql: versionFiveSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -351,6 +362,10 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "decision", type: "TEXT" },
     { name: "requested_at", type: "INTEGER" },
     { name: "resolved_at", type: "INTEGER" },
+    { name: "tool", type: "TEXT" },
+    { name: "expires_at", type: "INTEGER" },
+    { name: "consumed_at", type: "INTEGER" },
+    { name: "expired_at", type: "INTEGER" },
   ],
 };
 
@@ -375,8 +390,20 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   events: ["type", "payload", "created_at"],
   memories: ["kind", "content", "metadata", "created_at", "updated_at"],
   schedules: ["prompt", "enabled", "created_at"],
-  approvals: ["call_id", "arguments_hash", "capability", "risk_level", "decision", "requested_at"],
+  approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at"],
 };
+
+const legacyApprovalColumns: readonly ColumnDefinition[] = [
+  { name: "call_id", type: "TEXT" },
+  { name: "arguments_hash", type: "TEXT" },
+  { name: "task_id", type: "TEXT" },
+  { name: "run_id", type: "TEXT" },
+  { name: "capability", type: "TEXT" },
+  { name: "risk_level", type: "TEXT" },
+  { name: "decision", type: "TEXT" },
+  { name: "requested_at", type: "INTEGER" },
+  { name: "resolved_at", type: "INTEGER" },
+];
 
 type ForeignKeyDefinition = {
   table: string;
@@ -996,7 +1023,8 @@ function expectedLineageTableSql(table: LineageTable, lineage: SchemaLineage): s
 
 function assertHistoricalLineageTables(database: Database, lineage: SchemaLineage): void {
   for (const table of lineageTables) {
-    const columns = requiredTableColumns[table].filter((column) => column.name !== "lease_token");
+    const columns = (table === "approvals" ? legacyApprovalColumns : requiredTableColumns[table])
+      .filter((column) => column.name !== "lease_token");
     if (!hasTable(database, table)) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
     }
@@ -1143,6 +1171,28 @@ const requiredTableDefinitions = [
   },
 ] as const;
 
+const currentApprovalTableDefinition = {
+  table: "approvals",
+  sql: normalizedSql(`
+    CREATE TABLE "approvals" (
+      call_id TEXT NOT NULL,
+      arguments_hash TEXT NOT NULL,
+      task_id TEXT REFERENCES tasks(id),
+      run_id TEXT REFERENCES runs(id),
+      capability TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+      requested_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      tool TEXT NOT NULL DEFAULT '',
+      expires_at INTEGER NOT NULL DEFAULT 0,
+      consumed_at INTEGER,
+      expired_at INTEGER,
+      PRIMARY KEY (call_id, arguments_hash)
+    )
+  `),
+} as const;
+
 function assertCurrentRebuildSources(database: Database): void {
   for (const table of requiredTableDefinitions) {
     const actual = database
@@ -1240,13 +1290,20 @@ function assertRequiredSchema(database: Database): void {
     assertForeignKeys(database, table, requiredForeignKeys[table]);
   }
 
-  for (const requiredTable of requiredTableDefinitions) {
+  for (const requiredTable of requiredTableDefinitions.filter((table) => table.table !== "approvals")) {
     const actual = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(requiredTable.table) as { sql: string } | null;
     if (actual === null || normalizedSql(actual.sql) !== requiredTable.sql) {
       fail(`required table constraint is missing or altered: ${requiredTable.table}`);
     }
+  }
+
+  const actualApproval = database
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approvals'")
+    .get() as { sql: string } | null;
+  if (actualApproval === null || normalizedSql(actualApproval.sql) !== currentApprovalTableDefinition.sql) {
+    fail("required table definition is missing or altered: approvals");
   }
 
   const expectedSchemaMigrationsDefinition = appliedVersionOneChecksum(database) === historicalVersionOneChecksum
@@ -1350,6 +1407,13 @@ function assertRequiredSchema(database: Database): void {
       .get() !== null
   ) {
     fail("approvals contains an invalid persisted decision");
+  }
+  if (
+    database
+      .query("SELECT 1 AS invalid FROM approvals WHERE expires_at <= requested_at LIMIT 1")
+      .get() !== null
+  ) {
+    fail("approvals contains an invalid expiry");
   }
   if (
     database.query("SELECT 1 AS invalid FROM schedules WHERE enabled NOT IN (0, 1) LIMIT 1").get() !== null

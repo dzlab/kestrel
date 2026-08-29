@@ -1458,7 +1458,7 @@ test("version-four migration rejects an altered current schedule definition befo
     database.exec("INSERT INTO schedules SELECT * FROM schedules_original");
     database.exec("DROP TABLE schedules_original");
     database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
-    database.query("DELETE FROM schema_migrations WHERE version = 4").run();
+    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5)").run();
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/schedule|default|schema/i);
@@ -1496,6 +1496,7 @@ test("fresh databases apply the complete migration history", () => {
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
+      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
     ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
@@ -1549,12 +1550,14 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 2 },
       { version: 3 },
       { version: 4 },
+      { version: 5 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
+      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1607,12 +1610,14 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 2 },
       { version: 3 },
       { version: 4 },
+      { version: 5 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
       { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
       { version: 3, checksum: migrationChecksum(migrations[2].sql) },
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
+      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1675,6 +1680,7 @@ test("version-two databases with a legacy nullable checksum upgrade to the harde
       { version: 2 },
       { version: 3 },
       { version: 4 },
+      { version: 5 },
     ]);
   });
 });

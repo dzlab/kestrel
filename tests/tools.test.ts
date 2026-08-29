@@ -15,6 +15,7 @@ import { dlopen, FFIType } from "bun:ffi";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ValidationError } from "../src/errors";
+import { ApprovalManager } from "../src/policy/approvals";
 import { createFilesystemTools, resolveWorkspacePath } from "../src/tools/filesystem";
 import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
 import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES, boundToolResult } from "../src/tools/types";
@@ -75,6 +76,74 @@ test("registry rejects malformed tool schemas instead of silently accepting argu
   };
 
   expect(() => new ToolRegistry([tool])).toThrow(ValidationError);
+});
+
+test("registry gates custom shell implementations and consumes a matching approval once", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "kestrel-policy-tools-"));
+  let executions = 0;
+  const shell = {
+    definition: {
+      name: "shell.exec",
+      description: "test shell",
+      capability: "shell",
+      inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"], additionalProperties: false },
+    },
+    async execute() {
+      executions += 1;
+      return { ok: true, content: "executed" };
+    },
+  };
+  const approvals = new ApprovalManager({ now: () => 10_000 });
+  const context = { workspace, runId: "run-shell", repository: {} } as ToolContext;
+  const registry = new ToolRegistry([shell], {
+    approvals,
+    policyContext: () => ({ workspace, runId: context.runId, now: 10_001 }),
+  });
+  const call = { id: "shell-call", name: "shell.exec", arguments: { command: "printf safe" } };
+
+  try {
+    await expect(registry.execute(call, context)).resolves.toMatchObject({ ok: false });
+    expect(executions).toBe(0);
+    approvals.request({
+      callId: call.id,
+      runId: context.runId,
+      tool: call.name,
+      capability: "shell",
+      risk: "high",
+      summary: "Run shell",
+      arguments: call.arguments,
+      createdAt: 10_000,
+      expiresAt: 20_000,
+    });
+    approvals.approve(call.id, 10_001);
+    await expect(registry.execute(call, context)).resolves.toMatchObject({ ok: true, content: "executed" });
+    await expect(registry.execute(call, context)).resolves.toMatchObject({ ok: false });
+    expect(executions).toBe(1);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("registry denies a registered tool that has no known policy rule", async () => {
+  let executions = 0;
+  const unknown = {
+    definition: {
+      name: "custom.unknown",
+      description: "unknown policy tool",
+      capability: "shell",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    },
+    async execute() {
+      executions += 1;
+      return { ok: true, content: "bypassed" };
+    },
+  };
+
+  await expect(new ToolRegistry([unknown]).execute(
+    { id: "unknown-call", name: "custom.unknown", arguments: {} },
+    { workspace: "/tmp", runId: "run-unknown", repository: {} } as ToolContext,
+  )).rejects.toThrow(/policy|unknown/i);
+  expect(executions).toBe(0);
 });
 
 test("registry rejects tool schemas whose root is not an object", () => {
@@ -901,16 +970,28 @@ test("patch validates deletion contents before unlinking", async () => {
 test("patch deletes a file only after a matching full-file deletion hunk", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "remove.txt"), "remove me\n");
-    const result = await createToolRegistry().execute(
-      {
-        id: "delete",
-        name: "fs.patch",
-        arguments: {
-          patch: "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove me\n",
-        },
-      },
-      context,
-    );
+    const call = {
+      id: "delete",
+      name: "fs.patch",
+      arguments: { patch: "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove me\n" },
+    };
+    const approvals = new ApprovalManager({ now: () => 10_000 });
+    approvals.request({
+      callId: call.id,
+      runId: context.runId,
+      tool: call.name,
+      capability: "destructive",
+      risk: "high",
+      summary: "Delete a file",
+      arguments: call.arguments,
+      createdAt: 10_000,
+      expiresAt: 20_000,
+    });
+    approvals.approve(call.id, 10_001);
+    const result = await new ToolRegistry(createFilesystemTools(), {
+      approvals,
+      policyContext: () => ({ workspace, runId: context.runId, now: 10_001 }),
+    }).execute(call, context);
 
     expect(result.ok).toBe(true);
     expect(existsSync(join(workspace, "remove.txt"))).toBe(false);
@@ -953,7 +1034,9 @@ test("enforces one aggregate serialized ToolResult budget", async () => {
     },
   };
 
-  const registry = new ToolRegistry([tool]);
+  const registry = new ToolRegistry([tool], {
+    policyEngine: { evaluate: () => ({ allowed: true, requiresApproval: false, capability: "filesystem", risk: "low", reason: "test" }) } as never,
+  });
   const result = await registry.execute(
     { id: "aggregate-budget", name: "oversized-result", arguments: {} },
     { workspace: "/tmp", runId: "run-budget", repository: {} } as ToolContext,

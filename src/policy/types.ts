@@ -37,6 +37,8 @@ export type ApprovalRequest = {
   createdAt: number;
   expiresAt: number;
   status: ApprovalStatus;
+  consumedAt?: number | null;
+  expiredAt?: number | null;
 };
 
 export type ApprovalRequestInput = {
@@ -62,18 +64,25 @@ export type ApprovalLookup = {
 export type ApprovalStoreRecord = {
   callId: string;
   argumentsHash: string;
+  tool?: string;
   capability: string;
   riskLevel: string;
   taskId?: string | null;
   runId?: string | null;
   decision: "pending" | "approved" | "denied";
   requestedAt: number;
+  expiresAt?: number;
   resolvedAt?: number | null;
+  consumedAt?: number | null;
+  expiredAt?: number | null;
 };
 
 export type ApprovalStore = {
   saveApproval(record: ApprovalStoreRecord): void;
   getApproval(callId: string, argumentsHash: string): ApprovalStoreRecord | null;
+  getApprovalByCallId(callId: string): ApprovalStoreRecord | null;
+  consumeApproval(callId: string, argumentsHash: string, now: number): ApprovalStoreRecord | null;
+  expireApproval(callId: string, argumentsHash: string, now: number): ApprovalStoreRecord | null;
 };
 
 export type ApprovalManagerOptions = {

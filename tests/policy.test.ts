@@ -142,6 +142,29 @@ test("unknown tools fail closed and self-modification cannot be disguised by its
   }
 });
 
+test("classifies parsed patch deletion as destructive and configured self targets as self-modifying", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "kestrel-policy-patch-"));
+  try {
+    const engine = new PolicyEngine();
+    const patch = definition("fs.patch", "filesystem", { patch: { type: "string" } }, ["patch"]);
+    const deletion = engine.evaluate(
+      patch,
+      { patch: "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove\n" },
+      context(workspace),
+    );
+    expect(deletion).toMatchObject({ allowed: false, requiresApproval: true, risk: "high", capability: "destructive" });
+
+    const selfTarget = engine.evaluate(
+      patch,
+      { patch: "--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1 @@\n-old\n+new\n" },
+      { ...context(workspace), selfPaths: ["src/index.ts"] },
+    );
+    expect(selfTarget).toMatchObject({ allowed: false, requiresApproval: true, risk: "high", capability: "self-modification" });
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("approval lifecycle is durable, exact, expiring, and one-shot", () => {
   const directory = mkdtempSync(join(tmpdir(), "kestrel-approval-"));
   const path = join(directory, "approvals.sqlite");
@@ -200,10 +223,10 @@ test("approval lifecycle is durable, exact, expiring, and one-shot", () => {
   firstDatabase.close();
   const secondDatabase = openDatabase(path);
   const secondManager = new ApprovalManager(new StoreRepository(secondDatabase), { now: () => now, defaultExpiryMs: 100 });
-  expect(secondManager.isApproved({ id: request.id, tool: request.tool, arguments: { command: "printf safe" } })).toBe(true);
+  expect(secondManager.isApproved({ id: request.id, tool: request.tool, arguments: { command: "printf safe" } })).toBe(false);
   now = 10_101;
   expect(secondManager.isApproved({ id: request.id, tool: request.tool, arguments: { command: "printf safe" } })).toBe(false);
-  expect(secondManager.get(request.id)?.status).toBe("expired");
+  expect(secondManager.get(request.id)?.status).toBe("consumed");
 
   secondDatabase.close();
   rmSync(directory, { recursive: true, force: true });
@@ -212,4 +235,97 @@ test("approval lifecycle is durable, exact, expiring, and one-shot", () => {
 test("approval hashes include the complete tool name and canonical argument order", () => {
   expect(hashToolCall("fs.read", { b: 2, a: 1 })).toBe(hashToolCall("fs.read", { a: 1, b: 2 }));
   expect(hashToolCall("fs.read", { path: "notes.txt" })).not.toBe(hashToolCall("search.text", { path: "notes.txt" }));
+});
+
+test("approval state, exact expiry, id-only decisions, one-shot consume, and audit events survive restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kestrel-approval-restart-"));
+  const path = join(directory, "approvals.sqlite");
+  let firstDatabase = openDatabase(path);
+  let firstRepository = new StoreRepository(firstDatabase);
+  const task = firstRepository.createTask({ title: "approval", prompt: "approval", workspace: directory, maxSteps: 1 });
+  const run = firstRepository.startRun(task.id, "approval-run");
+  let now = 1_000;
+  const input = {
+    callId: "restart-call",
+    runId: run.id,
+    taskId: task.id,
+    tool: "shell.exec",
+    capability: "shell",
+    risk: "high" as const,
+    summary: "restart shell",
+    arguments: { command: "printf restart" },
+    createdAt: now,
+    expiresAt: 1_234,
+  };
+  const first = new ApprovalManager(firstRepository, { now: () => now });
+  first.request(input);
+  firstDatabase.close();
+
+  firstDatabase = openDatabase(path);
+  firstRepository = new StoreRepository(firstDatabase);
+  const restarted = new ApprovalManager(firstRepository, { now: () => now });
+  expect(restarted.get(input.callId)).toMatchObject({ expiresAt: 1_234, status: "pending", tool: "shell.exec" });
+  expect(restarted.approve(input.callId, 1_001).status).toBe("approved");
+
+  const secondDatabase = openDatabase(path);
+  const second = new ApprovalManager(new StoreRepository(secondDatabase), { now: () => now });
+  const lookup = { id: input.callId, tool: input.tool, arguments: input.arguments };
+  expect(second.consume(lookup)).toBe(true);
+  expect(restarted.consume(lookup)).toBe(false);
+
+  const expiredInput = { ...input, callId: "expired-call", expiresAt: 2_000, arguments: { command: "printf expired" } };
+  restarted.request(expiredInput);
+  now = 2_001;
+  expect(second.get(expiredInput.callId)?.status).toBe("expired");
+
+  const deniedInput = { ...input, callId: "denied-call", expiresAt: 3_000, arguments: { command: "printf denied" } };
+  restarted.request(deniedInput);
+  expect(second.deny(deniedInput.callId, 2_002).status).toBe("denied");
+
+  const events = secondDatabase.query(
+    "SELECT type FROM events WHERE run_id = ? ORDER BY id",
+  ).all(run.id) as Array<{ type: string }>;
+  expect(events.map((event) => event.type)).toEqual(expect.arrayContaining([
+    "approval.requested",
+    "approval.approved",
+    "approval.consumed",
+    "approval.expired",
+    "approval.denied",
+  ]));
+
+  secondDatabase.close();
+  firstDatabase.close();
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test("two managers cannot consume the same durable approval", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kestrel-approval-race-"));
+  const path = join(directory, "approvals.sqlite");
+  const firstDatabase = openDatabase(path);
+  const secondDatabase = openDatabase(path);
+  const firstRepository = new StoreRepository(firstDatabase);
+  const secondRepository = new StoreRepository(secondDatabase);
+  const task = firstRepository.createTask({ title: "race", prompt: "race", workspace: directory, maxSteps: 1 });
+  const run = firstRepository.startRun(task.id, "race-run");
+  const input = {
+    callId: "race-call",
+    runId: run.id,
+    tool: "shell.exec",
+    capability: "shell",
+    risk: "high" as const,
+    summary: "race shell",
+    arguments: { command: "printf race" },
+    createdAt: 3_000,
+    expiresAt: 4_000,
+  };
+  const first = new ApprovalManager(firstRepository, { now: () => 3_000 });
+  const second = new ApprovalManager(secondRepository, { now: () => 3_000 });
+  first.request(input);
+  first.approve(input.callId, 3_001);
+  const lookup = { id: input.callId, tool: input.tool, arguments: input.arguments };
+  expect([first.consume(lookup), second.consume(lookup)].filter(Boolean)).toHaveLength(1);
+
+  firstDatabase.close();
+  secondDatabase.close();
+  rmSync(directory, { recursive: true, force: true });
 });
