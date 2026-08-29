@@ -15,6 +15,8 @@ import type {
 import { buildInitialMessages, buildToolMessage, boundMessages } from "./context";
 import { ToolRegistry } from "../tools/registry";
 import type { ToolContext, ToolResult } from "../tools/types";
+import { MemoryStore } from "../memory/store";
+import type { MemoryScope } from "../memory/types";
 
 const DEFAULT_MAX_TURNS = 12;
 const DEFAULT_MAX_TOOL_CALLS = 24;
@@ -42,6 +44,13 @@ export type RunOptions = {
   contextBytes?: number;
   signal?: AbortSignal;
   secretPatterns?: readonly (string | RegExp)[];
+  userId?: string;
+  memoryContext?: {
+    query: string;
+    scope?: MemoryScope;
+    maxResults?: number;
+    maxBytes?: number;
+  };
 };
 
 export type RunSummary = {
@@ -178,7 +187,17 @@ export class RunKernel {
     const deadline = Math.min(this.now() + limits.timeoutMs, run.startedAt + limits.timeoutMs);
     let messages = this.repository.getMessages(run.id);
     if (messages.length === 0) {
-      for (const message of buildInitialMessages(task, limits.contextBytes)) this.repository.appendMessage(run.id, message);
+      const memories = options.memoryContext === undefined
+        ? []
+        : new MemoryStore(this.repository).search({
+            query: options.memoryContext.query,
+            scope: options.memoryContext.scope,
+            userId: options.userId ?? "local",
+            taskId: task.id,
+            maxResults: options.memoryContext.maxResults,
+            maxBytes: options.memoryContext.maxBytes,
+          });
+      for (const message of buildInitialMessages(task, limits.contextBytes, memories)) this.repository.appendMessage(run.id, message);
       this.repository.appendEvent(run.id, "run.started", { taskId: task.id });
       messages = this.repository.getMessages(run.id);
       this.repository.updateRunStatus(run.id, "running");
@@ -328,6 +347,7 @@ export class RunKernel {
       workspace: task.workspace,
       runId: run.id,
       taskId: task.id,
+      userId: options.userId,
       repository: this.repository,
       signal: controller.signal,
       secretPatterns: options.secretPatterns,

@@ -11,6 +11,7 @@ export type ToolContext = {
   workspace: string;
   runId: string;
   taskId?: string | null;
+  userId?: string;
   repository: Repository;
   signal?: AbortSignal;
   secretPatterns?: readonly (string | RegExp)[];

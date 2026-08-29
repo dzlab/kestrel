@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createFilesystemTools } from "./filesystem";
 import { createSearchTool } from "./search";
 import { createShellTools } from "./shell";
+import { createMemoryTools } from "../memory/tools";
 import { boundToolResult } from "./types";
 import { isTrustedBuiltInTool } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
@@ -18,7 +19,7 @@ export type ToolRegistryOptions = {
   policyContext?: PolicyContext | ((context: ToolContext, call: ReturnType<typeof parseToolCall>) => PolicyContext);
 };
 
-const automaticBuiltInNames = new Set(["fs.list", "fs.read", "fs.write", "fs.patch", "search.text"]);
+const automaticBuiltInNames = new Set(["fs.list", "fs.read", "fs.write", "fs.patch", "search.text", "memory.search"]);
 const agentRepository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -125,7 +126,7 @@ export class ToolRegistry {
   private readonly policyContext?: ToolRegistryOptions["policyContext"];
 
   constructor(
-    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool(), ...createShellTools()],
+    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool(), ...createShellTools(), ...createMemoryTools()],
     options: ToolRegistryOptions = {},
   ) {
     this.policyEngine = options.policyEngine ?? new PolicyEngine();

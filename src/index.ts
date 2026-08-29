@@ -7,3 +7,14 @@ export type {
   RunSummary,
   RunTask,
 } from "./kernel";
+export {
+  MemoryStore,
+  assertSafeMemory,
+  createMemoryTools,
+} from "./memory";
+export type {
+  MemoryRecord,
+  MemorySaveInput,
+  MemorySearchInput,
+  MemoryScope,
+} from "./memory";

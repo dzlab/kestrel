@@ -266,6 +266,15 @@ const versionSixSql = `
       ALTER TABLE approvals ADD COLUMN version INTEGER NOT NULL DEFAULT 0;
     `;
 
+const versionSevenSql = `
+      ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+      ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy';
+      ALTER TABLE memories ADD COLUMN source_run_id TEXT;
+      ALTER TABLE memories ADD COLUMN expires_at INTEGER;
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -279,6 +288,7 @@ export const migrations: readonly Migration[] = [
   { version: 4, sql: versionFourSql, prepare: prepareVersionFour },
   { version: 5, sql: versionFiveSql },
   { version: 6, sql: versionSixSql },
+  { version: 7, sql: versionSevenSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -343,6 +353,12 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "confidence", type: "REAL" },
     { name: "created_at", type: "INTEGER" },
     { name: "updated_at", type: "INTEGER" },
+    { name: "scope", type: "TEXT" },
+    { name: "user_id", type: "TEXT" },
+    { name: "tags", type: "TEXT" },
+    { name: "source", type: "TEXT" },
+    { name: "source_run_id", type: "TEXT" },
+    { name: "expires_at", type: "INTEGER" },
   ],
   schedules: [
     { name: "id", type: "TEXT" },
@@ -394,10 +410,22 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   messages: ["run_id", "sequence_number", "payload", "created_at"],
   tool_calls: ["run_id", "call_id", "name", "arguments", "state", "created_at"],
   events: ["type", "payload", "created_at"],
-  memories: ["kind", "content", "metadata", "created_at", "updated_at"],
+  memories: ["kind", "content", "metadata", "created_at", "updated_at", "scope", "user_id", "tags", "source"],
   schedules: ["prompt", "enabled", "created_at"],
   approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at", "version"],
 };
+
+const legacyMemoryColumns: readonly ColumnDefinition[] = [
+  { name: "id", type: "TEXT" },
+  { name: "task_id", type: "TEXT" },
+  { name: "run_id", type: "TEXT" },
+  { name: "kind", type: "TEXT" },
+  { name: "content", type: "TEXT" },
+  { name: "metadata", type: "TEXT" },
+  { name: "confidence", type: "REAL" },
+  { name: "created_at", type: "INTEGER" },
+  { name: "updated_at", type: "INTEGER" },
+];
 
 const legacyApprovalColumns: readonly ColumnDefinition[] = [
   { name: "call_id", type: "TEXT" },
@@ -1029,7 +1057,9 @@ function expectedLineageTableSql(table: LineageTable, lineage: SchemaLineage): s
 
 function assertHistoricalLineageTables(database: Database, lineage: SchemaLineage): void {
   for (const table of lineageTables) {
-    const columns = (table === "approvals" ? legacyApprovalColumns : requiredTableColumns[table])
+    const columns = (table === "approvals"
+      ? legacyApprovalColumns
+      : table === "memories" ? legacyMemoryColumns : requiredTableColumns[table])
       .filter((column) => column.name !== "lease_token");
     if (!hasTable(database, table)) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
@@ -1266,7 +1296,13 @@ const requiredCurrentTableDefinitions = [
         metadata TEXT NOT NULL,
         confidence REAL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'legacy',
+        user_id TEXT NOT NULL DEFAULT 'legacy',
+        tags TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL DEFAULT 'legacy',
+        source_run_id TEXT,
+        expires_at INTEGER
       )
     `),
   },

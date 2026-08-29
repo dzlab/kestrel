@@ -78,6 +78,20 @@ export type MemoryRecord = {
   confidence?: number | null;
   createdAt?: number;
   updatedAt?: number;
+  scope?: string;
+  userId?: string;
+  tags?: string[];
+  source?: string;
+  sourceRunId?: string | null;
+  expiresAt?: number | null;
+};
+
+export type MemorySearchOptions = {
+  scope?: string;
+  userId?: string;
+  taskId?: string | null;
+  now?: number;
+  maxBytes?: number;
 };
 
 export type ScheduleRecord = {
@@ -238,16 +252,36 @@ function parseApprovalDecision(value: unknown): ApprovalDecision {
 }
 
 function memoryFromRow(row: Row): MemoryRecord {
+  let metadata: Record<string, unknown>;
+  let tags: string[];
+  try {
+    metadata = parseJson<Record<string, unknown>>(row.metadata);
+    const parsedTags = parseJson<unknown>(row.tags ?? "[]");
+    if (!Array.isArray(parsedTags) || parsedTags.some((tag) => typeof tag !== "string")) {
+      throw new Error("tags must be an array of strings");
+    }
+    tags = parsedTags;
+  } catch (error) {
+    throw new PersistenceError("persisted memory payload is malformed", { cause: error });
+  }
   return {
     id: String(row.id),
     kind: String(row.kind),
     content: String(row.content),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
-    metadata: parseJson<Record<string, unknown>>(row.metadata),
+    metadata,
     confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+    scope: row.scope === null || row.scope === undefined ? "legacy" : String(row.scope),
+    userId: row.user_id === null || row.user_id === undefined ? "legacy" : String(row.user_id),
+    tags,
+    source: row.source === null || row.source === undefined ? "legacy" : String(row.source),
+    sourceRunId: row.source_run_id === null || row.source_run_id === undefined
+      ? (row.run_id === null || row.run_id === undefined ? null : String(row.run_id))
+      : String(row.source_run_id),
+    expiresAt: row.expires_at === null || row.expires_at === undefined ? null : Number(row.expires_at),
   };
 }
 
@@ -607,8 +641,9 @@ export class StoreRepository {
       this.database
         .query(
           `INSERT INTO memories
-            (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at,
+             scope, user_id, tags, source, source_run_id, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (id) DO UPDATE SET
              task_id = excluded.task_id,
              run_id = excluded.run_id,
@@ -616,6 +651,12 @@ export class StoreRepository {
              content = excluded.content,
              metadata = excluded.metadata,
              confidence = excluded.confidence,
+             scope = excluded.scope,
+             user_id = excluded.user_id,
+             tags = excluded.tags,
+             source = excluded.source,
+             source_run_id = excluded.source_run_id,
+             expires_at = excluded.expires_at,
              updated_at = excluded.updated_at`,
         )
         .run(
@@ -628,25 +669,79 @@ export class StoreRepository {
           input.confidence ?? null,
           input.createdAt ?? timestamp,
           input.updatedAt ?? timestamp,
+          input.scope ?? "legacy",
+          input.userId ?? "legacy",
+          json(input.tags ?? []),
+          input.source ?? input.taskId ?? "legacy",
+          input.sourceRunId ?? input.runId ?? null,
+          input.expiresAt ?? null,
         );
     });
   }
 
-  searchMemories(query: string, limit: number): MemoryRecord[] {
+  getMemory(id: string): MemoryRecord | null {
+    const row = this.database.query("SELECT * FROM memories WHERE id = ?").get(id) as Row | null;
+    return row === null ? null : memoryFromRow(row);
+  }
+
+  searchMemories(query: string, limit: number, options: MemorySearchOptions = {}): MemoryRecord[] {
     if (!Number.isInteger(limit) || limit <= 0) {
       throw new ValidationError("memory search limit must be a positive integer");
     }
+    if (options.maxBytes !== undefined && (!Number.isInteger(options.maxBytes) || options.maxBytes < 2)) {
+      throw new ValidationError("memory search byte limit must be at least two bytes");
+    }
 
     const cappedLimit = Math.min(limit, 100);
+    const now = options.now ?? Date.now();
+    const scoped = options.userId !== undefined;
+    const clauses = ["(expires_at IS NULL OR expires_at > ?)"];
+    const parameters: Array<string | number | null> = [now];
+    if (scoped) {
+      clauses.push("user_id = ?");
+      parameters.push(options.userId!);
+      if (options.scope === "user") {
+        clauses.push("scope = 'user'");
+      } else if (options.scope === "task") {
+        if (options.taskId === undefined || options.taskId === null) {
+          throw new ValidationError("task-scoped memory search requires a task id");
+        }
+        clauses.push("scope = 'task' AND task_id = ?");
+        parameters.push(options.taskId);
+      } else {
+        clauses.push("(scope = 'user' OR (scope = 'task' AND task_id = ?))");
+        parameters.push(options.taskId ?? null);
+      }
+    }
     const rows = this.database
-      .query(
-        `SELECT * FROM memories
-         WHERE content LIKE ? OR metadata LIKE ?
-         ORDER BY created_at DESC
-         LIMIT ?`,
-      )
-      .all(`%${query}%`, `%${query}%`, cappedLimit) as Row[];
-    return rows.map(memoryFromRow);
+      .query(`SELECT * FROM memories WHERE ${clauses.join(" AND ")}`)
+      .all(...parameters) as Row[];
+    const normalizedQuery = query.trim().toLocaleLowerCase("en-US");
+    const tokens = normalizedQuery.match(/[\p{L}\p{N}_-]+/gu) ?? [];
+    const ranked = rows
+      .map((row) => {
+        const record = memoryFromRow(row);
+        const content = record.content.toLocaleLowerCase("en-US");
+        const tags = (record.tags ?? []).map((tag) => tag.toLocaleLowerCase("en-US"));
+        let score = normalizedQuery.length === 0 ? 0 : content.includes(normalizedQuery) ? 1 : 0;
+        for (const token of tokens) {
+          if (tags.some((tag) => tag === token)) score += 10;
+          if (content.split(/[^\p{L}\p{N}_-]+/u).includes(token)) score += 4;
+        }
+        return { record, score };
+      })
+      .filter(({ score }) => normalizedQuery.length === 0 || score > 0)
+      .sort((left, right) => right.score - left.score || (right.record.updatedAt ?? 0) - (left.record.updatedAt ?? 0) || left.record.id.localeCompare(right.record.id));
+
+    const result: MemoryRecord[] = [];
+    const maxBytes = options.maxBytes;
+    for (const { record } of ranked) {
+      if (result.length >= cappedLimit) break;
+      const candidate = [...result, record];
+      if (maxBytes !== undefined && Buffer.byteLength(JSON.stringify(candidate), "utf8") > maxBytes) break;
+      result.push(record);
+    }
+    return result;
   }
 
   createSchedule(input: ScheduleRecord): void {

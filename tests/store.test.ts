@@ -1327,10 +1327,23 @@ test("migration rejects a memories table with an altered default", () => {
         metadata TEXT NOT NULL DEFAULT '{}',
         confidence REAL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'legacy',
+        user_id TEXT NOT NULL DEFAULT 'legacy',
+        tags TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL DEFAULT 'legacy',
+        source_run_id TEXT,
+        expires_at INTEGER
       )
     `);
-    database.exec("INSERT INTO memories SELECT * FROM memories_original");
+    database.exec(`
+      INSERT INTO memories
+        (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at,
+         scope, user_id, tags, source, source_run_id, expires_at)
+      SELECT id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at,
+        scope, user_id, tags, source, source_run_id, expires_at
+      FROM memories_original
+    `);
     database.exec("DROP TABLE memories_original");
     database.exec("CREATE INDEX idx_memories_created ON memories(created_at)");
     database.close();
@@ -1487,7 +1500,7 @@ test("version-four migration rejects an altered current schedule definition befo
     database.exec("INSERT INTO schedules SELECT * FROM schedules_original");
     database.exec("DROP TABLE schedules_original");
     database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
-    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5, 6)").run();
+    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7)").run();
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/schedule|default|schema/i);
@@ -1527,6 +1540,7 @@ test("fresh databases apply the complete migration history", () => {
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
       { version: 5, checksum: migrationChecksum(migrations[4].sql) },
       { version: 6, checksum: migrationChecksum(migrations[5].sql) },
+      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
     ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
@@ -1582,6 +1596,7 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 4 },
       { version: 5 },
       { version: 6 },
+      { version: 7 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
@@ -1590,6 +1605,7 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
       { version: 5, checksum: migrationChecksum(migrations[4].sql) },
       { version: 6, checksum: migrationChecksum(migrations[5].sql) },
+      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1644,6 +1660,7 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 4 },
       { version: 5 },
       { version: 6 },
+      { version: 7 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
@@ -1652,6 +1669,7 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 4, checksum: migrationChecksum(migrations[3].sql) },
       { version: 5, checksum: migrationChecksum(migrations[4].sql) },
       { version: 6, checksum: migrationChecksum(migrations[5].sql) },
+      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1716,6 +1734,7 @@ test("version-two databases with a legacy nullable checksum upgrade to the harde
       { version: 4 },
       { version: 5 },
       { version: 6 },
+      { version: 7 },
     ]);
   });
 });
