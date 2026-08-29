@@ -35,30 +35,34 @@ function readErrno(errnoPointer: NativeSymbols["errnoPointer"]): number {
   return new DataView(toArrayBuffer(pointer as NativePointer, 0, 4)).getInt32(0, true);
 }
 export function createDarwinNativeFs(): NativeFs {
-  const library = dlopen(DARWIN_LIBRARY_PATH, ffiDefinitions);
-  const loaded = library.symbols;
-  const symbols: NativeSymbols = {
-    openat: loaded.openat,
-    flock: loaded.flock,
-    linkat: loaded.linkat,
-    mkdirat: loaded.mkdirat,
-    renameat: loaded.renameat,
-    unlinkat: loaded.unlinkat,
-    fdopendir: loaded.fdopendir,
-    readdir: loaded.readdir,
-    closedir: loaded.closedir,
-    errnoPointer: loaded.__error,
-    strerror: loaded.strerror,
-    mkfifo: loaded.mkfifo,
-  };
+  try {
+    const library = dlopen(DARWIN_LIBRARY_PATH, ffiDefinitions);
+    const loaded = library.symbols;
+    const symbols: NativeSymbols = {
+      openat: loaded.openat,
+      flock: loaded.flock,
+      linkat: loaded.linkat,
+      mkdirat: loaded.mkdirat,
+      renameat: loaded.renameat,
+      unlinkat: loaded.unlinkat,
+      fdopendir: loaded.fdopendir,
+      readdir: loaded.readdir,
+      closedir: loaded.closedir,
+      errnoPointer: loaded.__error,
+      strerror: loaded.strerror,
+      mkfifo: loaded.mkfifo,
+    };
 
-  return {
-    platform: "darwin",
-    libraryPath: DARWIN_LIBRARY_PATH,
-    symbols,
-    constants: { atFdcwd: -2, atRemovedir: 0x0080, lockExclusive: 0x02, lockNonblocking: 0x04 },
-    dirent: createDirentParser(DARWIN_DIRENT_LAYOUT),
-    errnoNames: DARWIN_ERRNO_NAMES,
-    errno: () => readErrno(symbols.errnoPointer),
-  };
+    return {
+      platform: "darwin",
+      libraryPath: DARWIN_LIBRARY_PATH,
+      symbols,
+      constants: { atFdcwd: -2, atRemovedir: 0x0080, lockExclusive: 0x02, lockNonblocking: 0x04 },
+      dirent: createDirentParser(DARWIN_DIRENT_LAYOUT),
+      errnoNames: DARWIN_ERRNO_NAMES,
+      errno: () => readErrno(symbols.errnoPointer),
+    };
+  } catch {
+    throw new ToolExecutionError("could not load Darwin native filesystem library");
+  }
 }

@@ -22,7 +22,7 @@ const ffiDefinitions = {
     args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring, FFIType.i32],
     returns: FFIType.i32,
   },
-  mkdirat: { args: [FFIType.i32, FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
+  mkdirat: { args: [FFIType.i32, FFIType.cstring, FFIType.u32], returns: FFIType.i32 },
   renameat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
   unlinkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
   fdopendir: { args: [FFIType.i32], returns: FFIType.ptr },
@@ -30,7 +30,7 @@ const ffiDefinitions = {
   closedir: { args: [FFIType.ptr], returns: FFIType.i32 },
   __errno_location: { args: [], returns: FFIType.ptr },
   strerror: { args: [FFIType.i32], returns: FFIType.cstring },
-  mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
+  mkfifo: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.i32 },
 } as const;
 
 function readErrno(errnoPointer: NativeSymbols["errnoPointer"]): number {
