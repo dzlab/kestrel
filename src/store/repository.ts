@@ -427,13 +427,15 @@ export class StoreRepository {
       }
       const updated = this.database
         .query(
-          `UPDATE approvals SET consumed_at = ?, resolved_at = ?
+          `UPDATE approvals SET consumed_at = ?, resolved_at = ?, version = version + 1
            WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision = 'approved'
              AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
         )
         .run(now, now, callId, argumentsHash, expectedVersion, now);
       if (updated.changes !== 1) return null;
-      const consumed = { ...record, consumedAt: now, resolvedAt: now, version: record.version + 1 };
+      const consumed = approvalFromRow(this.database
+        .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
+        .get(callId, argumentsHash) as Row);
       this.appendApprovalEvent(consumed, "approval.consumed", now);
       return consumed;
     });

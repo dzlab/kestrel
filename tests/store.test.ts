@@ -536,6 +536,35 @@ test("pending approvals survive reopening the database", () => {
   });
 });
 
+test("consumeApproval atomically persists and returns the incremented version", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    repository.saveApproval({
+      callId: "call-consume-version",
+      argumentsHash: "hash-consume-version",
+      capability: "shell.exec",
+      riskLevel: "high",
+      decision: "approved",
+      requestedAt: 1_000,
+      expiresAt: 2_000,
+      resolvedAt: 1_001,
+      version: 1,
+    });
+
+    const consumed = repository.consumeApproval("call-consume-version", "hash-consume-version", 1_500, 1);
+
+    expect(consumed).toMatchObject({ consumedAt: 1_500, resolvedAt: 1_500, version: 2 });
+    expect(database.query(
+      "SELECT consumed_at, resolved_at, version FROM approvals WHERE call_id = ? AND arguments_hash = ?",
+    ).get("call-consume-version", "hash-consume-version")).toEqual({
+      consumed_at: 1_500,
+      resolved_at: 1_500,
+      version: 2,
+    });
+  });
+});
+
 test("claimDueSchedule returns a due job only once", () => {
   withDatabase((_path, open) => {
     const database = open();

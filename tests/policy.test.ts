@@ -324,6 +324,9 @@ test("two managers cannot consume the same durable approval", () => {
   first.approve(input.callId, 3_001);
   const lookup = { id: input.callId, tool: input.tool, arguments: input.arguments };
   expect([first.consume(lookup), second.consume(lookup)].filter(Boolean)).toHaveLength(1);
+  expect(firstDatabase.query(
+    "SELECT consumed_at, version FROM approvals WHERE call_id = ?",
+  ).get(input.callId)).toEqual({ consumed_at: 3_000, version: 2 });
 
   firstDatabase.close();
   secondDatabase.close();
