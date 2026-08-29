@@ -16,7 +16,7 @@ test("KestrelError always uses its stable base code", () => {
   expect(attemptedCustomCode.code).toBe("KESTREL_ERROR");
 });
 
-test("error codes cannot be changed at runtime", () => {
+test("instance error codes are non-writable and non-configurable", () => {
   const errors = [
     [new KestrelError("x"), "KESTREL_ERROR"],
     [new ValidationError("x"), "VALIDATION_ERROR"],
@@ -27,17 +27,18 @@ test("error codes cannot be changed at runtime", () => {
   ] as const;
 
   for (const [error, code] of errors) {
-    try {
-      (error as { code: string }).code = "MUTATED";
-    } catch {
-      // Strict-mode assignment may throw for a non-writable property.
-    }
-
+    expect(Object.getOwnPropertyDescriptor(error, "code")).toMatchObject({
+      value: code,
+      writable: false,
+      configurable: false,
+    });
+    expect(Reflect.defineProperty(error, "code", { value: "MUTATED" })).toBe(false);
+    expect(Reflect.deleteProperty(error, "code")).toBe(false);
     expect(error.code).toBe(code);
   }
 });
 
-test("new errors keep stable codes when constructor statics are mutated", () => {
+test("static error codes are non-writable and non-configurable", () => {
   const constructors = [
     [KestrelError, "KESTREL_ERROR"],
     [ValidationError, "VALIDATION_ERROR"],
@@ -48,12 +49,13 @@ test("new errors keep stable codes when constructor statics are mutated", () => 
   ] as const;
 
   for (const [ErrorType, code] of constructors) {
-    try {
-      (ErrorType as { code: string }).code = "MUTATED";
-    } catch {
-      // A frozen static property may reject assignment in strict mode.
-    }
-
+    expect(Object.getOwnPropertyDescriptor(ErrorType, "code")).toMatchObject({
+      value: code,
+      writable: false,
+      configurable: false,
+    });
+    expect(Reflect.defineProperty(ErrorType, "code", { value: "MUTATED" })).toBe(false);
+    expect(Reflect.deleteProperty(ErrorType, "code")).toBe(false);
     expect(new ErrorType("x").code).toBe(code);
   }
 });

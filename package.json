@@ -8,7 +8,7 @@
     "dev": "bun run src/cli/main.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "latest"
+    "@types/bun": "1.4.0",
+    "typescript": "5.9.3"
   }
 }
