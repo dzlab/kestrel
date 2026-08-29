@@ -12,6 +12,8 @@ export type ToolContext = {
   runId: string;
   taskId?: string | null;
   repository: Repository;
+  signal?: AbortSignal;
+  secretPatterns?: readonly (string | RegExp)[];
 };
 
 export type ToolResult = {

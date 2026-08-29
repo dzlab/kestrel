@@ -7,6 +7,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFilesystemTools } from "./filesystem";
 import { createSearchTool } from "./search";
+import { createShellTools } from "./shell";
 import { boundToolResult } from "./types";
 import { isTrustedBuiltInTool } from "./types";
 import type { Tool, ToolContext, ToolResult } from "./types";
@@ -24,7 +25,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const schemaTypes = new Set(["object", "string", "number", "boolean"]);
+const schemaTypes = new Set(["object", "string", "number", "boolean", "array"]);
 
 function validateSchemaDefinition(schema: unknown, path: string): asserts schema is Record<string, unknown> {
   if (!isRecord(schema)) {
@@ -32,6 +33,11 @@ function validateSchemaDefinition(schema: unknown, path: string): asserts schema
   }
   if (typeof schema.type !== "string" || !schemaTypes.has(schema.type)) {
     throw new ValidationError(`${path}.type is unsupported`);
+  }
+  if (schema.type === "array") {
+    if (!isRecord(schema.items)) throw new ValidationError(`${path}.items must be a schema object`);
+    validateSchemaDefinition(schema.items, `${path}.items`);
+    return;
   }
   if (schema.type !== "object") return;
 
@@ -88,6 +94,14 @@ function validateSchema(value: unknown, schema: Record<string, unknown>, path: s
     return;
   }
 
+  if (schemaType === "array") {
+    if (!Array.isArray(value)) throw new ValidationError(`${path} must be an array`);
+    if (isRecord(schema.items)) {
+      for (const [index, item] of value.entries()) validateSchema(item, schema.items, `${path}[${index}]`);
+    }
+    return;
+  }
+
   if (schemaType === "string" && typeof value !== "string") {
     throw new ValidationError(`${path} must be a string`);
   }
@@ -111,7 +125,7 @@ export class ToolRegistry {
   private readonly policyContext?: ToolRegistryOptions["policyContext"];
 
   constructor(
-    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool()],
+    tools: readonly Tool[] = [...createFilesystemTools(), createSearchTool(), ...createShellTools()],
     options: ToolRegistryOptions = {},
   ) {
     this.policyEngine = options.policyEngine ?? new PolicyEngine();
