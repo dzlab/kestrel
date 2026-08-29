@@ -529,6 +529,24 @@ test("finishToolCall rejects an unknown call", () => {
   });
 });
 
+test("finishToolCall persists the result, state, and completion time", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const run = createRun(repository);
+    const call: ToolCall = { id: "call-finished", name: "fs.read", arguments: { path: "README.md" } };
+
+    repository.recordToolCall(run.id, call, "running");
+    repository.finishToolCall(run.id, call.id, { ok: true }, "completed");
+
+    expect(database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id)).toEqual({
+      result: '{"ok":true}',
+      state: "completed",
+      finished_at: expect.any(Number),
+    });
+  });
+});
+
 test("searchMemories rejects non-positive limits", () => {
   withDatabase((_path, open) => {
     const database = open();
@@ -622,6 +640,35 @@ test("migration rejects an altered required index", () => {
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/required index/i);
+  });
+});
+
+test("migration rejects a partial unique tool-call index", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("DROP INDEX idx_tool_calls_call_id");
+    database.exec("CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id) WHERE state = 'completed'");
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/required index/i);
+  });
+});
+
+test("migration rejects existing foreign-key violations", () => {
+  withDatabase((path, open) => {
+    open().close();
+    const database = new Database(path);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database
+      .query(
+        `INSERT INTO runs (id, task_id, idempotency_key, status, started_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("orphan-run", "missing-task", "orphan-key", "running", 1);
+    database.close();
+
+    expect(() => openDatabase(path)).toThrow(/foreign key|integrity|constraint/i);
   });
 });
 

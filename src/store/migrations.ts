@@ -357,14 +357,62 @@ const requiredForeignKeys: Readonly<Record<string, readonly ForeignKeyDefinition
 };
 
 const requiredIndexes = [
-  { name: "idx_tool_calls_call_id", table: "tool_calls", unique: true, columns: ["call_id"] },
-  { name: "idx_runs_task_id", table: "runs", unique: false, columns: ["task_id"] },
-  { name: "idx_messages_run_sequence", table: "messages", unique: false, columns: ["run_id", "sequence_number"] },
-  { name: "idx_events_task_created", table: "events", unique: false, columns: ["task_id", "created_at"] },
-  { name: "idx_events_run_created", table: "events", unique: false, columns: ["run_id", "created_at"] },
-  { name: "idx_memories_created", table: "memories", unique: false, columns: ["created_at"] },
-  { name: "idx_schedules_due", table: "schedules", unique: false, columns: ["enabled", "next_run_at", "claimed_by"] },
-  { name: "idx_approvals_call_hash", table: "approvals", unique: false, columns: ["call_id", "arguments_hash"] },
+  {
+    name: "idx_tool_calls_call_id",
+    table: "tool_calls",
+    unique: true,
+    columns: ["call_id"],
+    sql: "create unique index idx_tool_calls_call_id on tool_calls(call_id)",
+  },
+  {
+    name: "idx_runs_task_id",
+    table: "runs",
+    unique: false,
+    columns: ["task_id"],
+    sql: "create index idx_runs_task_id on runs(task_id)",
+  },
+  {
+    name: "idx_messages_run_sequence",
+    table: "messages",
+    unique: false,
+    columns: ["run_id", "sequence_number"],
+    sql: "create index idx_messages_run_sequence on messages(run_id, sequence_number)",
+  },
+  {
+    name: "idx_events_task_created",
+    table: "events",
+    unique: false,
+    columns: ["task_id", "created_at"],
+    sql: "create index idx_events_task_created on events(task_id, created_at)",
+  },
+  {
+    name: "idx_events_run_created",
+    table: "events",
+    unique: false,
+    columns: ["run_id", "created_at"],
+    sql: "create index idx_events_run_created on events(run_id, created_at)",
+  },
+  {
+    name: "idx_memories_created",
+    table: "memories",
+    unique: false,
+    columns: ["created_at"],
+    sql: "create index idx_memories_created on memories(created_at)",
+  },
+  {
+    name: "idx_schedules_due",
+    table: "schedules",
+    unique: false,
+    columns: ["enabled", "next_run_at", "claimed_by"],
+    sql: "create index idx_schedules_due on schedules(enabled, next_run_at, claimed_by)",
+  },
+  {
+    name: "idx_approvals_call_hash",
+    table: "approvals",
+    unique: false,
+    columns: ["call_id", "arguments_hash"],
+    sql: "create index idx_approvals_call_hash on approvals(call_id, arguments_hash)",
+  },
 ] as const;
 
 export function migrationChecksum(sql: string): string {
@@ -608,6 +656,13 @@ function assertRequiredSchema(database: Database): void {
     if (JSON.stringify(actualColumns) !== JSON.stringify(index.columns)) {
       fail(`required index is missing or altered: ${index.name}`);
     }
+
+    const actualDefinition = database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(index.name) as { sql: string | null } | null;
+    if (actualDefinition === null || actualDefinition.sql === null || normalizedSql(actualDefinition.sql) !== index.sql) {
+      fail(`required index is missing or altered: ${index.name}`);
+    }
   }
 
   for (const trigger of requiredTriggerDefinitions) {
@@ -643,6 +698,11 @@ function assertRequiredSchema(database: Database): void {
       .get() !== null
   ) {
     fail("runs contains an invalid persisted status");
+  }
+
+  const foreignKeyViolations = database.query("PRAGMA foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    fail(`foreign-key integrity check failed with ${foreignKeyViolations.length} violation(s)`);
   }
 }
 
