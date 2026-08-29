@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { PersistenceError, ValidationError } from "../errors";
+import { parseMessage } from "../protocol/validation";
 import type { Message, RunStatus, ToolCall } from "../protocol/types";
 import { immediateTransaction } from "./transaction";
 
@@ -24,6 +25,26 @@ export type RunRecord = {
   status: RunStatus;
   startedAt: number;
   finishedAt: number | null;
+};
+
+export type ToolCallRecord = {
+  runId: string;
+  callId: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  state: string;
+  result: unknown | null;
+  createdAt: number;
+  finishedAt: number | null;
+};
+
+export type EventRecord = {
+  id: number;
+  runId: string | null;
+  taskId: string | null;
+  type: string;
+  payload: unknown;
+  createdAt: number;
 };
 
 export type ApprovalDecision = "pending" | "approved" | "denied";
@@ -94,6 +115,50 @@ function canonicalJson(value: unknown): string {
 
 function parseJson<T>(value: unknown): T {
   return JSON.parse(String(value)) as T;
+}
+
+function messageFromRow(row: Row): Message {
+  try {
+    return parseMessage(parseJson<unknown>(row.payload));
+  } catch (error) {
+    throw new PersistenceError("persisted message is malformed", { cause: error });
+  }
+}
+
+function toolCallFromRow(row: Row): ToolCallRecord {
+  let args: Record<string, unknown>;
+  let result: unknown | null = null;
+  try {
+    args = parseJson<Record<string, unknown>>(row.arguments);
+    if (row.result !== null && row.result !== undefined) result = parseJson<unknown>(row.result);
+  } catch (error) {
+    throw new PersistenceError("persisted tool call payload is malformed", { cause: error });
+  }
+  return {
+    runId: String(row.run_id),
+    callId: String(row.call_id),
+    name: String(row.name),
+    arguments: args,
+    state: String(row.state),
+    result,
+    createdAt: Number(row.created_at),
+    finishedAt: row.finished_at === null || row.finished_at === undefined ? null : Number(row.finished_at),
+  };
+}
+
+function eventFromRow(row: Row): EventRecord {
+  try {
+    return {
+      id: Number(row.id),
+      runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
+      taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
+      type: String(row.type),
+      payload: parseJson<unknown>(row.payload),
+      createdAt: Number(row.created_at),
+    };
+  } catch (error) {
+    throw new PersistenceError("persisted event payload is malformed", { cause: error });
+  }
 }
 
 const runStatuses: readonly RunStatus[] = [
@@ -214,6 +279,11 @@ function scheduleFromRow(row: Row): ScheduleRecord {
 export class StoreRepository {
   constructor(private readonly database: Database) {}
 
+  getTask(taskId: string): TaskRecord | null {
+    const row = this.database.query("SELECT * FROM tasks WHERE id = ?").get(taskId) as Row | null;
+    return row === null ? null : taskFromRow(row);
+  }
+
   createTask(input: {
     title: string;
     prompt: string;
@@ -257,6 +327,25 @@ export class StoreRepository {
     });
   }
 
+  getRun(runId: string): RunRecord | null {
+    const row = this.database.query("SELECT * FROM runs WHERE id = ?").get(runId) as Row | null;
+    return row === null ? null : runFromRow(row);
+  }
+
+  getMessages(runId: string): Message[] {
+    const rows = this.database
+      .query("SELECT * FROM messages WHERE run_id = ? ORDER BY sequence_number")
+      .all(runId) as Row[];
+    return rows.map(messageFromRow);
+  }
+
+  getEvents(runId: string): EventRecord[] {
+    const rows = this.database
+      .query("SELECT * FROM events WHERE run_id = ? ORDER BY id")
+      .all(runId) as Row[];
+    return rows.map(eventFromRow);
+  }
+
   appendMessage(runId: string, message: Message): void {
     immediateTransaction(this.database, () => {
       const row = this.database
@@ -265,6 +354,46 @@ export class StoreRepository {
       this.database
         .query("INSERT INTO messages (run_id, sequence_number, payload, created_at) VALUES (?, ?, ?, ?)")
         .run(runId, row.sequence_number, json(message), Date.now());
+    });
+  }
+
+  getToolCall(callId: string): ToolCallRecord | null {
+    const row = this.database.query("SELECT * FROM tool_calls WHERE call_id = ?").get(callId) as Row | null;
+    return row === null ? null : toolCallFromRow(row);
+  }
+
+  getToolCalls(runId: string): ToolCallRecord[] {
+    const rows = this.database
+      .query("SELECT * FROM tool_calls WHERE run_id = ? ORDER BY created_at, id")
+      .all(runId) as Row[];
+    return rows.map(toolCallFromRow);
+  }
+
+  updateToolCallState(runId: string, callId: string, state: string): void {
+    immediateTransaction(this.database, () => {
+      const update = this.database
+        .query("UPDATE tool_calls SET state = ? WHERE run_id = ? AND call_id = ? AND finished_at IS NULL")
+        .run(state, runId, callId);
+      if (update.changes !== 1) {
+        throw new PersistenceError(`tool call ${callId} is not an unfinished call for run ${runId}`);
+      }
+    });
+  }
+
+  updateRunStatus(runId: string, status: RunStatus): RunRecord {
+    if (!runStatuses.includes(status)) throw new ValidationError(`invalid run status: ${status}`);
+    return immediateTransaction(this.database, () => {
+      const now = Date.now();
+      const finishedAt = status === "running" ? null : now;
+      const update = this.database
+        .query("UPDATE runs SET status = ?, finished_at = ? WHERE id = ?")
+        .run(status, finishedAt, runId);
+      if (update.changes !== 1) throw new PersistenceError(`run ${runId} was not found`);
+      const run = runFromRow(this.database.query("SELECT * FROM runs WHERE id = ?").get(runId) as Row);
+      this.database
+        .query("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?")
+        .run(status, now, run.taskId);
+      return run;
     });
   }
 
