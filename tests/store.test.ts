@@ -1455,6 +1455,30 @@ test("legacy version-1 databases upgrade without losing data", () => {
   });
 });
 
+test("claimed legacy schedules upgrade with a new lease token", () => {
+  withDatabase((path, open) => {
+    createVersionTwoDatabase(path, (database) => {
+      database
+        .query(
+          `INSERT INTO schedules
+             (id, prompt, next_run_at, enabled, claimed_by, claimed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-claimed-schedule", "Run once", 1_000, 1, "legacy-owner", 1_234, 1_000);
+    });
+
+    const database = open();
+    const schedule = new StoreRepository(database).getSchedule("legacy-claimed-schedule");
+
+    expect(schedule).toMatchObject({
+      id: "legacy-claimed-schedule",
+      claimedBy: "legacy-owner",
+      claimedAt: 1_234,
+      leaseToken: expect.any(String),
+    });
+  });
+});
+
 test("hardened historical version-one databases upgrade without losing data", () => {
   withDatabase((path, open) => {
     createHistoricalDatabase(

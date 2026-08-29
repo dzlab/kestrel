@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { PersistenceError } from "../errors";
 import { immediateTransaction } from "./transaction";
@@ -513,6 +513,23 @@ function prepareVersionTwo(database: Database): void {
 function prepareVersionThree(database: Database): void {
   assertHistoricalLineageTables(database, schemaLineageFor(database, true));
   assertScheduleLeaseTuples(database);
+  const legacySchedules = database
+    .query(
+      `SELECT id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, last_error, created_at
+       FROM schedules`,
+    )
+    .all() as Array<{
+    id: string;
+    task_id: string | null;
+    prompt: string;
+    cron: string | null;
+    next_run_at: number | null;
+    enabled: number;
+    claimed_by: string | null;
+    claimed_at: number | null;
+    last_error: string | null;
+    created_at: number;
+  }>;
   const toolCallsSequence = database
     .query("SELECT seq FROM sqlite_sequence WHERE name = 'tool_calls'")
     .get() as { seq: number } | null;
@@ -549,10 +566,29 @@ function prepareVersionThree(database: Database): void {
         OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
       )
     );
-    INSERT INTO schedules_v3
-      (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
-    SELECT id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, NULL, last_error, created_at
-    FROM schedules;
+  `);
+  const insertLegacySchedule = database.query(
+    `INSERT INTO schedules_v3
+       (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const schedule of legacySchedules) {
+    insertLegacySchedule.run(
+      schedule.id,
+      schedule.task_id,
+      schedule.prompt,
+      schedule.cron,
+      schedule.next_run_at,
+      schedule.enabled,
+      schedule.claimed_by,
+      schedule.claimed_at,
+      schedule.claimed_by === null ? null : randomUUID(),
+      schedule.last_error,
+      schedule.created_at,
+    );
+  }
+
+  database.exec(`
     DROP TABLE schedules;
     ALTER TABLE schedules_v3 RENAME TO schedules;
 
@@ -649,7 +685,7 @@ function assertScheduleLeaseTuples(database: Database): void {
     ? `
        (claimed_by IS NULL) != (claimed_at IS NULL)
        OR (claimed_by IS NULL) != (lease_token IS NULL)`
-    : `claimed_by IS NOT NULL OR claimed_at IS NOT NULL`;
+    : `(claimed_by IS NULL) != (claimed_at IS NULL)`;
   const malformed = database
     .query(
       `SELECT id FROM schedules
