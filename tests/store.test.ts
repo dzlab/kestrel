@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PersistenceError, ValidationError } from "../src/errors";
 import { openDatabase } from "../src/store/database";
+import { migrations } from "../src/store/migrations";
 import { StoreRepository } from "../src/store/repository";
 import type { Message, ToolCall } from "../src/protocol/types";
 
@@ -290,6 +291,50 @@ test("migration rejects an altered required index", () => {
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/required index/i);
+  });
+});
+
+test("fresh databases apply the complete migration history", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const versions = database
+      .query("SELECT version, checksum FROM schema_migrations ORDER BY version")
+      .all() as Array<{ version: number; checksum: string }>;
+
+    expect(versions.map((migration) => migration.version)).toEqual([1, 2]);
+    expect(versions.every((migration) => migration.checksum.length === 64)).toBe(true);
+    expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
+      name: "approvals",
+    });
+    expect(database.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_schedules_due'").get()).toEqual({
+      name: "idx_schedules_due",
+    });
+  });
+});
+
+test("legacy version-1 databases upgrade without losing data", () => {
+  withDatabase((path, open) => {
+    const legacy = new Database(path);
+    legacy.exec(migrations.find((migration) => migration.version === 1)?.sql ?? "");
+    legacy.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    legacy.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(1, 1_700_000_000_000);
+    legacy
+      .query(
+        `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("legacy-task", "Legacy", "Keep this task", "/tmp/workspace", 3, "pending", 1_700_000_000_000, 1_700_000_000_000);
+    legacy.close();
+
+    const database = open();
+    expect(database.query("SELECT title FROM tasks WHERE id = ?").get("legacy-task")).toEqual({ title: "Legacy" });
+    expect(database.query("PRAGMA table_info('schema_migrations')").all()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "checksum" })]),
+    );
+    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
+      { version: 1 },
+      { version: 2 },
+    ]);
   });
 });
 

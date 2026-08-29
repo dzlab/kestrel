@@ -5,19 +5,18 @@ import { PersistenceError } from "../errors";
 export type Migration = {
   version: number;
   sql: string;
+  prepare?: (database: Database) => void;
 };
 
-export const migrations: readonly Migration[] = [
-  {
-    version: 1,
-    sql: `
+// Keep this SQL byte-for-byte compatible with the v1 migration shipped in 0fed501.
+const versionOneSql = `
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         prompt TEXT NOT NULL,
         workspace TEXT NOT NULL,
         max_steps INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -26,7 +25,7 @@ export const migrations: readonly Migration[] = [
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
         idempotency_key TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')),
+        status TEXT NOT NULL,
         started_at INTEGER NOT NULL,
         finished_at INTEGER,
         UNIQUE (task_id, idempotency_key)
@@ -44,7 +43,7 @@ export const migrations: readonly Migration[] = [
       CREATE TABLE tool_calls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         run_id TEXT NOT NULL REFERENCES runs(id),
-        call_id TEXT NOT NULL,
+        call_id TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
         arguments TEXT NOT NULL,
         state TEXT NOT NULL,
@@ -99,17 +98,44 @@ export const migrations: readonly Migration[] = [
         resolved_at INTEGER,
         PRIMARY KEY (call_id, arguments_hash)
       );
+    `;
 
-      CREATE UNIQUE INDEX idx_tool_calls_call_id ON tool_calls(call_id);
-      CREATE INDEX idx_runs_task_id ON runs(task_id);
-      CREATE INDEX idx_messages_run_sequence ON messages(run_id, sequence_number);
-      CREATE INDEX idx_events_task_created ON events(task_id, created_at);
-      CREATE INDEX idx_events_run_created ON events(run_id, created_at);
-      CREATE INDEX idx_memories_created ON memories(created_at);
-      CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
-      CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash);
-    `,
-  },
+const versionTwoSql = `
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_call_id ON tool_calls(call_id);
+      CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id);
+      CREATE INDEX IF NOT EXISTS idx_messages_run_sequence ON messages(run_id, sequence_number);
+      CREATE INDEX IF NOT EXISTS idx_events_task_created ON events(task_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_run_created ON events(run_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+      CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at, claimed_by);
+      CREATE INDEX IF NOT EXISTS idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+
+      CREATE TRIGGER IF NOT EXISTS tasks_status_insert_guard
+      BEFORE INSERT ON tasks
+      WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+      BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+
+      CREATE TRIGGER IF NOT EXISTS tasks_status_update_guard
+      BEFORE UPDATE OF status ON tasks
+      WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+      BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+
+      CREATE TRIGGER IF NOT EXISTS runs_status_insert_guard
+      BEFORE INSERT ON runs
+      WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+      BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+
+      CREATE TRIGGER IF NOT EXISTS runs_status_update_guard
+      BEFORE UPDATE OF status ON runs
+      WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+      BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+    `;
+
+export const versionOneChecksum = "35a5325463baa76e76db95fb84a46bd41d40aa26d4414776bb855785fb0ac129";
+
+export const migrations: readonly Migration[] = [
+  { version: 1, sql: versionOneSql },
+  { version: 2, sql: versionTwoSql, prepare: prepareVersionTwo },
 ];
 
 const requiredTableColumns: Readonly<Record<string, readonly string[]>> = {
@@ -135,39 +161,78 @@ const requiredIndexes = [
   { name: "idx_approvals_call_hash", table: "approvals", unique: false, columns: ["call_id", "arguments_hash"] },
 ] as const;
 
+const requiredTriggers = [
+  "tasks_status_insert_guard",
+  "tasks_status_update_guard",
+  "runs_status_insert_guard",
+  "runs_status_update_guard",
+] as const;
+
 export function migrationChecksum(sql: string): string {
   return createHash("sha256").update(sql).digest("hex");
+}
+
+function expectedChecksum(migration: Migration): string {
+  const checksum = migrationChecksum(migration.sql);
+  if (migration.version === 1 && checksum !== versionOneChecksum) {
+    fail("bundled version-1 migration does not match its historical checksum");
+  }
+  return migration.version === 1 ? versionOneChecksum : checksum;
 }
 
 function fail(message: string): never {
   throw new PersistenceError(message);
 }
 
-function assertSchemaMigrationsShape(database: Database): void {
-  const columns = database
-    .query("PRAGMA table_info('schema_migrations')")
-    .all() as Array<{ name: string }>;
-  const names = new Set(columns.map((column) => column.name));
-  for (const requiredColumn of requiredTableColumns.schema_migrations) {
-    if (!names.has(requiredColumn)) {
+function prepareVersionTwo(database: Database): void {
+  if (tableColumns(database, "schema_migrations").has("checksum")) {
+    return;
+  }
+
+  database.exec("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT");
+  const updated = database
+    .query("UPDATE schema_migrations SET checksum = ? WHERE version = 1")
+    .run(versionOneChecksum);
+  if (updated.changes !== 1) {
+    fail("cannot establish the historical version-1 checksum");
+  }
+}
+
+function tableColumns(database: Database, table: string): Set<string> {
+  return new Set(
+    (database.query(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>).map((column) => column.name),
+  );
+}
+
+function hasTable(database: Database, table: string): boolean {
+  return database
+    .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table) !== null;
+}
+
+function assertSchemaMigrationsShape(database: Database): boolean {
+  if (!hasTable(database, "schema_migrations")) {
+    fail("schema_migrations table is missing");
+  }
+
+  const columns = tableColumns(database, "schema_migrations");
+  for (const requiredColumn of ["version", "applied_at"] as const) {
+    if (!columns.has(requiredColumn)) {
       fail(`schema_migrations is missing required column ${requiredColumn}`);
     }
   }
+  return columns.has("checksum");
 }
 
 function assertRequiredSchema(database: Database): void {
   for (const [table, columns] of Object.entries(requiredTableColumns)) {
-    const object = database
-      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-      .get(table) as { name: string } | null;
-    if (object === null) {
+    if (!hasTable(database, table)) {
       fail(`required table is missing: ${table}`);
     }
 
-    const actualColumns = database.query(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>;
-    const actualNames = new Set(actualColumns.map((column) => column.name));
+    const actualColumns = tableColumns(database, table);
     for (const column of columns) {
-      if (!actualNames.has(column)) {
+      if (!actualColumns.has(column)) {
         fail(`required table ${table} is missing column ${column}`);
       }
     }
@@ -192,6 +257,55 @@ function assertRequiredSchema(database: Database): void {
       fail(`required index is missing or altered: ${index.name}`);
     }
   }
+
+  for (const trigger of requiredTriggers) {
+    if (
+      database
+        .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+        .get(trigger) === null
+    ) {
+      fail(`required trigger is missing: ${trigger}`);
+    }
+  }
+
+  if (
+    database
+      .query(
+        `SELECT 1 AS invalid FROM tasks
+         WHERE status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+         LIMIT 1`,
+      )
+      .get() !== null
+  ) {
+    fail("tasks contains an invalid persisted status");
+  }
+  if (
+    database
+      .query(
+        `SELECT 1 AS invalid FROM runs
+         WHERE status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+         LIMIT 1`,
+      )
+      .get() !== null
+  ) {
+    fail("runs contains an invalid persisted status");
+  }
+}
+
+function assertAppliedChecksums(
+  database: Database,
+  rows: Array<{ version: number; checksum: string | null }>,
+): void {
+  const knownMigrations = new Map(migrations.map((migration) => [migration.version, migration]));
+  for (const row of rows) {
+    const migration = knownMigrations.get(row.version);
+    if (migration === undefined) {
+      fail(`unknown migration version ${row.version}; database requires a newer Kestrel version`);
+    }
+    if (row.checksum !== expectedChecksum(migration)) {
+      fail(`migration ${row.version} checksum mismatch`);
+    }
+  }
 }
 
 export function runMigrations(database: Database): void {
@@ -199,30 +313,35 @@ export function runMigrations(database: Database): void {
     database.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
-        checksum TEXT NOT NULL,
         applied_at INTEGER NOT NULL
       );
     `);
-    assertSchemaMigrationsShape(database);
 
+    let hasChecksum = assertSchemaMigrationsShape(database);
     const knownMigrations = new Map(migrations.map((migration) => [migration.version, migration]));
-    const appliedRows = database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all() as Array<{
+    const versionRows = database.query("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{
       version: number;
-      checksum: string;
     }>;
-    const applied = new Set<number>();
-
-    for (const row of appliedRows) {
-      const migration = knownMigrations.get(row.version);
-      if (migration === undefined) {
+    const applied = new Set(versionRows.map((row) => row.version));
+    for (const row of versionRows) {
+      if (!knownMigrations.has(row.version)) {
         fail(`unknown migration version ${row.version}; database requires a newer Kestrel version`);
       }
-
-      const expectedChecksum = migrationChecksum(migration.sql);
-      if (row.checksum !== expectedChecksum) {
-        fail(`migration ${row.version} checksum mismatch`);
+    }
+    for (let index = 1; index < migrations.length; index += 1) {
+      if (applied.has(migrations[index].version) && !applied.has(migrations[index - 1].version)) {
+        fail(`migration history skips version ${migrations[index - 1].version}`);
       }
-      applied.add(row.version);
+    }
+
+    if (hasChecksum) {
+      assertAppliedChecksums(
+        database,
+        database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all() as Array<{
+          version: number;
+          checksum: string | null;
+        }>,
+      );
     }
 
     for (const migration of migrations) {
@@ -230,12 +349,32 @@ export function runMigrations(database: Database): void {
         continue;
       }
 
+      migration.prepare?.(database);
+      hasChecksum = assertSchemaMigrationsShape(database);
+
       database.exec(migration.sql);
-      database
-        .query("INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)")
-        .run(migration.version, migrationChecksum(migration.sql), Date.now());
+      if (hasChecksum) {
+        database
+          .query("INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)")
+          .run(migration.version, expectedChecksum(migration), Date.now());
+      } else {
+        database
+          .query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+          .run(migration.version, Date.now());
+      }
+      applied.add(migration.version);
     }
 
+    if (!hasChecksum) {
+      fail("schema_migrations checksum upgrade was not applied");
+    }
+    assertAppliedChecksums(
+      database,
+      database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all() as Array<{
+        version: number;
+        checksum: string | null;
+      }>,
+    );
     assertRequiredSchema(database);
   });
 
