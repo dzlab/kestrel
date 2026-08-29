@@ -3,6 +3,13 @@ import { ValidationError } from "../src/errors";
 import type { RunStatus } from "../src/protocol/types";
 import { parseMessage, parseModelResponse, parseToolCall } from "../src/protocol/validation";
 
+const terminalStatuses = [
+  "completed",
+  "failed",
+  "blocked_on_approval",
+  "budget_exhausted",
+] as const satisfies readonly Exclude<RunStatus, "running">[];
+
 test("parses a valid assistant tool call and JSON arguments", () => {
   const response = parseModelResponse({
     message: {
@@ -62,18 +69,62 @@ test("rejects an assistant message without content or tool calls", () => {
   );
 });
 
-test("accepts every terminal run status", () => {
-  const terminalStatuses: Exclude<RunStatus, "running">[] = [
-    "completed",
-    "failed",
-    "blocked_on_approval",
-    "budget_exhausted",
-  ];
+test("rejects invalid model response finish reasons", () => {
+  for (const finishReason of ["unknown", "", null]) {
+    expect(() =>
+      parseModelResponse({
+        message: { role: "assistant", content: "Done" },
+        finishReason,
+      }),
+    ).toThrow(ValidationError);
+  }
+});
 
-  expect(terminalStatuses).toEqual([
-    "completed",
-    "failed",
-    "blocked_on_approval",
-    "budget_exhausted",
-  ]);
+test("rejects missing model response messages", () => {
+  expect(() => parseModelResponse({ finishReason: "stop" })).toThrow(ValidationError);
+});
+
+test("rejects malformed model response messages", () => {
+  expect(() =>
+    parseModelResponse({
+      message: { role: "assistant", content: 42 },
+      finishReason: "stop",
+    }),
+  ).toThrow(ValidationError);
+});
+
+test("rejects malformed model response usage", () => {
+  for (const usage of [null, [], "not an object"]) {
+    expect(() =>
+      parseModelResponse({
+        message: { role: "assistant", content: "Done" },
+        finishReason: "stop",
+        usage,
+      }),
+    ).toThrow(ValidationError);
+  }
+});
+
+test("rejects negative and non-finite usage token counts", () => {
+  const tokenFields = ["inputTokens", "outputTokens", "totalTokens"] as const;
+  const invalidTokenCounts = [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+
+  for (const field of tokenFields) {
+    for (const tokenCount of invalidTokenCounts) {
+      expect(() =>
+        parseModelResponse({
+          message: { role: "assistant", content: "Done" },
+          finishReason: "stop",
+          usage: { [field]: tokenCount },
+        }),
+      ).toThrow(ValidationError);
+    }
+  }
+});
+
+test("lists every terminal run status at runtime", () => {
+  expect(terminalStatuses).toHaveLength(4);
+  expect(new Set(terminalStatuses)).toEqual(
+    new Set(["completed", "failed", "blocked_on_approval", "budget_exhausted"]),
+  );
 });
