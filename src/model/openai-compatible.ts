@@ -114,7 +114,7 @@ function normalizeResponse(input: unknown): unknown {
 }
 
 function isRetryableStatus(status: number): boolean {
-  return status === 429 || status >= 500;
+  return status === 429 || (status >= 500 && status <= 599);
 }
 
 function errorDetail(body: string): string {

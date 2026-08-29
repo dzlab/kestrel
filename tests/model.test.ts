@@ -180,6 +180,28 @@ test("rejects non-2xx responses without retrying permanent failures", async () =
   expect(attempts).toBe(1);
 });
 
+test("does not retry an HTTP 600 response", async () => {
+  let attempts = 0;
+  const fetchImpl: FetchImplementation = async () => {
+    attempts += 1;
+    return {
+      ok: false,
+      status: 600,
+      text: async () => JSON.stringify({ error: { message: "unknown failure" } }),
+    } as Response;
+  };
+
+  await expect(
+    new OpenAICompatibleClient({
+      baseUrl: "https://example.test",
+      model: "configured-model",
+      timeoutMs: 100,
+      fetchImpl,
+    }).complete(request),
+  ).rejects.toThrow(/600/);
+  expect(attempts).toBe(1);
+});
+
 test("retries one 429 or 5xx response before succeeding", async () => {
   for (const transientStatus of [429, 503]) {
     let attempts = 0;
