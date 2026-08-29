@@ -6,7 +6,7 @@
 
 **Architecture:** Use three focused workflows under \`.github/workflows/\`. CI owns project checks and actionlint, CodeQL owns static analysis with its required upload permission, and dependency review owns pull-request dependency diffs. CI installs from the committed \`package-lock.json\` with \`npm ci --ignore-scripts\` and executes the project with Bun \`1.4.0\` and \`latest\`.
 
-**Tech Stack:** GitHub Actions, Bun, npm, TypeScript, \`oven-sh/setup-bun@v2\`, \`github/codeql-action@v3\`, \`actions/dependency-review-action@v4\`, and actionlint.
+**Tech Stack:** GitHub Actions, Bun, npm, TypeScript, \`oven-sh/setup-bun@v2\`, \`github/codeql-action@v4\`, \`actions/dependency-review-action@v4\`, and actionlint.
 
 ---
 
@@ -120,12 +120,12 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
           build-mode: none
           queries: security-and-quality
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: /language:javascript-typescript
 \`\`\`
