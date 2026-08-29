@@ -248,6 +248,46 @@ test("lists and reads workspace files with a bounded read", async () => {
   });
 });
 
+test("refuses sensitive files and redacts secret-like values from safe reads and searches", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, ".env"), "API_KEY=env-secret-value\n");
+    writeFileSync(join(workspace, "notes.txt"), "API_KEY=ordinary-secret-value\nneedle\n");
+
+    const registry = createToolRegistry();
+    await expect(registry.execute({ id: "env-read", name: "fs.read", arguments: { path: ".env" } }, context))
+      .resolves.toMatchObject({ ok: false, content: expect.stringMatching(/sensitive|secret/i) });
+
+    const read = await registry.execute({ id: "notes-read", name: "fs.read", arguments: { path: "notes.txt" } }, context);
+    expect(read.content).not.toContain("ordinary-secret-value");
+    expect(read.content).toContain("[REDACTED]");
+
+    const search = await registry.execute({ id: "notes-search", name: "search.text", arguments: { query: "API_KEY" } }, context);
+    expect(JSON.stringify(search.data)).not.toContain("ordinary-secret-value");
+    expect(JSON.stringify(search.data)).toContain("[REDACTED]");
+
+    await expect(registry.execute({ id: "pem-search", name: "search.text", arguments: { query: "secret", path: ".env" } }, context))
+      .resolves.toMatchObject({ ok: false, content: expect.stringMatching(/sensitive|secret/i) });
+  });
+});
+
+test("always applies built-in redaction to shell output without optional patterns", async () => {
+  await withWorkspace(async (workspace, context) => {
+    const approvals = new ApprovalManager({ now: () => 10_000 });
+    const call = { id: "built-in-redaction", name: "shell.exec", arguments: { argv: ["printf", "TOKEN=process-secret-value"] } };
+    approvals.request({ callId: call.id, runId: context.runId, tool: call.name, capability: "shell", risk: "high", summary: "test", arguments: call.arguments, createdAt: 10_000, expiresAt: 20_000 });
+    approvals.approve(call.id, 10_001);
+    const result = await new ToolRegistry(undefined, { approvals, policyContext: () => ({ workspace, runId: context.runId, now: 10_001 }) }).execute(call, context);
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("process-secret-value");
+    expect(JSON.stringify(result)).toContain("[REDACTED]");
+  });
+});
+
+test("does not expose a public built-in trust branding capability", async () => {
+  const trust = await import("../src/tools/trust");
+  expect(Object.hasOwn(trust, "markTrustedBuiltIn")).toBe(false);
+});
+
 test("writes a file and applies a unified patch without a shell", async () => {
   await withWorkspace(async (workspace, context) => {
     const registry = createToolRegistry();

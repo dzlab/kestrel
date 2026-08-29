@@ -139,8 +139,8 @@ export type {
 export { ApprovalManager } from "./policy/approvals";
 export { PolicyEngine, classifyTool, evaluateToolCall, canonicalJson, hashToolCall } from "./policy/rules";
 export type { ApprovalRequest, Decision, PolicyContext, Risk } from "./policy/types";
-export { ToolRegistry, createToolRegistry } from "./tools/registry";
-export { boundToolResult, isTrustedBuiltInTool } from "./tools/types";
+export { ToolRegistry, createToolRegistry, isTrustedBuiltInTool } from "./tools/registry";
+export { boundToolResult } from "./tools/types";
 export type { Tool, ToolContext, ToolResult } from "./tools/types";
 export { parseMessage, parseModelResponse, parseToolCall } from "./protocol/validation";
 export type { Message, ModelRequest, ModelResponse, Role, RunStatus, ToolCall, ToolDefinition } from "./protocol/types";

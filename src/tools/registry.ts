@@ -5,15 +5,17 @@ import type { PolicyContext } from "../policy/types";
 import { parseToolCall } from "../protocol/validation";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFilesystemTools } from "./filesystem";
-import { createSearchTool } from "./search";
-import { createShellTools } from "./shell";
-import { createMemoryTools } from "../memory/tools";
-import { createScheduleTools } from "./schedule";
-import { createUpgradeTools } from "../upgrade/tools";
+import { createFilesystemTools, isFilesystemBuiltIn } from "./filesystem";
+import { createSearchTool, isSearchBuiltIn } from "./search";
+import { createShellTools, isShellBuiltIn } from "./shell";
+import { createMemoryTools, isMemoryBuiltIn } from "../memory/tools";
+import { createScheduleTools, isScheduleBuiltIn } from "./schedule";
+import { createUpgradeTools, isUpgradeBuiltIn } from "../upgrade/tools";
 import { boundToolResult } from "./types";
-import { isTrustedBuiltInTool } from "./trust";
 import type { Tool, ToolContext, ToolResult } from "./types";
+
+const canonicalBuiltIns = new WeakSet<object>();
+const trustedBuiltIns = new WeakSet<object>();
 
 export type ToolRegistryOptions = {
   policyEngine?: PolicyEngine;
@@ -35,6 +37,26 @@ const automaticBuiltInNames = new Set([
 ]);
 const agentRepository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const defaultSelfPaths: readonly string[] = [agentRepository];
+
+for (const tool of [
+  ...createFilesystemTools(),
+  createSearchTool(),
+  ...createShellTools(),
+  ...createMemoryTools(),
+  ...createScheduleTools(),
+  ...createUpgradeTools(),
+]) canonicalBuiltIns.add(tool);
+
+export function isTrustedBuiltInTool(tool: object): boolean {
+  return canonicalBuiltIns.has(tool)
+    || trustedBuiltIns.has(tool)
+    || isFilesystemBuiltIn(tool)
+    || isSearchBuiltIn(tool)
+    || isShellBuiltIn(tool)
+    || isMemoryBuiltIn(tool)
+    || isScheduleBuiltIn(tool)
+    || isUpgradeBuiltIn(tool);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -146,6 +168,7 @@ export class ToolRegistry {
     this.policyEngine = options.policyEngine ?? new PolicyEngine();
     this.approvals = options.approvals;
     this.policyContext = options.policyContext;
+    const usingDefaults = tools === undefined;
     const registeredTools = tools ?? [
       ...createFilesystemTools(),
       createSearchTool(),
@@ -155,6 +178,7 @@ export class ToolRegistry {
       ...createUpgradeTools(options.approvals),
     ];
     for (const tool of registeredTools) {
+      if (usingDefaults) trustedBuiltIns.add(tool);
       this.register(tool);
     }
   }

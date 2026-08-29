@@ -8,6 +8,7 @@ import { parseModelResponse } from "../protocol/validation";
 import type { Message, ModelResponse, RunStatus, ToolCall } from "../protocol/types";
 import type {
   RunRecord,
+  RunOptionsSnapshot,
   StoreRepository,
   TaskRecord,
   ToolCallRecord,
@@ -152,15 +153,16 @@ export class RunKernel {
 
   async run(taskInput: RunTask | TaskRecord, options: RunOptions = {}): Promise<RunSummary> {
     const task = this.loadOrCreateTask(taskInput, options);
+    const requestedOptions = options.runId === undefined ? this.snapshotOptions(task, options) : {};
     const run = options.runId === undefined
-      ? this.repository.startRun(task.id, options.idempotencyKey ?? `run-${randomUUID()}`)
+      ? this.repository.startRun(task.id, options.idempotencyKey ?? `run-${randomUUID()}`, requestedOptions)
       : this.repository.getRun(options.runId);
     if (run === null || run === undefined) {
       return { taskId: task.id, runId: options.runId ?? "unknown", status: "failed", error: "run was not found" };
     }
     if (run.taskId !== task.id) return this.fail(run, "run does not belong to task");
     if (isTerminal(run.status) && run.status !== "blocked_on_approval") return this.summary(run);
-    return this.execute(task, run, options);
+    return this.execute(task, run, this.effectiveOptions(options, run, requestedOptions));
   }
 
   async resume(runId: string, options: RunOptions = {}): Promise<RunSummary> {
@@ -169,7 +171,7 @@ export class RunKernel {
     const task = this.repository.getTask(run.taskId);
     if (task === null) return this.fail(run, "task was not found for run");
     if (isTerminal(run.status) && run.status !== "blocked_on_approval") return this.summary(run);
-    return this.execute(task, run, options);
+    return this.execute(task, run, this.effectiveOptions(options, run));
   }
 
   private loadOrCreateTask(input: RunTask | TaskRecord, options: RunOptions): TaskRecord {
@@ -198,6 +200,19 @@ export class RunKernel {
     };
   }
 
+  private snapshotOptions(task: TaskRecord, options: RunOptions): RunOptionsSnapshot {
+    const limits = this.limits(task, options);
+    return {
+      modelName: options.modelName ?? this.defaultModelName,
+      ...limits,
+      ...(options.userId === undefined ? {} : { userId: options.userId }),
+    };
+  }
+
+  private effectiveOptions(options: RunOptions, run: RunRecord, fallback: RunOptionsSnapshot = {}): RunOptions {
+    return { ...options, ...fallback, ...run.options, ...(options.signal === undefined ? {} : { signal: options.signal }) };
+  }
+
   private async execute(task: TaskRecord, run: RunRecord, options: RunOptions): Promise<RunSummary> {
     const limits = this.limits(task, options);
     const deadline = Math.min(this.now() + limits.timeoutMs, run.startedAt + limits.timeoutMs);
@@ -221,10 +236,15 @@ export class RunKernel {
     }
 
     const pending = this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null);
-    if (pending.some((call) => call.state === "executing" || call.state === "pending")) {
+    if (pending.some((call) => call.state === "executing")) {
       return this.fail(run, "an unfinished tool call cannot be replayed safely");
     }
-    const resumed = await this.resumeApproval(task, run, pending, options, deadline, messages);
+    for (const call of pending.filter((candidate) => candidate.state === "pending")) {
+      if (this.approvals.get(call.callId) === null) return this.fail(run, "an unfinished tool call has no durable approval");
+      this.repository.updateToolCallState(run.id, call.callId, "awaiting_approval");
+      this.repository.appendEvent(run.id, "run.blocked_on_approval", { callId: call.callId, reason: "approval pause recovered" });
+    }
+    const resumed = await this.resumeApproval(task, run, this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null), options, deadline, messages);
     if (resumed !== null) return resumed;
     messages = this.repository.getMessages(run.id);
 
@@ -292,19 +312,20 @@ export class RunKernel {
       requestController.abort();
       options.signal?.removeEventListener("abort", abortRequest);
 
-      tokens += responseTokens(parsed);
-      this.repository.appendMessage(run.id, parsed.message);
+      const responseTokenCount = responseTokens(parsed);
+      tokens += responseTokenCount;
       this.repository.appendEvent(run.id, "model.responded", {
         turn: turns,
         finishReason: parsed.finishReason,
         usage: {
           ...(parsed.usage ?? {}),
-          totalTokens: responseTokens(parsed),
+          totalTokens: responseTokenCount,
           ...(parsed.usage === undefined ? { estimated: true } : {}),
         },
       });
-      messages = [...messages, parsed.message];
       if (tokens > limits.maxTokens) return this.budget(run, "maximum token budget exceeded");
+      this.repository.appendMessage(run.id, parsed.message);
+      messages = [...messages, parsed.message];
       if (parsed.finishReason === "error") return this.fail(run, "model returned an error response");
 
       const calls = parsed.message.toolCalls ?? [];
@@ -353,7 +374,12 @@ export class RunKernel {
         }
 
         const result = await this.dispatch(task, run, call, options, deadline, limits.toolTimeoutMs);
-        if (options.signal?.aborted) return this.cancel(run, "run was cancelled");
+        if (options.signal?.aborted) {
+          const cancelled = { ok: false, content: "tool execution cancelled" } satisfies ToolResult;
+          this.repository.finishToolCall(run.id, call.id, cancelled, "cancelled");
+          this.repository.appendEvent(run.id, "tool.cancelled", { callId: call.id });
+          return this.cancel(run, "run was cancelled");
+        }
         this.repository.finishToolCall(run.id, call.id, result, result.ok ? "completed" : "failed");
         this.repository.appendEvent(run.id, "tool.completed", { callId: call.id, ok: result.ok, result });
         const toolMessage = buildToolMessage(call.id, result);
@@ -438,6 +464,12 @@ export class RunKernel {
     const result = await this.dispatch(task, run, toolCall, options, deadline, options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS);
     if (!result.ok && /approval required/iu.test(result.content)) {
       return this.fail(run, "approved tool could not be dispatched safely");
+    }
+    if (options.signal?.aborted) {
+      const cancelled = { ok: false, content: "tool execution cancelled" } satisfies ToolResult;
+      this.repository.finishToolCall(run.id, call.callId, cancelled, "cancelled");
+      this.repository.appendEvent(run.id, "tool.cancelled", { callId: call.callId });
+      return this.cancel(run, "run was cancelled");
     }
     this.repository.finishToolCall(run.id, call.callId, result, result.ok ? "completed" : "failed");
     this.repository.appendEvent(run.id, "tool.completed", { callId: call.callId, ok: result.ok, result });

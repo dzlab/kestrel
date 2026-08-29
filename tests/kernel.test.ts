@@ -113,6 +113,43 @@ test("pauses before an approval-gated tool and resumes it exactly once", async (
   }
 });
 
+test("reconciles an approval persisted before the pause state after restart", async () => {
+  const state = setup(new FakeModel([assistant("reconciled")]))
+  try {
+    const task = state.repository.createTask({ title: "Crash", prompt: "run", workspace: state.workspace, maxSteps: 2 });
+    const run = state.repository.startRun(task.id, "crash-run");
+    const call = { id: "crash-shell", name: "shell.exec", arguments: { argv: ["printf", "reconciled"] } };
+    state.repository.recordToolCall(run.id, call, "pending");
+    state.approvals.request({ callId: call.id, runId: run.id, taskId: task.id, tool: call.name, capability: "shell", risk: "high", summary: "crash", arguments: call.arguments });
+
+    const restarted = new RunKernel({ model: state.model, repository: state.repository, registry: state.registry, approvals: state.approvals });
+    const paused = await restarted.resume(run.id);
+    expect(paused.status).toBe("blocked_on_approval");
+    expect(state.repository.getToolCall(call.id)).toMatchObject({ state: "awaiting_approval", finishedAt: null });
+    state.approvals.approve(call.id);
+    expect(await restarted.resume(run.id)).toMatchObject({ status: "completed", answer: "reconciled" });
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("persists effective run budgets and reuses them on approval restart", async () => {
+  const state = setup(new FakeModel([
+    toolCall("persisted-options", "shell.exec", { argv: ["printf", "ok"] }),
+    assistant("done"),
+  ]));
+  try {
+    const kernel = new RunKernel({ model: state.model, repository: state.repository, registry: state.registry, approvals: state.approvals });
+    const paused = await kernel.run({ title: "Options", prompt: "run", workspace: state.workspace }, { maxTurns: 3, maxToolCalls: 4, maxTokens: 100, timeoutMs: 7_000, toolTimeoutMs: 2_000, contextBytes: 4_000, modelName: "persisted-model" });
+    const row = state.database.query("SELECT options FROM runs WHERE id = ?").get(paused.runId) as { options: string };
+    expect(JSON.parse(row.options)).toMatchObject({ maxTurns: 3, maxToolCalls: 4, maxTokens: 100, timeoutMs: 7_000, toolTimeoutMs: 2_000, contextBytes: 4_000, modelName: "persisted-model" });
+    state.approvals.approve("persisted-options");
+    expect(await kernel.resume(paused.runId, { maxTokens: 1, maxTurns: 1 })).toMatchObject({ status: "completed", answer: "done" });
+  } finally {
+    state.cleanup();
+  }
+});
+
 test("terminates a repeated identical tool call safely", async () => {
   const state = setup();
   try {

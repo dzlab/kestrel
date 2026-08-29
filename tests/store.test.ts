@@ -423,6 +423,20 @@ test("events are appended in order without overwriting prior audit records", () 
   });
 });
 
+test("redacts secret-like values before persisting kernel and tool audit payloads", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    const run = createRun(repository);
+    repository.recordToolCall(run.id, { id: "audit-call", name: "shell.exec", arguments: { argv: ["printf", "audit-secret-value"] } }, "executing");
+    repository.appendEvent(run.id, "tool.completed", { result: { content: "TOKEN=audit-secret-value" } });
+    repository.finishToolCall(run.id, "audit-call", { ok: true, content: "TOKEN=audit-secret-value" }, "completed");
+    const stored = repository.getEvents(run.id).map((event) => JSON.stringify(event.payload)).join(" ");
+    expect(stored).not.toContain("audit-secret-value");
+    expect(stored).toContain("[REDACTED]");
+    expect(JSON.stringify(repository.getToolCall("audit-call")?.result)).not.toContain("audit-secret-value");
+  });
+});
+
 test("memory search caps an oversized limit at one hundred rows", () => {
   withDatabase((_path, open) => {
     const repository = new StoreRepository(open());
@@ -1505,7 +1519,7 @@ test("version-four migration rejects an altered current schedule definition befo
     );
     database.exec("DROP TABLE schedules_original");
     database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
-    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9)").run();
+    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9, 10)").run();
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/schedule|default|schema/i);
@@ -1548,6 +1562,7 @@ test("fresh databases apply the complete migration history", () => {
       { version: 7, checksum: migrationChecksum(migrations[6].sql) },
       { version: 8, checksum: migrationChecksum(migrations[7].sql) },
       { version: 9, checksum: migrationChecksum(migrations[8].sql) },
+      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
     ]);
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
@@ -1606,6 +1621,7 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 7 },
       { version: 8 },
       { version: 9 },
+      { version: 10 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
@@ -1617,6 +1633,7 @@ test("legacy version-1 databases upgrade without losing data", () => {
       { version: 7, checksum: migrationChecksum(migrations[6].sql) },
       { version: 8, checksum: migrationChecksum(migrations[7].sql) },
       { version: 9, checksum: migrationChecksum(migrations[8].sql) },
+      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
     ]);
     expectCurrentSchema(database);
   });
@@ -1677,6 +1694,7 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 7 },
       { version: 8 },
       { version: 9 },
+      { version: 10 },
     ]);
     expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
       { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
@@ -1688,6 +1706,7 @@ test("hardened historical version-one databases upgrade without losing data", ()
       { version: 7, checksum: migrationChecksum(migrations[6].sql) },
       { version: 8, checksum: migrationChecksum(migrations[7].sql) },
       { version: 9, checksum: migrationChecksum(migrations[8].sql) },
+      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
     ]);
     expectCurrentSchema(database);
     database.query("UPDATE runs SET status = 'cancelled' WHERE id = 'hardened-run'").run();
@@ -1757,6 +1776,7 @@ test("version-two databases with a legacy nullable checksum upgrade to the harde
       { version: 7 },
       { version: 8 },
       { version: 9 },
+      { version: 10 },
     ]);
   });
 });

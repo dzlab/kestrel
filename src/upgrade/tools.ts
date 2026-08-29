@@ -1,5 +1,14 @@
 import { ApprovalManager } from "../policy/approvals";
-import { markTrustedBuiltIn } from "../tools/trust";
+const upgradeBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  upgradeBuiltIns.add(tool);
+  return tool;
+}
+
+export function isUpgradeBuiltIn(tool: object): boolean {
+  return upgradeBuiltIns.has(tool);
+}
 import type { Tool, ToolContext, ToolResult } from "../tools/types";
 import { SelfUpgrade } from "./workflow";
 
@@ -68,6 +77,7 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
           workspace: context.workspace,
           runId: context.runId,
           proposalId: String(args.proposalId),
+          signal: context.signal,
         });
         return { ok: true, content: `applied ${result.id}`, data: result };
       } catch (error) {

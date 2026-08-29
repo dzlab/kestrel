@@ -4,6 +4,7 @@ import { PersistenceError, ValidationError } from "../errors";
 import { parseMessage } from "../protocol/validation";
 import type { Message, RunStatus, ToolCall } from "../protocol/types";
 import { immediateTransaction } from "./transaction";
+import { redactUnknown } from "../tools/redaction";
 
 type Row = Record<string, unknown>;
 
@@ -25,6 +26,18 @@ export type RunRecord = {
   status: RunStatus;
   startedAt: number;
   finishedAt: number | null;
+  options: RunOptionsSnapshot;
+};
+
+export type RunOptionsSnapshot = {
+  modelName?: string;
+  maxTurns?: number;
+  maxToolCalls?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  toolTimeoutMs?: number;
+  contextBytes?: number;
+  userId?: string;
 };
 
 export type ToolCallRecord = {
@@ -226,6 +239,15 @@ function taskFromRow(row: Row): TaskRecord {
 }
 
 function runFromRow(row: Row): RunRecord {
+  let options: RunOptionsSnapshot = {};
+  if (row.options !== null && row.options !== undefined) {
+    try {
+      const parsed = parseJson<unknown>(row.options);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) options = parsed as RunOptionsSnapshot;
+    } catch (error) {
+      throw new PersistenceError("persisted run options are malformed", { cause: error });
+    }
+  }
   return {
     id: String(row.id),
     taskId: String(row.task_id),
@@ -233,6 +255,7 @@ function runFromRow(row: Row): RunRecord {
     status: parseRunStatus(row.status),
     startedAt: Number(row.started_at),
     finishedAt: row.finished_at === null || row.finished_at === undefined ? null : Number(row.finished_at),
+    options,
   };
 }
 
@@ -371,23 +394,23 @@ export class StoreRepository {
         .run(id, input.title, input.prompt, input.workspace, input.maxSteps, "pending", timestamp, timestamp);
       this.database
         .query("INSERT INTO events (task_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-        .run(id, "created", json(input), timestamp);
+        .run(id, "created", json(redactUnknown(input)), timestamp);
     });
 
     return taskFromRow(this.database.query("SELECT * FROM tasks WHERE id = ?").get(id) as Row);
   }
 
-  startRun(taskId: string, idempotencyKey: string): RunRecord {
+  startRun(taskId: string, idempotencyKey: string, options: RunOptionsSnapshot = {}): RunRecord {
     const id = randomUUID();
     const startedAt = Date.now();
     return immediateTransaction(this.database, () => {
       this.database
         .query(
-          `INSERT INTO runs (id, task_id, idempotency_key, status, started_at)
-           VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO runs (id, task_id, idempotency_key, status, started_at, options)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT (task_id, idempotency_key) DO NOTHING`,
         )
-        .run(id, taskId, idempotencyKey, "running", startedAt);
+        .run(id, taskId, idempotencyKey, "running", startedAt, json(options));
 
       return runFromRow(
         this.database
@@ -471,7 +494,7 @@ export class StoreRepository {
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-        .run(runId, type, json(payload), Date.now());
+        .run(runId, type, json(redactUnknown(payload)), Date.now());
     });
   }
 
@@ -507,7 +530,7 @@ export class StoreRepository {
 
   finishToolCall(runId: string, callId: string, result: unknown, state: string): void {
     immediateTransaction(this.database, () => {
-      const resultJson = json(result);
+      const resultJson = json(redactUnknown(result));
       const update = this.database
         .query(
           `UPDATE tool_calls
@@ -886,6 +909,14 @@ export class StoreRepository {
         .run(now, now + SCHEDULE_LEASE_TIMEOUT_MS, id, owner, leaseToken, now);
       return update.changes === 1;
     });
+  }
+
+  hasScheduleLease(id: string, owner: string, leaseToken: string, now: number): boolean {
+    return this.database.query(
+      `SELECT 1 FROM schedules
+       WHERE id = ? AND claimed_by = ? AND lease_token = ?
+         AND claimed_at IS NOT NULL AND lease_until IS NOT NULL AND lease_until > ?`,
+    ).get(id, owner, leaseToken, now) !== null;
   }
 
   finishSchedule(

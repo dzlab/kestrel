@@ -87,8 +87,8 @@ function targetFilesFromPatch(patch: string): string[] {
 
 function defaultRunner(): UpgradeRunner {
   return {
-    async run(argv, cwd, timeoutMs = 30_000): Promise<UpgradeRunnerResult> {
-      return runProcess({ argv, cwd, timeoutMs, env: { PATH: SAFE_PATH, PWD: cwd } });
+    async run(argv, cwd, timeoutMs = 30_000, signal): Promise<UpgradeRunnerResult> {
+      return runProcess({ argv, cwd, timeoutMs, env: { PATH: SAFE_PATH, PWD: cwd }, signal });
     },
   };
 }
@@ -211,7 +211,8 @@ export class SelfUpgrade {
     const repoStateHash = await this.repoStateHash(workspace);
     const id = `upgrade-${randomUUID()}`;
     const patchHash = sha256(patch);
-    const approvalArguments = { proposalId: id, patchHash };
+    const approvalArguments = { proposalId: id };
+    this.repository.recordToolCall(input.runId, { id: `approval-${id}`, name: "self.apply", arguments: approvalArguments }, "awaiting_approval");
     const approval = this.approvals.request({
       id: `approval-${id}`,
       runId: input.runId,
@@ -277,15 +278,18 @@ export class SelfUpgrade {
       this.recordStatus({ ...proposal, status: "stale", error: "workspace or target changed since proposal" });
       throw new ValidationError("upgrade proposal is stale: workspace or target changed");
     }
-    const approvalArguments = { proposalId: proposal.id, patchHash: proposal.patchHash };
-    const approved = this.approvals.consume(
-      { id: proposal.approval.id, tool: "self.apply", arguments: approvalArguments },
-      undefined,
-      this.now(),
-    );
+    const approvalArguments = { proposalId: proposal.id };
+    const approvalRecord = this.approvals.get(proposal.approval.id);
+    const approvalConsumedByCaller = approvalRecord?.status === "consumed";
+    const approved = approvalRecord?.status === "approved"
+      ? this.approvals.consume({ id: proposal.approval.id, tool: "self.apply", arguments: approvalArguments }, undefined, this.now())
+      : approvalRecord?.status === "consumed" && this.repository.getToolCall(proposal.approval.id)?.state === "executing";
     if (!approved) {
       throw new ApprovalRequiredError(`approval required for upgrade ${proposal.id}`);
     }
+
+    if (input.signal?.aborted) throw new ToolExecutionError("upgrade application cancelled");
+    this.repository.updateToolCallState(proposal.runId, proposal.approval.id, "executing");
 
     this.recordStatus({ ...proposal, status: "applying", approval: { ...proposal.approval, status: "consumed" } });
     const before = snapshotForWorkspace(proposal.workspace, proposal.targetFiles);
@@ -295,11 +299,11 @@ export class SelfUpgrade {
     let patchApplied = false;
     let after: Snapshot | null = null;
     try {
-      const toolContext: ToolContext = { workspace: proposal.workspace, runId: input.runId, repository: this.repository } as ToolContext;
+      const toolContext: ToolContext = { workspace: proposal.workspace, runId: input.runId, repository: this.repository, signal: input.signal } as ToolContext;
       const patchResult = await patchTool.execute({ patch: proposal.patch }, toolContext);
       if (!patchResult.ok) throw new ToolExecutionError(`upgrade patch failed: ${patchResult.content}`);
       patchApplied = true;
-      const verification = boundRunnerResult(await this.runner.run(proposal.verification, proposal.workspace, proposal.verificationTimeoutMs));
+      const verification = boundRunnerResult(await this.runner.run(proposal.verification, proposal.workspace, proposal.verificationTimeoutMs, input.signal));
       after = snapshotForWorkspace(proposal.workspace, proposal.targetFiles);
       const afterHash = snapshotHash(after);
       if (verification.exitCode !== 0 || verification.timedOut === true || verification.aborted === true) {
@@ -310,6 +314,7 @@ export class SelfUpgrade {
       }
       const applied: UpgradeApplyResult = { ...proposal, status: "applied", beforeHash, afterHash, verificationResult: verification, approval: { ...proposal.approval, status: "consumed" } };
       this.recordStatus(applied);
+      if (!approvalConsumedByCaller) this.repository.finishToolCall(proposal.runId, proposal.approval.id, applied, "completed");
       return applied;
     } catch (error) {
       if (error instanceof ToolExecutionError && /verification failed/u.test(error.message)) throw error;
@@ -329,6 +334,7 @@ export class SelfUpgrade {
         error: rollbackError === undefined ? resultError(error) : `${resultError(error)}; rollback failed: ${rollbackError}`,
       };
       this.recordStatus(failed);
+      if (!approvalConsumedByCaller) this.repository.finishToolCall(proposal.runId, proposal.approval.id, failed, "failed");
       throw error;
     }
   }

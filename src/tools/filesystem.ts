@@ -5,7 +5,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
-import { markTrustedBuiltIn } from "./trust";
+import { isSensitivePath, redactSecrets } from "./redaction";
 import type { Tool } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES } from "./types";
 import type { ToolContext, ToolResult } from "./types";
@@ -32,6 +32,17 @@ import {
   workspacePathInfo,
   writeWorkspaceText,
 } from "./secure-fs";
+
+const filesystemBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  filesystemBuiltIns.add(tool);
+  return tool;
+}
+
+export function isFilesystemBuiltIn(tool: object): boolean {
+  return filesystemBuiltIns.has(tool);
+}
 
 function stringArgument(args: Record<string, unknown>, name: string): string {
   const value = args[name];
@@ -192,8 +203,9 @@ const readTool: Tool = markTrustedBuiltIn({
   definition: fileDefinition("fs.read", "Read bounded UTF-8 text from a workspace file.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
+    if (isSensitivePath(path)) throw new ValidationError("reading sensitive files is not allowed");
     const read = readWorkspaceText(context.workspace, path);
-    return result(read.content, { path: relativePath(context.workspace, path), truncated: read.truncated });
+    return result(redactSecrets(read.content, context.secretPatterns), { path: relativePath(context.workspace, path), truncated: read.truncated });
   },
 });
 

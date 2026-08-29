@@ -67,11 +67,16 @@ export class SchedulerDaemon {
     const leaseToken = schedule.leaseToken;
     this.repository.appendScheduleEvent(schedule.id, "schedule.claimed", { owner: this.owner, leaseToken }, schedule.taskId);
 
+    const leaseController = new AbortController();
+    let leaseLost = false;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     const renew = () => {
       const renewalNow = this.now();
       if (this.repository.renewScheduleLease(schedule.id, this.owner, leaseToken, renewalNow)) {
         this.repository.appendScheduleEvent(schedule.id, "schedule.heartbeat", { owner: this.owner }, schedule.taskId);
+      } else {
+        leaseLost = true;
+        leaseController.abort(new Error("scheduler lease lost"));
       }
     };
     heartbeat = setInterval(renew, this.leaseRenewalMs);
@@ -80,8 +85,12 @@ export class SchedulerDaemon {
     let summary: RunSummary;
     try {
       const workspace = validateScheduleWorkspace(schedule.workspace ?? "");
+      if (!this.repository.hasScheduleLease(schedule.id, this.owner, leaseToken, now)) {
+        leaseLost = true;
+        leaseController.abort(new Error("scheduler lease lost"));
+      }
       if (schedule.pendingRunId !== null && schedule.pendingRunId !== undefined) {
-        summary = await this.kernel.resume(schedule.pendingRunId, { userId: "local" });
+        summary = await this.kernel.resume(schedule.pendingRunId, { userId: "local", signal: leaseController.signal });
       } else {
         summary = await this.kernel.run({
           ...(schedule.taskId === null || schedule.taskId === undefined ? {} : { id: schedule.taskId }),
@@ -91,6 +100,7 @@ export class SchedulerDaemon {
         }, {
           idempotencyKey: `schedule:${schedule.id}:${schedule.nextRunAt ?? now}`,
           userId: "local",
+          signal: leaseController.signal,
         });
       }
     } catch (error) {
@@ -100,6 +110,11 @@ export class SchedulerDaemon {
     }
 
     const finishedAt = this.now();
+    if (leaseLost || !this.repository.hasScheduleLease(schedule.id, this.owner, leaseToken, finishedAt)) {
+      leaseController.abort(new Error("scheduler lease lost"));
+      this.repository.releaseScheduleLease(schedule.id, this.owner, leaseToken);
+      return { scheduleId: schedule.id, ...summary, leaseLost: true };
+    }
     const attempts = (schedule.attempts ?? 0) + 1;
     const blocked = summary.status === "blocked_on_approval";
     const successful = summary.status === "completed";

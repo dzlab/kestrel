@@ -2,7 +2,16 @@ import { ValidationError } from "../errors";
 import { MemoryStore } from "./store";
 import { assertSafeMemory } from "./security";
 import type { MemoryScope } from "./types";
-import { markTrustedBuiltIn } from "../tools/trust";
+const memoryBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  memoryBuiltIns.add(tool);
+  return tool;
+}
+
+export function isMemoryBuiltIn(tool: object): boolean {
+  return memoryBuiltIns.has(tool);
+}
 import type { Tool, ToolContext, ToolResult } from "../tools/types";
 
 function stringArgument(args: Record<string, unknown>, name: string): string {

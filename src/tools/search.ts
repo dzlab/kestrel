@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
 import { readWorkspaceText, resolveWorkspacePath, safeDirectoryEntries, workspacePathInfo } from "./filesystem";
-import { markTrustedBuiltIn } from "./trust";
+import { isSensitivePath, redactSecrets } from "./redaction";
 import type { Tool } from "./types";
 import {
   MAX_READ_BYTES,
@@ -10,6 +10,17 @@ import {
   MAX_TOOL_OUTPUT_BYTES,
 } from "./types";
 import type { ToolContext, ToolResult } from "./types";
+
+const searchBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  searchBuiltIns.add(tool);
+  return tool;
+}
+
+export function isSearchBuiltIn(tool: object): boolean {
+  return searchBuiltIns.has(tool);
+}
 
 type Match = { path: string; line: number; content: string };
 
@@ -63,6 +74,7 @@ const searchTool: Tool = markTrustedBuiltIn({
     if (query.length === 0) throw new ValidationError("query must be non-empty");
     const requestedPath = args.path === undefined ? "." : stringArgument(args, "path");
     const root = resolveWorkspacePath(context.workspace, requestedPath);
+    if (isSensitivePath(root)) throw new ValidationError("searching sensitive files is not allowed");
     if (isIgnoredPath(context.workspace, root)) return { ok: true, content: "[]", data: [] };
     const rootInfo = workspacePathInfo(context.workspace, root);
     const files: string[] = [];
@@ -73,7 +85,8 @@ const searchTool: Tool = markTrustedBuiltIn({
     const matches: Match[] = [];
     for (const file of files) {
       if (matches.length >= MAX_SEARCH_MATCHES) break;
-      const text = readWorkspaceText(context.workspace, file).content;
+      if (isSensitivePath(file)) continue;
+      const text = redactSecrets(readWorkspaceText(context.workspace, file).content, context.secretPatterns);
       const lines = text.split("\n");
       for (let index = 0; index < lines.length && matches.length < MAX_SEARCH_MATCHES; index += 1) {
         if (lines[index].includes(query)) {

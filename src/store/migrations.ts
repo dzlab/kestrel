@@ -316,6 +316,10 @@ const versionNineSql = `
       BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
     `;
 
+const versionTenSql = `
+      ALTER TABLE runs ADD COLUMN options TEXT NOT NULL DEFAULT '{}';
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -332,6 +336,7 @@ export const migrations: readonly Migration[] = [
   { version: 7, sql: versionSevenSql },
   { version: 8, sql: versionEightSql },
   { version: 9, sql: versionNineSql, prepare: prepareVersionNine },
+  { version: 10, sql: versionTenSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -359,6 +364,7 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "status", type: "TEXT" },
     { name: "started_at", type: "INTEGER" },
     { name: "finished_at", type: "INTEGER" },
+    { name: "options", type: "TEXT" },
   ],
   messages: [
     { name: "id", type: "INTEGER" },
@@ -460,7 +466,7 @@ const requiredPrimaryKeys: Readonly<Record<string, Readonly<Record<string, numbe
 const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   schema_migrations: ["checksum", "applied_at"],
   tasks: ["title", "prompt", "workspace", "max_steps", "status", "created_at", "updated_at"],
-  runs: ["task_id", "idempotency_key", "status", "started_at"],
+  runs: ["task_id", "idempotency_key", "status", "started_at", "options"],
   messages: ["run_id", "sequence_number", "payload", "created_at"],
   tool_calls: ["run_id", "call_id", "name", "arguments", "state", "created_at"],
   events: ["type", "payload", "created_at"],
@@ -480,6 +486,8 @@ const legacyMemoryColumns: readonly ColumnDefinition[] = [
   { name: "created_at", type: "INTEGER" },
   { name: "updated_at", type: "INTEGER" },
 ];
+
+const legacyRunColumns: readonly ColumnDefinition[] = requiredTableColumns.runs.filter((column) => column.name !== "options");
 
 const legacyScheduleColumns: readonly ColumnDefinition[] = [
   { name: "id", type: "TEXT" },
@@ -1331,7 +1339,7 @@ function assertHistoricalLineageTables(database: Database, lineage: SchemaLineag
       ? legacyApprovalColumns
       : table === "memories" ? legacyMemoryColumns
         : table === "schedules" ? legacyScheduleColumns
-          : requiredTableColumns[table])
+          : table === "runs" ? legacyRunColumns : requiredTableColumns[table])
       .filter((column) => column.name !== "lease_token");
     if (!hasTable(database, table)) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
@@ -1914,7 +1922,7 @@ export function runMigrations(database: Database): void {
       }>,
     );
     const lineage = schemaLineageFor(database, true);
-    const historicalStatusConstraintsUpgraded = lineage.hasInlineStatusChecks &&
+    const historicalStatusConstraintsUpgraded =
       database.query("SELECT 1 FROM schema_migrations WHERE version = 9").get() !== null;
     if (!historicalStatusConstraintsUpgraded) {
       assertLineageSchema(database, lineage, false);

@@ -4,7 +4,7 @@ import {
   openSecureDirectoryPath,
   revalidateSecureDirectory,
 } from "./secure-fs";
-import { markTrustedBuiltIn } from "./trust";
+import { redactSecrets } from "./redaction";
 import type { Tool, ToolContext, ToolResult } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES, truncateUtf8 } from "./types";
 import {
@@ -14,6 +14,17 @@ import {
   runProcess,
 } from "../runtime/process";
 import { ValidationError } from "../errors";
+
+const shellBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  shellBuiltIns.add(tool);
+  return tool;
+}
+
+export function isShellBuiltIn(tool: object): boolean {
+  return shellBuiltIns.has(tool);
+}
 
 const SAFE_ENV_KEYS = new Set(["HOME"]);
 const CREDENTIAL_KEY = /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|AUTH|AWS_|GITHUB_TOKEN)/iu;
@@ -111,24 +122,10 @@ function scrubEnvironment(
   return environment;
 }
 
-function redact(value: string, patterns: readonly (string | RegExp)[] | undefined): string {
-  if (patterns === undefined || patterns.length === 0) return value;
-  let redacted = value;
-  for (const pattern of patterns) {
-    if (pattern instanceof RegExp) {
-      const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
-      redacted = redacted.replace(new RegExp(pattern.source, flags), "[REDACTED]");
-      continue;
-    }
-    if (pattern.length > 0) redacted = redacted.split(pattern).join("[REDACTED]");
-  }
-  return redacted;
-}
-
 function processResult(result: Awaited<ReturnType<typeof runProcess>>, context: ToolContext): ToolResult {
   const streamLimit = Math.min(PROCESS_OUTPUT_LIMIT_BYTES, Math.floor((MAX_TOOL_OUTPUT_BYTES - 1_024) / 2));
-  const stdout = truncateUtf8(redact(result.stdout, context.secretPatterns), streamLimit);
-  const stderr = truncateUtf8(redact(result.stderr, context.secretPatterns), streamLimit);
+  const stdout = truncateUtf8(redactSecrets(result.stdout, context.secretPatterns), streamLimit);
+  const stderr = truncateUtf8(redactSecrets(result.stderr, context.secretPatterns), streamLimit);
   const ok = result.exitCode === 0 && result.timedOut !== true && result.aborted !== true;
   const status = result.timedOut === true
     ? "process timed out"

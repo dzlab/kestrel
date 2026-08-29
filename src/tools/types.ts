@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../protocol/types";
 import type { Repository } from "../store/repository";
+import { redactSecrets, redactUnknown } from "./redaction";
 
 export type { ToolDefinition } from "../protocol/types";
 
@@ -31,8 +32,6 @@ export interface Tool {
   execute(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult>;
 }
 
-export { isTrustedBuiltInTool } from "./trust";
-
 export function truncateUtf8(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, "utf8");
   if (bytes.byteLength <= maxBytes) {
@@ -47,8 +46,14 @@ export function truncateUtf8(value: string, maxBytes: number): string {
 }
 
 export function boundToolResult(result: ToolResult): ToolResult {
-  const hasData = Object.prototype.hasOwnProperty.call(result, "data") && result.data !== undefined;
-  const hasRedactions = Object.prototype.hasOwnProperty.call(result, "redactions") && result.redactions !== undefined;
+  const safeResult: ToolResult = {
+    ...result,
+    content: redactSecrets(result.content),
+    ...(result.data === undefined ? {} : { data: redactUnknown(result.data) }),
+    ...(result.redactions === undefined ? {} : { redactions: redactUnknown(result.redactions) as string[] }),
+  };
+  const hasData = Object.prototype.hasOwnProperty.call(safeResult, "data") && safeResult.data !== undefined;
+  const hasRedactions = Object.prototype.hasOwnProperty.call(safeResult, "redactions") && safeResult.redactions !== undefined;
   const fieldShareBytes = Math.floor(MAX_TOOL_OUTPUT_BYTES / (1 + Number(hasData) + Number(hasRedactions)));
   const data = hasData ? boundToolData(result.data, fieldShareBytes) : undefined;
   const redactions = hasRedactions ? boundToolData(result.redactions, fieldShareBytes) : undefined;
@@ -56,7 +61,7 @@ export function boundToolResult(result: ToolResult): ToolResult {
     ok: result.ok,
     content: boundToolContent(
       result.ok,
-      result.content,
+      safeResult.content,
       data,
       Array.isArray(redactions) ? (redactions as string[]) : undefined,
     ),

@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { ValidationError } from "../errors";
-import { markTrustedBuiltIn } from "./trust";
+const scheduleBuiltIns = new WeakSet<object>();
+
+function markTrustedBuiltIn<T extends Tool>(tool: T): T {
+  scheduleBuiltIns.add(tool);
+  return tool;
+}
+
+export function isScheduleBuiltIn(tool: object): boolean {
+  return scheduleBuiltIns.has(tool);
+}
 import type { Tool, ToolContext, ToolResult } from "./types";
 import { validateScheduleInput, validateScheduleWorkspace } from "../scheduler/expressions";
 

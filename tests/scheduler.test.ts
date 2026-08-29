@@ -161,3 +161,32 @@ test("approval-paused recurring schedules resume the pending run on the next occ
     state.cleanup();
   }
 });
+
+test("lease loss aborts the running kernel before it can commit side effects", async () => {
+  const state = setup();
+  let sideEffects = 0;
+  try {
+    const tool = {
+      definition: { name: "lease.sideeffect", description: "test", capability: "test", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+      async execute(_args: Record<string, unknown>, context: { signal?: AbortSignal }) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        if (!context.signal?.aborted) sideEffects += 1;
+        return { ok: true, content: "side effect" };
+      },
+    };
+    const policy = { evaluate: () => ({ allowed: true, requiresApproval: false, capability: "test", risk: "low", reason: "test" }) } as never;
+    const registry = new (await import("../src/tools/registry")).ToolRegistry([tool], { policyEngine: policy });
+    const model = new FakeModel([{ message: { role: "assistant", content: "", toolCalls: [{ id: "lease-call", name: "lease.sideeffect", arguments: {} }] }, finishReason: "tool_calls" }, assistant("must not complete")]);
+    const kernel = new RunKernel({ model, repository: state.repository, registry, policyEngine: policy });
+    state.repository.createSchedule({ id: "lease-loss", workspace: state.directory, prompt: "run", nextRunAt: 1_000, enabled: true });
+    let renewal = 0;
+    const daemon = new SchedulerDaemon({ repository: state.repository, kernel, owner: "worker", now: () => { renewal += 1; return renewal === 1 ? 1_000 : 61_001; }, leaseRenewalMs: 1 });
+    const result = await daemon.runOnce(1_000);
+    expect(result?.leaseLost).toBe(true);
+    expect(result?.status).toBe("cancelled");
+    expect(sideEffects).toBe(0);
+    expect(state.repository.getSchedule("lease-loss")?.claimedBy).toBe(null);
+  } finally {
+    state.cleanup();
+  }
+});

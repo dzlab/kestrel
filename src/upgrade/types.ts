@@ -14,7 +14,7 @@ export type UpgradeRunnerResult = {
 };
 
 export type UpgradeRunner = {
-  run(argv: readonly string[], cwd: string, timeoutMs?: number): Promise<UpgradeRunnerResult>;
+  run(argv: readonly string[], cwd: string, timeoutMs?: number, signal?: AbortSignal): Promise<UpgradeRunnerResult>;
 };
 
 export type UpgradeProposalStatus = "proposed" | "applying" | "applied" | "failed" | "stale";
@@ -47,7 +47,7 @@ export type UpgradeProposal = {
   error?: string;
 };
 
-export type UpgradePersistence = Pick<StoreRepository, "appendEvent" | "getEvents">;
+export type UpgradePersistence = Pick<StoreRepository, "appendEvent" | "getEvents" | "recordToolCall" | "getToolCall" | "updateToolCallState" | "finishToolCall">;
 
 export type SelfUpgradeOptions = {
   repository: UpgradePersistence;
@@ -69,6 +69,7 @@ export type UpgradeApplyInput = {
   workspace: string;
   runId: string;
   proposalId: string;
+  signal?: AbortSignal;
 };
 
 export type UpgradeApplyResult = UpgradeProposal & {

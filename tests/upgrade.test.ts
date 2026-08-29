@@ -61,8 +61,49 @@ test("proposes a bounded patch without mutating source and persists its base sta
       approval: { status: "pending" },
     });
     expect(proposal.id).toBeString();
+    expect(value.repository.getToolCall(proposal.approval.id)).toMatchObject({ name: "self.apply", state: "awaiting_approval" });
     expect(proposal.patchHash).toMatch(/^[0-9a-f]{64}$/);
     expect(value.repository.getEvents(value.runId).some((event) => event.type === "upgrade.proposed")).toBe(true);
+  } finally {
+    value.close();
+  }
+});
+
+test("approval by the durable upgrade call ID resumes after reopening", async () => {
+  const value = fixture();
+  try {
+    const proposal = await proposed(value);
+    const approval = value.approvals.get(proposal.approval.id)!;
+    value.approvals.approve(approval.id);
+    const reopened = new ApprovalManager(value.repository);
+    expect(reopened.get(approval.id)).toMatchObject({ status: "approved" });
+    expect(value.repository.getToolCall(approval.id)).toMatchObject({ callId: approval.id, name: "self.apply" });
+    const upgrade = new SelfUpgrade({ repository: value.repository, approvals: value.approvals, runner: value.runner });
+    await expect(upgrade.apply({ workspace: value.workspace, runId: value.runId, proposalId: proposal.id })).resolves.toMatchObject({ status: "applied" });
+  } finally {
+    value.close();
+  }
+});
+
+test("propagates cancellation into upgrade verification and restores the target", async () => {
+  const value = fixture();
+  let sawSignal = false;
+  try {
+    const proposal = await proposed(value);
+    value.approvals.approve(proposal.approval.id);
+    const runner: UpgradeRunner = {
+      async run(argv, cwd, timeoutMs, signal) {
+        if (argv[0] === "git") return value.runner.run(argv, cwd, timeoutMs, signal);
+        sawSignal = signal !== undefined;
+        return new Promise((resolve) => signal?.addEventListener("abort", () => resolve({ exitCode: null, stdout: "", stderr: "", aborted: true }), { once: true }));
+      },
+    };
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 10);
+    const upgrade = new SelfUpgrade({ repository: value.repository, approvals: value.approvals, runner });
+    await expect(upgrade.apply({ workspace: value.workspace, runId: value.runId, proposalId: proposal.id, signal: controller.signal })).rejects.toThrow(/verification|cancel/i);
+    expect(sawSignal).toBe(true);
+    expect(readFileSync(join(value.workspace, "target.txt"), "utf8")).toBe("old\n");
   } finally {
     value.close();
   }
