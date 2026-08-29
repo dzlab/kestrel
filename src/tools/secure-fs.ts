@@ -24,6 +24,8 @@ const PATCH_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O
 
 const native = dlopen("/usr/lib/libSystem.B.dylib", {
   openat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  linkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
   mkdirat: { args: [FFIType.i32, FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
   renameat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
   unlinkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
@@ -45,6 +47,7 @@ const errnoNames: Record<number, string> = {
   21: "EISDIR",
   22: "EINVAL",
   28: "ENOSPC",
+  35: "EAGAIN",
   62: "ELOOP",
   66: "ENOTEMPTY",
 };
@@ -137,6 +140,18 @@ export function secureFileIdentity(fd: number): SecureIdentity {
 
 export function sameSecureIdentity(left: SecureIdentity | null, right: SecureIdentity | null): boolean {
   return left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+}
+
+export function openPatchTransactionLock(workspace: string): number {
+  const root = openRoot(rootPath(workspace));
+  const result = native.symbols.flock(root, 2 | 4);
+  if (result < 0) {
+    const errorNumber = errno();
+    closeFd(root);
+    if (errorNumber === 35) throw new ToolExecutionError("another patch transaction is already active");
+    throw nativeError("lock", workspace, errorNumber);
+  }
+  return root;
 }
 
 function openDirectory(workspace: string, path: string, create: boolean): { fd: number; created: SecureCreatedDirectory[] } {
@@ -375,37 +390,24 @@ export function openSecureDirectory(parent: SecureParent): number {
   }
 }
 
-export function createPatchTemp(parent: SecureParent, name: string, content: string): SecureIdentity {
+export type SecureOpenFile = { fd: number; identity: SecureIdentity };
+
+export function createPatchTemp(parent: SecureParent, name: string, content: string): SecureOpenFile {
   let fd: number | null = null;
-  let identity: SecureIdentity | null = null;
+  let retained = false;
   try {
     fd = openAt(parent.fd, name, CREATE_FLAGS, 0o600);
-    identity = secureFileIdentity(fd);
+    const identity = secureFileIdentity(fd);
     fchmodSync(fd, 0o600);
     requireRegular(fd, "patch temporary");
     const bytes = Buffer.from(content, "utf8");
     let offset = 0;
     while (offset < bytes.byteLength) offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
     fsyncSync(fd);
-    return identity;
-  } catch (error) {
-    if (identity !== null) {
-      try {
-        const current = openPatchTarget(parent, name);
-        if (current !== null) {
-          try {
-            if (sameSecureIdentity(identity, secureFileIdentity(current))) unlinkAt(parent, name);
-          } finally {
-            closeFd(current);
-          }
-        }
-      } catch {
-        // Preserve the original staging failure and any uncertain artifact.
-      }
-    }
-    throw error;
+    retained = true;
+    return { fd, identity };
   } finally {
-    if (fd !== null) closeFd(fd);
+    if (fd !== null && !retained) closeFd(fd);
   }
 }
 
@@ -415,6 +417,10 @@ function callAt(operation: string, result: number, path: string): void {
 
 export function renameAt(parent: SecureParent, from: string, to: string): void {
   callAt("rename", native.symbols.renameat(parent.fd, from, parent.fd, to), `${from} -> ${to}`);
+}
+
+export function linkAt(parent: SecureParent, from: string, to: string): void {
+  callAt("link", native.symbols.linkat(parent.fd, from, parent.fd, to, 0), `${from} -> ${to}`);
 }
 
 export function unlinkAt(parent: SecureParent, name: string, directory = false): void {

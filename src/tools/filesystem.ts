@@ -12,6 +12,8 @@ import {
   closeSecureFile,
   closeSecureParent,
   createPatchTemp,
+  linkAt,
+  openPatchTransactionLock,
   openSecureDirectory,
   openPatchTarget,
   openSecureParent,
@@ -232,32 +234,61 @@ function isFileHeaderAt(lines: string[], index: number): boolean {
   return lines[index]?.startsWith("--- ") === true && lines[index + 1]?.startsWith("+++ ") === true;
 }
 
+function isGitMetadata(line: string): boolean {
+  return (
+    /^diff --git .+ .+$/u.test(line) ||
+    /^index [0-9a-f]+(?:\.\.[0-9a-f]+)?(?: [0-7]{6})?$/u.test(line) ||
+    /^(?:new file mode|deleted file mode|old mode|new mode) [0-7]{6}$/u.test(line) ||
+    /^(?:similarity|dissimilarity) index (?:100|[0-9]{1,2})%$/u.test(line) ||
+    /^(?:rename from|rename to) .+$/u.test(line)
+  );
+}
+
+function validateGitMetadata(line: string): void {
+  if (line.startsWith("diff --git ") && !/^diff --git .+ .+$/u.test(line)) {
+    throw new ValidationError("invalid Git diff metadata");
+  }
+  if (line.startsWith("index ") && !/^index [0-9a-f]+(?:\.\.[0-9a-f]+)?(?: [0-7]{6})?$/u.test(line)) {
+    throw new ValidationError("invalid Git index metadata");
+  }
+  if (!isGitMetadata(line)) {
+    throw new ValidationError("unexpected unified patch line");
+  }
+}
+
 function parsePatch(patch: string): FilePatch[] {
   const lines = patch.replace(/\r\n/gu, "\n").split("\n");
   if (lines.at(-1) === "") lines.pop();
   const files: FilePatch[] = [];
   let index = 0;
   while (index < lines.length) {
-    if (!lines[index].startsWith("--- ")) {
+    if (lines[index] === "") {
       index += 1;
       continue;
     }
     if (!isFileHeaderAt(lines, index)) {
-      throw new ValidationError("unified patch is missing its target header");
+      validateGitMetadata(lines[index]);
+      index += 1;
+      continue;
     }
     const oldPath = patchPath(lines[index]);
     index += 1;
     const newPath = patchPath(lines[index]);
     index += 1;
     const hunks: Hunk[] = [];
-    while (index < lines.length && !isFileHeaderAt(lines, index)) {
+    while (index < lines.length && !isFileHeaderAt(lines, index) && !lines[index].startsWith("diff --git ")) {
       if (lines[index] === "") {
         index += 1;
         continue;
       }
       const header = lines[index];
+      if (isGitMetadata(header)) {
+        validateGitMetadata(header);
+        index += 1;
+        continue;
+      }
       if (!header.startsWith("@@ ")) throw new ValidationError("unexpected unified patch line");
-      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u.exec(header);
+      const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$/u.exec(header);
       if (match === null) {
         throw new ValidationError("invalid unified patch hunk header");
       }
@@ -344,7 +375,7 @@ function applyHunks(original: string, hunks: Hunk[]): string {
   const output: Array<{ text: string; newline: boolean }> = [];
   let cursor = 0;
   for (const hunk of hunks) {
-    const start = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
+    const start = hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
     const newStart = hunk.newStart === 0 ? 0 : hunk.newStart - 1;
     if (start < cursor || start > oldLines.length) {
       throw new ValidationError("patch hunk is out of order");
@@ -383,6 +414,7 @@ function applyHunks(original: string, hunks: Hunk[]): string {
 
 export type PatchHooks = {
   afterInstall?: (path: string) => void | Promise<void>;
+  beforeCleanup?: (path: string) => void | Promise<void>;
 };
 
 function removeCreatedDirectory(workspace: string, created: SecureCreatedDirectory): void {
@@ -392,10 +424,10 @@ function removeCreatedDirectory(workspace: string, created: SecureCreatedDirecto
       const directory = openSecureDirectory(parent);
       try {
         if (!sameSecureIdentity(created.identity, secureFileIdentity(directory))) return;
+        unlinkAt(parent, parent.name, true);
       } finally {
         closeSecureFile(directory);
       }
-      unlinkAt(parent, parent.name, true);
     } finally {
       closeSecureParent(parent);
     }
@@ -426,14 +458,36 @@ function requireTargetIdentity(
   }
 }
 
-function unlinkIfIdentity(
+async function unlinkVerifiedPath(
   parent: ReturnType<typeof openSecureParent>,
   name: string,
   expected: SecureIdentity,
+  heldFd: number,
   description: string,
-): void {
-  requireTargetIdentity(parent, name, expected, description);
-  unlinkAt(parent, name);
+  cleanupPath: string,
+  beforeCleanup?: (path: string) => void | Promise<void>,
+): Promise<void> {
+  const current = openPatchTarget(parent, name);
+  if (current === null) throw new ToolExecutionError(`${description} is missing`);
+  try {
+    const currentIdentity = secureFileIdentity(current);
+    if (!sameSecureIdentity(expected, currentIdentity) || !sameSecureIdentity(expected, secureFileIdentity(heldFd))) {
+      throw new ToolExecutionError(`${description} identity changed`);
+    }
+    await beforeCleanup?.(cleanupPath);
+    const verified = openPatchTarget(parent, name);
+    if (verified === null) throw new ToolExecutionError(`${description} identity changed`);
+    try {
+      if (!sameSecureIdentity(expected, secureFileIdentity(verified)) || !sameSecureIdentity(expected, secureFileIdentity(heldFd))) {
+        throw new ToolExecutionError(`${description} identity changed`);
+      }
+      unlinkAt(parent, name);
+    } finally {
+      closeSecureFile(verified);
+    }
+  } finally {
+    closeSecureFile(current);
+  }
 }
 
 function patchTool(hooks: PatchHooks = {}): Tool {
@@ -450,6 +504,8 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       return { file, path: newPath ?? oldPath };
     });
 
+    const transactionLock = openPatchTransactionLock(context.workspace);
+    try {
     const seen = new Set<string>();
     const changes = [] as Array<{
       file: FilePatch;
@@ -502,8 +558,10 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       change: (typeof changes)[number];
       parent: ReturnType<typeof openSecureParent>;
       tempName: string | null;
+      tempFd: number | null;
       tempIdentity: SecureIdentity | null;
       backupName: string | null;
+      backupFd: number | null;
       backupIdentity: SecureIdentity | null;
       backupMade: boolean;
       installed: boolean;
@@ -525,18 +583,23 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         }
         for (const directory of parent.created) createdDirectories.set(directory.path, directory);
         let tempName: string | null = null;
+        let tempFd: number | null = null;
         let tempIdentity: SecureIdentity | null = null;
         try {
           if (!change.isDelete) {
             tempName = `.kestrel-patch-${randomUUID()}.tmp`;
-            tempIdentity = createPatchTemp(parent, tempName, change.content ?? "");
+            const temporary = createPatchTemp(parent, tempName, change.content ?? "");
+            tempFd = temporary.fd;
+            tempIdentity = temporary.identity;
           }
           staged.push({
             change,
             parent,
             tempName,
+            tempFd,
             tempIdentity,
             backupName: null,
+            backupFd: null,
             backupIdentity: null,
             backupMade: false,
             installed: false,
@@ -563,9 +626,20 @@ function patchTool(hooks: PatchHooks = {}): Tool {
           item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
           renameAt(item.parent, item.parent.name, item.backupName);
           item.backupMade = true;
-          item.backupIdentity = change.preconditionIdentity;
-          if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
-          requireTargetIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
+        } else if (item.tempName !== null) {
+          item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
+          linkAt(item.parent, item.tempName, item.backupName);
+          item.backupMade = true;
+        }
+        if (item.backupMade && item.backupName !== null) {
+          const backup = openPatchTarget(item.parent, item.backupName);
+          if (backup === null) throw new ToolExecutionError("patch backup is missing");
+          item.backupFd = backup;
+          item.backupIdentity = secureFileIdentity(backup);
+          const expectedBackup = change.existed ? change.preconditionIdentity : item.tempIdentity;
+          if (!sameSecureIdentity(expectedBackup, item.backupIdentity)) {
+            throw new ToolExecutionError("patch backup identity changed");
+          }
         }
         if (item.tempName !== null) {
           renameAt(item.parent, item.tempName, item.parent.name);
@@ -582,7 +656,15 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (item.backupMade && item.backupName !== null) {
           try {
             if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
-            unlinkIfIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
+            if (item.backupFd === null) throw new ToolExecutionError("patch backup descriptor is missing");
+            await unlinkVerifiedPath(
+              item.parent,
+              item.backupName,
+              item.backupIdentity,
+              item.backupFd,
+              "patch backup",
+              item.change.path,
+            );
             item.backupMade = false;
           } catch (error) {
             item.backupRetained = true;
@@ -600,7 +682,16 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (item.installed) {
           try {
             if (item.installedIdentity === null) throw new ToolExecutionError("patch installed identity is missing");
-            unlinkIfIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
+            if (item.tempFd === null) throw new ToolExecutionError("patch temporary descriptor is missing");
+            await unlinkVerifiedPath(
+              item.parent,
+              item.parent.name,
+              item.installedIdentity,
+              item.tempFd,
+              "patch target",
+              item.change.path,
+              hooks.beforeCleanup,
+            );
             item.installed = false;
           } catch (rollbackError) {
             rollbackFailures.push(`${relativePath(context.workspace, item.change.path)}: ${String(rollbackError)}`);
@@ -609,12 +700,27 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (item.backupMade && item.backupName !== null) {
           try {
             if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
-            requireTargetIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
             if (item.installed) throw new ToolExecutionError("patch target identity changed during rollback");
             if (targetIdentity(item.parent) !== null) {
               throw new ToolExecutionError("patch target identity changed during rollback");
             }
-            renameAt(item.parent, item.backupName, item.parent.name);
+            if (item.backupFd === null) throw new ToolExecutionError("patch backup descriptor is missing");
+            if (!sameSecureIdentity(item.backupIdentity, secureFileIdentity(item.backupFd))) {
+              throw new ToolExecutionError("patch backup identity changed");
+            }
+            if (item.change.existed) {
+              renameAt(item.parent, item.backupName, item.parent.name);
+              requireTargetIdentity(item.parent, item.parent.name, item.backupIdentity, "patch restored target");
+            } else {
+              await unlinkVerifiedPath(
+                item.parent,
+                item.backupName,
+                item.backupIdentity,
+                item.backupFd,
+                "patch recovery backup",
+                item.change.path,
+              );
+            }
             item.backupMade = false;
           } catch (rollbackError) {
             item.backupRetained = true;
@@ -636,13 +742,22 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       throw error;
     } finally {
       for (const item of staged) {
-        if (item.tempName !== null && !item.installed && item.tempIdentity !== null) {
+        if (item.tempName !== null && !item.installed && item.tempIdentity !== null && item.tempFd !== null) {
           try {
-            unlinkIfIdentity(item.parent, item.tempName, item.tempIdentity, "patch temporary");
+            await unlinkVerifiedPath(
+              item.parent,
+              item.tempName,
+              item.tempIdentity,
+              item.tempFd,
+              "patch temporary",
+              item.change.path,
+            );
           } catch {
             // Retain the temporary artifact if its pathname was replaced.
           }
         }
+        if (item.tempFd !== null) closeSecureFile(item.tempFd);
+        if (item.backupFd !== null) closeSecureFile(item.backupFd);
         closeSecureParent(item.parent);
       }
       for (const directory of [...createdDirectories.values()].reverse()) {
@@ -652,6 +767,9 @@ function patchTool(hooks: PatchHooks = {}): Tool {
 
     const paths = changes.map((change) => relativePath(context.workspace, change.path));
     return result(`patched ${paths.length} file(s)`, paths);
+    } finally {
+      closeSecureFile(transactionLock);
+    }
     },
   };
 }
