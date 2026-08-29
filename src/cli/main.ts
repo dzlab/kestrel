@@ -1,56 +1,52 @@
-import { OpenAICompatibleClient } from "../model/openai-compatible";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { ApprovalManager } from "../policy/approvals";
-import { openDatabase } from "../store/database";
-import { StoreRepository } from "../store/repository";
-import { createToolRegistry } from "../tools/registry";
-import { RunKernel } from "../kernel";
-import { SchedulerDaemon } from "../scheduler/daemon";
+#!/usr/bin/env bun
 
-const usage = "Usage: bun run src/cli/main.ts [--help]";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createKestrel, loadConfig, openConfiguredDatabase } from "../index";
+import { SchedulerDaemon } from "../scheduler/daemon";
+import { StoreRepository } from "../store/repository";
+import type { ApprovalManager } from "../policy/approvals";
+import type { RunKernel, RunOptions } from "../kernel";
+
+const usage = `Kestrel local agent
+
+Usage:
+  kestrel run <prompt>             Run a task in the configured workspace
+  kestrel approve <call-id>        Approve the exact pending tool call and resume
+  kestrel deny <call-id>           Deny the exact pending tool call
+  kestrel history                  Show recent durable tasks
+  kestrel status [task-or-run-id]  Show durable task or run status
+  kestrel schedule list             List schedules
+  kestrel schedule cancel <id>     Cancel a schedule without deleting history
+  kestrel tick                     Claim and run one due schedule
+  kestrel daemon start|status|stop Run the durable scheduler daemon
+  kestrel --help                   Show this help
+
+Config:
+  KESTREL_MODEL_BASE_URL           OpenAI-compatible API base URL, for example http://127.0.0.1:8000/v1
+  KESTREL_MODEL_API_KEY            Optional bearer token (never sent to tool output)
+  KESTREL_MODEL_NAME               Provider model name (default: kestrel)
+  KESTREL_WORKSPACE                Workspace root (default: current directory)
+  KESTREL_DATA_DIR                 Private state directory (default: ~/.kestrel)
+  KESTREL_DB                       SQLite file, relative paths stay under KESTREL_DATA_DIR
+
+Use mise install or Bun 1.4+ before running the CLI.`;
 
 export type CliRuntime = {
-  kernel: RunKernel;
+  kernel?: RunKernel;
   repository: StoreRepository;
   approvals: ApprovalManager;
+  config?: { workspace: string };
+  defaults?: RunOptions;
   close?: () => void;
 };
 
 function runtimeFromEnvironment(): CliRuntime {
-  const database = openDatabase(databasePath());
-  const repository = new StoreRepository(database);
-  const approvals = new ApprovalManager(repository);
-  const registry = createToolRegistry({ approvals });
-  const baseUrl = process.env.KESTREL_MODEL_BASE_URL;
-  if (baseUrl === undefined || baseUrl.length === 0) {
-    database.close();
-    throw new Error("KESTREL_MODEL_BASE_URL is required for run/resume");
-  }
-  const modelName = process.env.KESTREL_MODEL_NAME ?? "kestrel";
-  const model = new OpenAICompatibleClient({
-    baseUrl,
-    apiKey: process.env.KESTREL_MODEL_API_KEY,
-    model: modelName,
-    timeoutMs: Number(process.env.KESTREL_MODEL_TIMEOUT_MS ?? 30_000),
-  });
-  return {
-    kernel: new RunKernel({ model, repository, registry, approvals, modelName }),
-    repository,
-    approvals,
-    close: () => database.close(),
-  };
-}
-
-function databasePath(): string {
-  return process.env.KESTREL_DB ?? join(dataDirectory(), "kestrel.sqlite");
+  return createKestrel();
 }
 
 function dataDirectory(): string {
-  const directory = process.env.KESTREL_DATA_DIR ?? join(homedir(), ".kestrel");
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  return directory;
+  return loadConfig().dataDir;
 }
 
 function pidPath(): string {
@@ -61,6 +57,11 @@ function getRuntime(runtime?: CliRuntime): { runtime: CliRuntime; owned: boolean
   return runtime === undefined ? { runtime: runtimeFromEnvironment(), owned: true } : { runtime, owned: false };
 }
 
+function requireKernel(runtime: CliRuntime): RunKernel {
+  if (runtime.kernel === undefined) throw new Error("this command requires a model runtime");
+  return runtime.kernel;
+}
+
 async function runCommand(args: readonly string[], write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
   const prompt = args.slice(1).join(" ").trim();
   if (prompt.length === 0) {
@@ -69,8 +70,14 @@ async function runCommand(args: readonly string[], write: (message: string) => v
   }
   const selected = getRuntime(runtime);
   try {
-    const workspace = process.env.KESTREL_WORKSPACE ?? process.cwd();
-    const result = await selected.runtime.kernel.run({ title: prompt.slice(0, 120), prompt, workspace });
+    const result = await requireKernel(selected.runtime).run(
+      {
+        title: prompt.slice(0, 120),
+        prompt,
+        workspace: selected.runtime.config?.workspace ?? process.env.KESTREL_WORKSPACE ?? process.cwd(),
+      },
+      selected.runtime.defaults,
+    );
     write(JSON.stringify(result));
     return result.status === "completed" ? 0 : 1;
   } finally {
@@ -101,7 +108,7 @@ async function approvalCommand(
     const resolved = action === "approve"
       ? selected.runtime.approvals.approve(callId)
       : selected.runtime.approvals.deny(callId);
-    const result = await selected.runtime.kernel.resume(resolved.runId);
+    const result = await requireKernel(selected.runtime).resume(resolved.runId, selected.runtime.defaults);
     write(JSON.stringify(result));
     return result.status === "completed" ? 0 : 1;
   } finally {
@@ -117,7 +124,7 @@ async function scheduleCommand(args: readonly string[], write: (message: string)
   }
   const selected = runtime === undefined
     ? (() => {
-        const database = openDatabase(databasePath());
+        const database = openConfiguredDatabase(loadConfig());
         return { runtime: { repository: new StoreRepository(database) } as CliRuntime, owned: true, close: () => database.close() };
       })()
     : { runtime, owned: false, close: () => undefined };
@@ -139,6 +146,50 @@ async function scheduleCommand(args: readonly string[], write: (message: string)
     return 0;
   } finally {
     if (selected.owned) selected.close();
+  }
+}
+
+async function historyCommand(args: readonly string[], write: (message: string) => void): Promise<number> {
+  const config = loadConfig();
+  const database = openConfiguredDatabase(config);
+  try {
+    const limit = args[1] === undefined ? 50 : Number(args[1]);
+    write(JSON.stringify(new StoreRepository(database).listTasks(limit)));
+    return 0;
+  } finally {
+    database.close();
+  }
+}
+
+async function statusCommand(args: readonly string[], write: (message: string) => void): Promise<number> {
+  const config = loadConfig();
+  const database = openConfiguredDatabase(config);
+  try {
+    const repository = new StoreRepository(database);
+    const id = args[1];
+    const record = id === undefined ? repository.listTasks(1)[0] ?? null : repository.getTask(id) ?? repository.getRun(id);
+    if (record === null) {
+      write(JSON.stringify({ found: false }));
+      return 1;
+    }
+    write(JSON.stringify(record));
+    return 0;
+  } finally {
+    database.close();
+  }
+}
+
+async function tickCommand(write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
+  const selected = getRuntime(runtime);
+  try {
+    const result = await new SchedulerDaemon({
+      repository: selected.runtime.repository,
+      kernel: requireKernel(selected.runtime),
+    }).tick();
+    write(JSON.stringify(result));
+    return result === null || result.status === "completed" ? 0 : 1;
+  } finally {
+    if (selected.owned) selected.runtime.close?.();
   }
 }
 
@@ -185,8 +236,7 @@ async function daemonCommand(args: readonly string[], write: (message: string) =
     return 1;
   }
   const selected = getRuntime(runtime);
-  if (!selected.runtime.kernel) return 1;
-  const daemon = new SchedulerDaemon({ repository: selected.runtime.repository, kernel: selected.runtime.kernel });
+  const daemon = new SchedulerDaemon({ repository: selected.runtime.repository, kernel: requireKernel(selected.runtime) });
   daemon.start(1_000, true);
   writeFileSync(path, `${process.pid}\n`, { mode: 0o600 });
   write(JSON.stringify({ running: true, pid: process.pid }));
@@ -214,6 +264,18 @@ export function runCli(
     });
   }
   if (command === "schedule") return scheduleCommand(args, write, runtime).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
+  if (command === "history") return historyCommand(args, write).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
+  if (command === "status") return statusCommand(args, write).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
+  if (command === "tick") return tickCommand(write, runtime).catch((error) => {
     write(error instanceof Error ? error.message : String(error));
     return 1;
   });

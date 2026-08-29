@@ -336,6 +336,16 @@ function scheduleFromRow(row: Row): ScheduleRecord {
 export class StoreRepository {
   constructor(private readonly database: Database) {}
 
+  listTasks(limit = 50): TaskRecord[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
+      throw new ValidationError("task history limit must be between 1 and 100");
+    }
+    const rows = this.database
+      .query("SELECT * FROM tasks ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?")
+      .all(limit) as Row[];
+    return rows.map(taskFromRow);
+  }
+
   getTask(taskId: string): TaskRecord | null {
     const row = this.database.query("SELECT * FROM tasks WHERE id = ?").get(taskId) as Row | null;
     return row === null ? null : taskFromRow(row);

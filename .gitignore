@@ -1,0 +1,11 @@
+node_modules/
+.kestrel-data/
+.env
+.env.*
+!.env.example
+
+# Local review and generated review artifacts.
+.reviews/
+review-artifacts/
+*.review.md
+CR-*.md

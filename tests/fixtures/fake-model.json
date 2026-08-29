@@ -1,0 +1,22 @@
+{
+  "responses": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "write-1",
+            "name": "fs.write",
+            "arguments": { "path": "hello.txt", "content": "hello from kestrel\n" }
+          }
+        ]
+      },
+      "finishReason": "tool_calls"
+    },
+    {
+      "message": { "role": "assistant", "content": "Created hello.txt." },
+      "finishReason": "stop"
+    }
+  ]
+}
