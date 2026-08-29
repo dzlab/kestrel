@@ -228,16 +228,18 @@ export function validateNativeDirentHeader(header: Uint8Array): NativeDirentHead
   }
   const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
   const recordLength = view.getUint16(dirent.recordLengthOffset, true);
-  const nameLength = dirent.nameLengthOffset === null ? 0 : view.getUint16(dirent.nameLengthOffset, true);
+  const nameLength =
+    dirent.nameLengthOffset === null
+      ? header.indexOf(0, dirent.nameOffset) - dirent.nameOffset
+      : view.getUint16(dirent.nameLengthOffset, true);
   if (
     recordLength < dirent.minimumRecordBytes ||
     recordLength > dirent.maxRecordBytes ||
     recordLength % dirent.alignment !== 0 ||
     dirent.nameOffset >= recordLength ||
-    (dirent.nameLengthOffset !== null &&
-      (nameLength === 0 ||
-        nameLength > dirent.maxNameBytes ||
-        dirent.nameOffset + nameLength + 1 > recordLength))
+    nameLength <= 0 ||
+    nameLength > dirent.maxNameBytes ||
+    dirent.nameOffset + nameLength + 1 > recordLength
   ) {
     throw new ToolExecutionError("directory contained an invalid entry");
   }
@@ -280,6 +282,7 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
         throw new ToolExecutionError("directory contained an invalid entry");
       }
       const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
+      validateNativeDirentHeader(record);
       const decoded = dirent.decodeDirent(record);
       const name = decoded.name;
       if (name !== "." && name !== "..") {

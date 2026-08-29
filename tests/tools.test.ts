@@ -1218,6 +1218,21 @@ test("rejects a native dirent record length above the bounded Darwin record size
   expect(() => validateNativeDirentHeader(header)).toThrow("invalid entry");
 });
 
+test("validates Linux dirent names from the native record", () => {
+  if (process.platform !== "linux") return;
+
+  const valid = new Uint8Array(32);
+  const validView = new DataView(valid.buffer);
+  validView.setUint16(16, 32, true);
+  validView.setUint8(18, 8);
+  valid.set(new TextEncoder().encode("entry"), 19);
+  expect(validateNativeDirentHeader(valid)).toEqual({ recordLength: 32, nameLength: 5, type: 8 });
+
+  const invalid = valid.slice();
+  invalid.fill(0x78, 24);
+  expect(() => validateNativeDirentHeader(invalid)).toThrow("invalid entry");
+});
+
 test("native directory reads distinguish an error from EOF", () => {
   expect(() => validateNativeReaddirResult("workspace", null, 5)).toThrow("EIO");
   expect(validateNativeReaddirResult("workspace", null, 0)).toBe(true);
