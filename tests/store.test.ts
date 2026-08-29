@@ -573,6 +573,56 @@ test("claimDueSchedule reclaims a stale lease with a new fencing token", () => {
   });
 });
 
+test("renewScheduleLease extends a live long-running lease", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    repository.createSchedule({ id: "renewable-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    const claim = repository.claimDueSchedule(1_000, "owner-a")!;
+    const renewedAt = 1_000 + SCHEDULE_LEASE_TIMEOUT_MS - 1;
+
+    expect(repository.renewScheduleLease("renewable-schedule", "owner-a", claim.leaseToken!, renewedAt)).toBe(true);
+    expect(repository.getSchedule("renewable-schedule")).toMatchObject({
+      claimedBy: "owner-a",
+      claimedAt: renewedAt,
+      leaseToken: claim.leaseToken,
+    });
+    expect(repository.claimDueSchedule(renewedAt + SCHEDULE_LEASE_TIMEOUT_MS - 1, "owner-b")).toBeNull();
+  });
+});
+
+test("renewScheduleLease rejects a wrong owner or token without changing the lease", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    repository.createSchedule({ id: "protected-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    const claim = repository.claimDueSchedule(1_000, "owner-a")!;
+
+    expect(repository.renewScheduleLease("protected-schedule", "owner-b", claim.leaseToken!, 2_000)).toBe(false);
+    expect(repository.renewScheduleLease("protected-schedule", "owner-a", "wrong-token", 2_000)).toBe(false);
+    expect(repository.getSchedule("protected-schedule")?.claimedAt).toBe(1_000);
+  });
+});
+
+test("renewScheduleLease rejects a lease after it has been reclaimed", () => {
+  withDatabase((_path, open) => {
+    const repository = new StoreRepository(open());
+    repository.createSchedule({ id: "reclaimed-schedule", prompt: "Run once", nextRunAt: 1_000, enabled: true });
+
+    const firstClaim = repository.claimDueSchedule(1_000, "owner-a")!;
+    const secondClaim = repository.claimDueSchedule(1_000 + SCHEDULE_LEASE_TIMEOUT_MS + 1, "owner-b")!;
+
+    expect(repository.renewScheduleLease("reclaimed-schedule", "owner-a", firstClaim.leaseToken!, 1_000 + SCHEDULE_LEASE_TIMEOUT_MS + 2)).toBe(
+      false,
+    );
+    expect(repository.getSchedule("reclaimed-schedule")).toMatchObject({
+      claimedBy: "owner-b",
+      claimedAt: 1_000 + SCHEDULE_LEASE_TIMEOUT_MS + 1,
+      leaseToken: secondClaim.leaseToken,
+    });
+  });
+});
+
 test("createSchedule rejects an owned schedule without a lease token", () => {
   withDatabase((_path, open) => {
     const repository = new StoreRepository(open());
@@ -663,6 +713,61 @@ test("finishToolCall persists the result, state, and completion time", () => {
       state: "completed",
       finished_at: expect.any(Number),
     });
+  });
+});
+
+test("finishToolCall treats an identical completion as an idempotent success", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const run = createRun(repository);
+    const call: ToolCall = { id: "idempotent-finish", name: "fs.read", arguments: { path: "README.md" } };
+
+    repository.recordToolCall(run.id, call, "running");
+    repository.finishToolCall(run.id, call.id, { ok: true }, "completed");
+    const firstCompletion = database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id);
+
+    repository.finishToolCall(run.id, call.id, { ok: true }, "completed");
+
+    expect(database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id)).toEqual(
+      firstCompletion,
+    );
+  });
+});
+
+test("finishToolCall rejects a conflicting result without mutating the completion", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const run = createRun(repository);
+    const call: ToolCall = { id: "conflicting-finish", name: "fs.read", arguments: { path: "README.md" } };
+
+    repository.recordToolCall(run.id, call, "running");
+    repository.finishToolCall(run.id, call.id, { ok: true }, "completed");
+    const firstCompletion = database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id);
+
+    expect(() => repository.finishToolCall(run.id, call.id, { ok: false }, "completed")).toThrow(PersistenceError);
+    expect(database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id)).toEqual(
+      firstCompletion,
+    );
+  });
+});
+
+test("finishToolCall rejects a conflicting state without mutating the completion", () => {
+  withDatabase((_path, open) => {
+    const database = open();
+    const repository = new StoreRepository(database);
+    const run = createRun(repository);
+    const call: ToolCall = { id: "conflicting-state-finish", name: "fs.read", arguments: { path: "README.md" } };
+
+    repository.recordToolCall(run.id, call, "running");
+    repository.finishToolCall(run.id, call.id, { ok: true }, "completed");
+    const firstCompletion = database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id);
+
+    expect(() => repository.finishToolCall(run.id, call.id, { ok: true }, "failed")).toThrow(PersistenceError);
+    expect(database.query("SELECT result, state, finished_at FROM tool_calls WHERE call_id = ?").get(call.id)).toEqual(
+      firstCompletion,
+    );
   });
 });
 

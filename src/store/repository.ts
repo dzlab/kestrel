@@ -298,16 +298,32 @@ export class StoreRepository {
 
   finishToolCall(runId: string, callId: string, result: unknown, state: string): void {
     immediateTransaction(this.database, () => {
+      const resultJson = json(result);
       const update = this.database
         .query(
           `UPDATE tool_calls
            SET result = ?, state = ?, finished_at = ?
-           WHERE run_id = ? AND call_id = ?`,
+           WHERE run_id = ? AND call_id = ? AND finished_at IS NULL`,
         )
-        .run(json(result), state, Date.now(), runId, callId);
-      if (update.changes !== 1) {
-        throw new PersistenceError(`tool call ${callId} was not found for run ${runId}`);
+        .run(resultJson, state, Date.now(), runId, callId);
+      if (update.changes === 1) {
+        return;
       }
+
+      const existing = this.database
+        .query("SELECT run_id, result, state, finished_at FROM tool_calls WHERE call_id = ?")
+        .get(callId) as { run_id: string; result: string | null; state: string; finished_at: number | null } | null;
+      if (
+        existing !== null &&
+        existing.run_id === runId &&
+        existing.finished_at !== null &&
+        existing.result === resultJson &&
+        existing.state === state
+      ) {
+        return;
+      }
+
+      throw new PersistenceError(`tool call ${callId} was not found for run ${runId}`);
     });
   }
 
@@ -462,6 +478,22 @@ export class StoreRepository {
       }
 
       return scheduleFromRow(this.database.query("SELECT * FROM schedules WHERE id = ?").get(row.id) as Row);
+    });
+  }
+
+  renewScheduleLease(id: string, owner: string, leaseToken: string, now: number): boolean {
+    const staleBefore = now - SCHEDULE_LEASE_TIMEOUT_MS;
+    return immediateTransaction(this.database, () => {
+      const update = this.database
+        .query(
+          `UPDATE schedules
+           SET claimed_at = ?
+           WHERE id = ? AND claimed_by = ? AND lease_token = ?
+             AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL
+             AND claimed_at > ?`,
+        )
+        .run(now, id, owner, leaseToken, staleBefore);
+      return update.changes === 1;
     });
   }
 
