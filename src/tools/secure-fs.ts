@@ -20,6 +20,7 @@ const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O
 const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const PATCH_CREATE_FLAGS = constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const PATCH_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 const native = dlopen("/usr/lib/libSystem.B.dylib", {
@@ -396,7 +397,7 @@ export function createPatchTemp(parent: SecureParent, name: string, content: str
   let fd: number | null = null;
   let retained = false;
   try {
-    fd = openAt(parent.fd, name, CREATE_FLAGS, 0o600);
+    fd = openAt(parent.fd, name, PATCH_CREATE_FLAGS, 0o600);
     const identity = secureFileIdentity(fd);
     fchmodSync(fd, 0o600);
     requireRegular(fd, "patch temporary");
@@ -409,6 +410,12 @@ export function createPatchTemp(parent: SecureParent, name: string, content: str
   } finally {
     if (fd !== null && !retained) closeFd(fd);
   }
+}
+
+export function createPatchRecovery(parent: SecureParent, name: string, sourceFd: number): SecureOpenFile {
+  const source = readSecureFileText(sourceFd);
+  if (source.truncated) throw new ToolExecutionError("patch recovery source exceeds the bounded read limit");
+  return createPatchTemp(parent, name, source.content);
 }
 
 function callAt(operation: string, result: number, path: string): void {

@@ -11,6 +11,7 @@ import type { ToolContext, ToolResult } from "./types";
 import {
   closeSecureFile,
   closeSecureParent,
+  createPatchRecovery,
   createPatchTemp,
   linkAt,
   openPatchTransactionLock,
@@ -237,18 +238,33 @@ function isFileHeaderAt(lines: string[], index: number): boolean {
 function isGitMetadata(line: string): boolean {
   return (
     /^diff --git .+ .+$/u.test(line) ||
-    /^index [0-9a-f]+(?:\.\.[0-9a-f]+)?(?: [0-7]{6})?$/u.test(line) ||
+    /^index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$/u.test(line) ||
     /^(?:new file mode|deleted file mode|old mode|new mode) [0-7]{6}$/u.test(line) ||
     /^(?:similarity|dissimilarity) index (?:100|[0-9]{1,2})%$/u.test(line) ||
     /^(?:rename from|rename to) .+$/u.test(line)
   );
 }
 
+function hasGitMetadataPrefix(line: string): boolean {
+  return (
+    line.startsWith("diff --git") ||
+    line.startsWith("index ") ||
+    line.startsWith("new file mode ") ||
+    line.startsWith("deleted file mode ") ||
+    line.startsWith("old mode ") ||
+    line.startsWith("new mode ") ||
+    line.startsWith("similarity index ") ||
+    line.startsWith("dissimilarity index ") ||
+    line.startsWith("rename from ") ||
+    line.startsWith("rename to ")
+  );
+}
+
 function validateGitMetadata(line: string): void {
-  if (line.startsWith("diff --git ") && !/^diff --git .+ .+$/u.test(line)) {
+  if (line.startsWith("diff --git") && !/^diff --git .+ .+$/u.test(line)) {
     throw new ValidationError("invalid Git diff metadata");
   }
-  if (line.startsWith("index ") && !/^index [0-9a-f]+(?:\.\.[0-9a-f]+)?(?: [0-7]{6})?$/u.test(line)) {
+  if (line.startsWith("index ") && !/^index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$/u.test(line)) {
     throw new ValidationError("invalid Git index metadata");
   }
   if (!isGitMetadata(line)) {
@@ -261,16 +277,28 @@ function parsePatch(patch: string): FilePatch[] {
   if (lines.at(-1) === "") lines.pop();
   const files: FilePatch[] = [];
   let index = 0;
+  let gitMetadataAllowed = false;
   while (index < lines.length) {
     if (lines[index] === "") {
       index += 1;
       continue;
     }
-    if (!isFileHeaderAt(lines, index)) {
+    if (lines[index].startsWith("diff --git")) {
+      validateGitMetadata(lines[index]);
+      gitMetadataAllowed = true;
+      index += 1;
+      continue;
+    }
+    if (hasGitMetadataPrefix(lines[index])) {
+      if (!gitMetadataAllowed) throw new ValidationError("Git metadata is only allowed before file headers");
       validateGitMetadata(lines[index]);
       index += 1;
       continue;
     }
+    if (!isFileHeaderAt(lines, index)) {
+      throw new ValidationError("unified patch is missing its target header");
+    }
+    gitMetadataAllowed = false;
     const oldPath = patchPath(lines[index]);
     index += 1;
     const newPath = patchPath(lines[index]);
@@ -282,11 +310,6 @@ function parsePatch(patch: string): FilePatch[] {
         continue;
       }
       const header = lines[index];
-      if (isGitMetadata(header)) {
-        validateGitMetadata(header);
-        index += 1;
-        continue;
-      }
       if (!header.startsWith("@@ ")) throw new ValidationError("unexpected unified patch line");
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$/u.exec(header);
       if (match === null) {
@@ -490,6 +513,46 @@ async function unlinkVerifiedPath(
   }
 }
 
+type PatchRecoveryItem = {
+  change: { existed: boolean; originalFd: number | null };
+  parent: ReturnType<typeof openSecureParent>;
+  tempFd: number | null;
+  backupName: string | null;
+  backupFd: number | null;
+  backupIdentity: SecureIdentity | null;
+  backupMade: boolean;
+  backupRetained: boolean;
+};
+
+function recoverySourceFd(item: PatchRecoveryItem): number {
+  const sourceFd = item.change.existed ? item.change.originalFd : item.tempFd;
+  if (sourceFd === null) throw new ToolExecutionError("patch recovery source descriptor is missing");
+  return sourceFd;
+}
+
+function ensureRecoveryBackup(item: PatchRecoveryItem): void {
+  if (!item.backupMade || item.backupName === null || item.backupFd === null || item.backupIdentity === null) {
+    throw new ToolExecutionError("patch recovery backup is missing");
+  }
+
+  let pathMatches = false;
+  try {
+    pathMatches = sameSecureIdentity(item.backupIdentity, targetIdentity(item.parent, item.backupName));
+  } catch {
+    // A replacement, symlink, or other invalid artifact is left untouched below.
+  }
+  if (pathMatches && sameSecureIdentity(item.backupIdentity, secureFileIdentity(item.backupFd))) return;
+
+  const oldBackupFd = item.backupFd;
+  const freshName = `.kestrel-patch-${randomUUID()}.bak`;
+  const fresh = createPatchRecovery(item.parent, freshName, recoverySourceFd(item));
+  item.backupName = freshName;
+  item.backupFd = fresh.fd;
+  item.backupIdentity = fresh.identity;
+  item.backupRetained = true;
+  closeSecureFile(oldBackupFd);
+}
+
 function patchTool(hooks: PatchHooks = {}): Tool {
   return {
   definition: fileDefinition("fs.patch", "Apply a unified patch to workspace files.", { patch: { type: "string" } }, ["patch"]),
@@ -513,8 +576,10 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       isDelete: boolean;
       existed: boolean;
       preconditionIdentity: SecureIdentity | null;
+      originalFd: number | null;
       content: string | null;
     }>;
+    try {
     for (const { file, path } of resolved) {
       if (path === null) throw new ValidationError("patch target is missing");
       if (seen.has(path)) throw new ValidationError("patch contains duplicate file targets");
@@ -523,6 +588,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       const isDelete = file.newPath === null;
       let existed = false;
       let preconditionIdentity: SecureIdentity | null = null;
+      let originalFd: number | null = null;
       let original = "";
       try {
         const parent = openSecureParent(context.workspace, path, false);
@@ -530,28 +596,38 @@ function patchTool(hooks: PatchHooks = {}): Tool {
           const target = openPatchTarget(parent);
           existed = target !== null;
           if (target !== null) {
-            try {
-              preconditionIdentity = secureFileIdentity(target);
-              original = readPatchTarget(target);
-            } finally {
-              closeSecureFile(target);
-            }
+            originalFd = target;
+            preconditionIdentity = secureFileIdentity(target);
+            original = readPatchTarget(target);
           }
         } finally {
           closeSecureParent(parent);
         }
       } catch (error) {
+        if (originalFd !== null) closeSecureFile(originalFd);
         if ((error as { code?: string }).code !== "ENOENT") throw error;
       }
-      if ((file.oldPath === null) === existed) {
-        throw new ValidationError(isDelete ? "cannot delete a missing file" : "patch target already exists or is missing");
-      }
+      try {
+        if ((file.oldPath === null) === existed) {
+          throw new ValidationError(isDelete ? "cannot delete a missing file" : "patch target already exists or is missing");
+        }
 
-      const patched = applyHunks(original, file.hunks);
-      if (isDelete && patched !== "") {
-        throw new ValidationError("deletion patch must match and remove the entire file");
+        const patched = applyHunks(original, file.hunks);
+        if (isDelete && patched !== "") {
+          throw new ValidationError("deletion patch must match and remove the entire file");
+        }
+        changes.push({ file, path, isDelete, existed, preconditionIdentity, originalFd, content: isDelete ? null : patched });
+        originalFd = null;
+      } catch (error) {
+        if (originalFd !== null) closeSecureFile(originalFd);
+        throw error;
       }
-      changes.push({ file, path, isDelete, existed, preconditionIdentity, content: isDelete ? null : patched });
+    }
+    } catch (error) {
+      for (const change of changes) {
+        if (change.originalFd !== null) closeSecureFile(change.originalFd);
+      }
+      throw error;
     }
 
     const staged: Array<{
@@ -623,23 +699,36 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         }
 
         if (change.existed) {
+          if (change.preconditionIdentity === null || change.originalFd === null) {
+            throw new ToolExecutionError("patch original descriptor is missing");
+          }
+          if (!sameSecureIdentity(change.preconditionIdentity, secureFileIdentity(change.originalFd))) {
+            throw new ToolExecutionError("patch original identity changed during staging");
+          }
           item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
-          renameAt(item.parent, item.parent.name, item.backupName);
+          const recovery = createPatchRecovery(item.parent, item.backupName, change.originalFd);
+          item.backupFd = recovery.fd;
+          item.backupIdentity = recovery.identity;
           item.backupMade = true;
+          await unlinkVerifiedPath(
+            item.parent,
+            item.parent.name,
+            change.preconditionIdentity,
+            change.originalFd,
+            "patch target",
+            change.path,
+          );
         } else if (item.tempName !== null) {
           item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
           linkAt(item.parent, item.tempName, item.backupName);
-          item.backupMade = true;
-        }
-        if (item.backupMade && item.backupName !== null) {
           const backup = openPatchTarget(item.parent, item.backupName);
           if (backup === null) throw new ToolExecutionError("patch backup is missing");
           item.backupFd = backup;
           item.backupIdentity = secureFileIdentity(backup);
-          const expectedBackup = change.existed ? change.preconditionIdentity : item.tempIdentity;
-          if (!sameSecureIdentity(expectedBackup, item.backupIdentity)) {
+          if (!sameSecureIdentity(item.tempIdentity, item.backupIdentity)) {
             throw new ToolExecutionError("patch backup identity changed");
           }
+          item.backupMade = true;
         }
         if (item.tempName !== null) {
           renameAt(item.parent, item.tempName, item.parent.name);
@@ -668,6 +757,11 @@ function patchTool(hooks: PatchHooks = {}): Tool {
             item.backupMade = false;
           } catch (error) {
             item.backupRetained = true;
+            try {
+              ensureRecoveryBackup(item);
+            } catch (recoveryError) {
+              error = new ToolExecutionError("patch recovery backup could not be retained", { cause: recoveryError });
+            }
             throw new ToolExecutionError(
               `patch applied but backup cleanup failed; recovery backup retained at ${relativePath(context.workspace, join(dirname(item.change.path), item.backupName))}`,
               { cause: error },
@@ -679,6 +773,14 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       if (transactionCommitted) throw error;
       const rollbackFailures: string[] = [];
       for (const item of [...staged].reverse()) {
+        try {
+          ensureRecoveryBackup(item);
+        } catch (recoveryError) {
+          rollbackFailures.push(
+            `${relativePath(context.workspace, item.change.path)} backup: ${String(recoveryError)}`,
+          );
+          continue;
+        }
         if (item.installed) {
           try {
             if (item.installedIdentity === null) throw new ToolExecutionError("patch installed identity is missing");
@@ -699,18 +801,39 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         }
         if (item.backupMade && item.backupName !== null) {
           try {
-            if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
-            if (item.installed) throw new ToolExecutionError("patch target identity changed during rollback");
             if (targetIdentity(item.parent) !== null) {
               throw new ToolExecutionError("patch target identity changed during rollback");
             }
-            if (item.backupFd === null) throw new ToolExecutionError("patch backup descriptor is missing");
-            if (!sameSecureIdentity(item.backupIdentity, secureFileIdentity(item.backupFd))) {
-              throw new ToolExecutionError("patch backup identity changed");
+            ensureRecoveryBackup(item);
+            if (item.backupIdentity === null || item.backupFd === null) {
+              throw new ToolExecutionError("patch backup descriptor is missing");
             }
+            requireTargetIdentity(item.parent, item.backupName, item.backupIdentity, "patch backup");
             if (item.change.existed) {
-              renameAt(item.parent, item.backupName, item.parent.name);
-              requireTargetIdentity(item.parent, item.parent.name, item.backupIdentity, "patch restored target");
+              const restored = createPatchRecovery(item.parent, item.parent.name, recoverySourceFd(item));
+              try {
+                requireTargetIdentity(item.parent, item.parent.name, restored.identity, "patch restored target");
+              } finally {
+                closeSecureFile(restored.fd);
+              }
+              item.installed = false;
+              item.backupRetained = false;
+              await unlinkVerifiedPath(
+                item.parent,
+                item.backupName,
+                item.backupIdentity,
+                item.backupFd,
+                "patch recovery backup",
+                item.change.path,
+              );
+              item.backupMade = false;
+            } else if (item.backupRetained) {
+              rollbackFailures.push(
+                `${relativePath(context.workspace, item.change.path)} recovery backup retained at ${relativePath(
+                  context.workspace,
+                  join(dirname(item.change.path), item.backupName),
+                )}`,
+              );
             } else {
               await unlinkVerifiedPath(
                 item.parent,
@@ -720,8 +843,8 @@ function patchTool(hooks: PatchHooks = {}): Tool {
                 "patch recovery backup",
                 item.change.path,
               );
+              item.backupMade = false;
             }
-            item.backupMade = false;
           } catch (rollbackError) {
             item.backupRetained = true;
             rollbackFailures.push(
@@ -759,6 +882,9 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (item.tempFd !== null) closeSecureFile(item.tempFd);
         if (item.backupFd !== null) closeSecureFile(item.backupFd);
         closeSecureParent(item.parent);
+      }
+      for (const change of changes) {
+        if (change.originalFd !== null) closeSecureFile(change.originalFd);
       }
       for (const directory of [...createdDirectories.values()].reverse()) {
         removeCreatedDirectory(context.workspace, directory);

@@ -237,6 +237,46 @@ test("patch rejects malformed Git metadata instead of skipping it", async () => 
   });
 });
 
+test("patch rejects a single-hash Git index line", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "target.txt"), "before\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "single-hash-index",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "diff --git a/target.txt b/target.txt\nindex 1111111\n--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+after\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("before\n");
+  });
+});
+
+test("patch rejects Git metadata after the file headers", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "target.txt"), "before\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "misplaced-index",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "diff --git a/target.txt b/target.txt\n--- a/target.txt\n+++ b/target.txt\nindex 1111111..2222222 100644\n@@ -1 +1 @@\n-before\n+after\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("before\n");
+  });
+});
+
 test("patch validates new ranges across multiple hunks with unchanged gaps", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "multi.txt"), "a\nb\nc\nd\n");
@@ -526,6 +566,42 @@ test("patch rollback does not unlink a replacement installed after the transacti
   });
 });
 
+test("patch rollback retains the original when afterInstall replaces the recovery artifact", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "safe.txt"), "original\n");
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("safe.txt")) {
+            const backup = readdirSync(workspace).find((name) => name.endsWith(".bak"));
+            if (backup === undefined) throw new Error("recovery backup was not created");
+            unlinkSync(join(workspace, backup));
+            writeFileSync(join(workspace, backup), "replacement backup\n");
+            throw new Error("force rollback");
+          }
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "backup-replacement-rollback",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "safe.txt"), "utf8")).toBe("original\n");
+    const backups = readdirSync(workspace).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(workspace, backups[0]!), "utf8")).toBe("replacement backup\n");
+  });
+});
+
 test("patch rollback does not unlink a replacement made during cleanup verification", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "safe.txt"), "original\n");
@@ -593,6 +669,44 @@ test("patch-created files retain a recovery artifact when cleanup sees a replace
     const backups = readdirSync(workspace).filter((name) => name.endsWith(".bak"));
     expect(backups).toHaveLength(1);
     expect(readFileSync(join(workspace, backups[0]!), "utf8")).toBe("created\n");
+    expect(result.content).toContain("recovery backup retained");
+  });
+});
+
+test("patch-created files retain recovery content when afterInstall replaces the artifact", async () => {
+  await withWorkspace(async (workspace, context) => {
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("created.txt")) {
+            const backup = readdirSync(workspace).find((name) => name.endsWith(".bak"));
+            if (backup === undefined) throw new Error("recovery backup was not created");
+            unlinkSync(join(workspace, backup));
+            writeFileSync(join(workspace, backup), "replacement backup\n");
+            throw new Error("force rollback");
+          }
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "created-backup-replacement-rollback",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(existsSync(join(workspace, "created.txt"))).toBe(false);
+    const backups = readdirSync(workspace).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(2);
+    expect(backups.map((name) => readFileSync(join(workspace, name), "utf8"))).toEqual(
+      expect.arrayContaining(["replacement backup\n", "created\n"]),
+    );
     expect(result.content).toContain("recovery backup retained");
   });
 });
