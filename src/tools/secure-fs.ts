@@ -10,12 +10,11 @@ import {
   writeSync,
 } from "node:fs";
 import { relative, resolve, sep } from "node:path";
-import { dlopen, FFIType, toArrayBuffer } from "bun:ffi";
+import { toArrayBuffer } from "bun:ffi";
 import { ToolExecutionError, ValidationError } from "../errors";
+import { getNativeFs, type NativeFs } from "./native-fs";
 import { MAX_READ_BYTES, truncateUtf8 } from "./types";
 
-const AT_FDCWD = -2;
-const AT_REMOVEDIR = 0x0080;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK;
@@ -23,53 +22,24 @@ const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |
 const PATCH_CREATE_FLAGS = constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const PATCH_READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
-const native = dlopen("/usr/lib/libSystem.B.dylib", {
-  openat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-  linkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
-  mkdirat: { args: [FFIType.i32, FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
-  renameat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring], returns: FFIType.i32 },
-  unlinkat: { args: [FFIType.i32, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
-  fdopendir: { args: [FFIType.i32], returns: FFIType.ptr },
-  readdir: { args: [FFIType.ptr], returns: FFIType.ptr },
-  closedir: { args: [FFIType.ptr], returns: FFIType.i32 },
-  __error: { args: [], returns: FFIType.ptr },
-  strerror: { args: [FFIType.i32], returns: FFIType.cstring },
-});
-
-const errnoNames: Record<number, string> = {
-  1: "EPERM",
-  2: "ENOENT",
-  5: "EIO",
-  6: "ENXIO",
-  13: "EACCES",
-  17: "EEXIST",
-  20: "ENOTDIR",
-  21: "EISDIR",
-  22: "EINVAL",
-  28: "ENOSPC",
-  35: "EAGAIN",
-  62: "ELOOP",
-  66: "ENOTEMPTY",
-};
-
 type NativeError = Error & { code?: string; errno?: number };
 type DirectoryOpenError = NativeError & { created?: SecureCreatedDirectory[] };
 
-const DIRENT_HEADER_BYTES = 21;
-const DIRENT_MIN_RECORD_BYTES = 24;
-const DIRENT_MAX_RECORD_BYTES = 1024; // Darwin DIRBLKSIZ-compatible bounded record size.
-const DIRENT_MAX_NAME_BYTES = 255;
+let nativeFs: NativeFs | undefined;
+
+function getSecureNativeFs(): NativeFs {
+  nativeFs ??= getNativeFs();
+  return nativeFs;
+}
 
 function errno(): number {
-  const pointer = native.symbols.__error();
-  if (pointer === null) throw new Error("could not read native errno");
-  return new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true);
+  return getSecureNativeFs().errno();
 }
 
 function nativeError(operation: string, path: string, errorNumber = errno()): NativeError {
   const number = errorNumber;
-  const name = errnoNames[number] ?? "ERRNO";
+  const native = getSecureNativeFs();
+  const name = native.errnoNames[number] ?? "ERRNO";
   const detail = native.symbols.strerror(number) ?? "native filesystem error";
   const error = new Error(`${operation} ${path}: ${name} (${detail})`) as NativeError;
   error.code = name;
@@ -82,13 +52,13 @@ function throwNative(operation: string, path: string): never {
 }
 
 function setErrno(value: number): void {
-  const pointer = native.symbols.__error();
+  const pointer = getSecureNativeFs().symbols.errnoPointer();
   if (pointer === null) throw new Error("could not access native errno");
   new DataView(toArrayBuffer(pointer, 0, 4)).setInt32(0, value, true);
 }
 
 function openAt(directoryFd: number, name: string, flags: number, mode = 0o600): number {
-  const fd = native.symbols.openat(directoryFd, name, flags, mode);
+  const fd = getSecureNativeFs().symbols.openat(directoryFd, name, flags, mode);
   if (fd < 0) throwNative("open", name);
   return fd;
 }
@@ -117,7 +87,7 @@ function componentsFor(workspace: string, path: string): { root: string; compone
 }
 
 function openRoot(root: string): number {
-  const fd = openAt(AT_FDCWD, root, DIRECTORY_FLAGS, 0);
+  const fd = openAt(getSecureNativeFs().constants.atFdcwd, root, DIRECTORY_FLAGS, 0);
   try {
     if (!fstatSync(fd).isDirectory()) throw new ToolExecutionError("workspace is not a directory");
     if (realpathSync(`/dev/fd/${fd}`) !== root) {
@@ -183,11 +153,14 @@ export function revalidateSecureDirectory(workspace: string, directory: SecureDi
 
 export function openPatchTransactionLock(workspace: string): number {
   const root = openRoot(rootPath(workspace));
-  const result = native.symbols.flock(root, 2 | 4);
+  const native = getSecureNativeFs();
+  const result = native.symbols.flock(root, native.constants.lockExclusive | native.constants.lockNonblocking);
   if (result < 0) {
     const errorNumber = errno();
     closeFd(root);
-    if (errorNumber === 35) throw new ToolExecutionError("another patch transaction is already active");
+    if (native.errnoNames[errorNumber] === "EAGAIN") {
+      throw new ToolExecutionError("another patch transaction is already active");
+    }
     throw nativeError("lock", workspace, errorNumber);
   }
   return root;
@@ -207,9 +180,10 @@ function openDirectory(workspace: string, path: string, create: boolean): { fd: 
           nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
         } catch (error) {
           if (!create || (error as NativeError).code !== "ENOENT") throw error;
+          const native = getSecureNativeFs();
           const made = native.symbols.mkdirat(currentFd, component, 0o755);
           createdNow = made >= 0;
-          if (!createdNow && errnoNames[errno()] !== "EEXIST") throwNative("mkdir", component);
+          if (!createdNow && native.errnoNames[errno()] !== "EEXIST") throwNative("mkdir", component);
           nextFd = openAt(currentFd, component, DIRECTORY_FLAGS, 0);
         }
         if (createdNow) {
@@ -247,23 +221,27 @@ function directoryEntryType(value: number): SecureEntryType {
 export type NativeDirentHeader = { recordLength: number; nameLength: number; type: number };
 
 export function validateNativeDirentHeader(header: Uint8Array): NativeDirentHeader {
-  if (header.byteLength < DIRENT_HEADER_BYTES) {
+  const native = getSecureNativeFs();
+  const { dirent } = native;
+  if (header.byteLength < dirent.headerBytes) {
     throw new ToolExecutionError("directory contained an invalid entry");
   }
   const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
-  const recordLength = view.getUint16(16, true);
-  const nameLength = view.getUint16(18, true);
+  const recordLength = view.getUint16(dirent.recordLengthOffset, true);
+  const nameLength = dirent.nameLengthOffset === null ? 0 : view.getUint16(dirent.nameLengthOffset, true);
   if (
-    recordLength < DIRENT_MIN_RECORD_BYTES ||
-    recordLength > DIRENT_MAX_RECORD_BYTES ||
-    recordLength % 4 !== 0 ||
-    nameLength === 0 ||
-    nameLength > DIRENT_MAX_NAME_BYTES ||
-    DIRENT_HEADER_BYTES + nameLength + 1 > recordLength
+    recordLength < dirent.minimumRecordBytes ||
+    recordLength > dirent.maxRecordBytes ||
+    recordLength % dirent.alignment !== 0 ||
+    dirent.nameOffset >= recordLength ||
+    (dirent.nameLengthOffset !== null &&
+      (nameLength === 0 ||
+        nameLength > dirent.maxNameBytes ||
+        dirent.nameOffset + nameLength + 1 > recordLength))
   ) {
     throw new ToolExecutionError("directory contained an invalid entry");
   }
-  return { recordLength, nameLength, type: view.getUint8(20) };
+  return { recordLength, nameLength, type: view.getUint8(dirent.typeOffset) };
 }
 
 export function validateNativeReaddirResult(path: string, entry: unknown, errorNumber: number): boolean {
@@ -274,6 +252,7 @@ export function validateNativeReaddirResult(path: string, entry: unknown, errorN
 
 export function safeDirectoryEntries(workspace: string, path: string): SecureEntry[] {
   const { fd } = openDirectory(workspace, path, false);
+  const native = getSecureNativeFs();
   const directory = native.symbols.fdopendir(fd);
   if (!directory) {
     closeFd(fd);
@@ -288,16 +267,23 @@ export function safeDirectoryEntries(workspace: string, path: string): SecureEnt
         if (validateNativeReaddirResult(path, entry, errno())) break;
         throw new ToolExecutionError("directory read did not return an entry or EOF");
       }
-      const header = new Uint8Array(toArrayBuffer(entry, 0, DIRENT_HEADER_BYTES));
-      const { recordLength, nameLength, type } = validateNativeDirentHeader(header);
-      const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
-      const nameBytes = record.subarray(DIRENT_HEADER_BYTES, DIRENT_HEADER_BYTES + nameLength);
-      if (nameBytes.includes(0) || record[DIRENT_HEADER_BYTES + nameLength] !== 0) {
+      const { dirent } = native;
+      const header = new Uint8Array(toArrayBuffer(entry, 0, dirent.headerBytes));
+      const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+      const recordLength = view.getUint16(dirent.recordLengthOffset, true);
+      if (
+        recordLength < dirent.minimumRecordBytes ||
+        recordLength > dirent.maxRecordBytes ||
+        recordLength % dirent.alignment !== 0 ||
+        dirent.nameOffset >= recordLength
+      ) {
         throw new ToolExecutionError("directory contained an invalid entry");
       }
-      const name = Buffer.from(nameBytes).toString("utf8");
+      const record = new Uint8Array(toArrayBuffer(entry, 0, recordLength));
+      const decoded = dirent.decodeDirent(record);
+      const name = decoded.name;
       if (name !== "." && name !== "..") {
-        entries.push({ name, type: directoryEntryType(type) });
+        entries.push({ name, type: directoryEntryType(decoded.type) });
       }
     }
   } finally {
@@ -492,13 +478,14 @@ function callAt(operation: string, result: number, path: string): void {
 }
 
 export function renameAt(parent: SecureParent, from: string, to: string): void {
-  callAt("rename", native.symbols.renameat(parent.fd, from, parent.fd, to), `${from} -> ${to}`);
+  callAt("rename", getSecureNativeFs().symbols.renameat(parent.fd, from, parent.fd, to), `${from} -> ${to}`);
 }
 
 export function linkAt(parent: SecureParent, from: string, to: string): void {
-  callAt("link", native.symbols.linkat(parent.fd, from, parent.fd, to, 0), `${from} -> ${to}`);
+  callAt("link", getSecureNativeFs().symbols.linkat(parent.fd, from, parent.fd, to, 0), `${from} -> ${to}`);
 }
 
 export function unlinkAt(parent: SecureParent, name: string, directory = false): void {
-  callAt("unlink", native.symbols.unlinkat(parent.fd, name, directory ? AT_REMOVEDIR : 0), name);
+  const native = getSecureNativeFs();
+  callAt("unlink", native.symbols.unlinkat(parent.fd, name, directory ? native.constants.atRemovedir : 0), name);
 }

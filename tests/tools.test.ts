@@ -23,6 +23,15 @@ import type { ToolContext } from "../src/tools/types";
 import { validateNativeDirentHeader, validateNativeReaddirResult } from "../src/tools/secure-fs";
 import { buildToolMessage } from "../src/kernel/context";
 
+test("secure filesystem keeps native library loading out of module import", () => {
+  const source = readFileSync(join(import.meta.dir, "../src/tools/secure-fs.ts"), "utf8");
+
+  expect(source).toContain("getNativeFs");
+  expect(source).not.toContain("dlopen(");
+  expect(source).not.toContain("FFIType");
+  expect(source).not.toContain("/usr/lib/libSystem.B.dylib");
+});
+
 function withWorkspace<T>(callback: (workspace: string, context: ToolContext) => T | Promise<T>): T | Promise<T> {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-tools-"));
   const context = { workspace, runId: "run-tools", repository: {} } as ToolContext;
