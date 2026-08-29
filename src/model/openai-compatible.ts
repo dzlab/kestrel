@@ -5,6 +5,9 @@ import type { ModelClient } from "./client";
 
 const MAX_RETRIES = 1;
 const RETRY_DELAY_MS = 50;
+const MAX_RESPONSE_BODY_BYTES = 1024 * 1024;
+const MAX_ERROR_DETAIL_LENGTH = 200;
+const RESPONSE_BODY_TOO_LARGE_ERROR = `model response body exceeds the maximum size of ${MAX_RESPONSE_BODY_BYTES} bytes`;
 
 export type OpenAICompatibleClientOptions = {
   baseUrl: string;
@@ -117,17 +120,77 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
 }
 
+async function discardResponseBody(response: Response): Promise<void> {
+  const body = response.body;
+  if (body !== null && body !== undefined) {
+    await body.cancel();
+    return;
+  }
+
+  await response.text();
+}
+
+async function readResponseBody(response: Response): Promise<string> {
+  const body = response.body;
+  if (body === null || body === undefined) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_RESPONSE_BODY_BYTES) {
+      throw new Error(RESPONSE_BODY_TOO_LARGE_ERROR);
+    }
+    return text;
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      const chunk = value ?? new Uint8Array();
+      totalBytes += chunk.byteLength;
+      if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Preserve the useful size-limit error if cancellation also fails.
+        }
+        throw new Error(RESPONSE_BODY_TOO_LARGE_ERROR);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function capErrorText(text: string): string {
+  return text.length > MAX_ERROR_DETAIL_LENGTH ? `${text.slice(0, MAX_ERROR_DETAIL_LENGTH)}…` : text;
+}
+
 function errorDetail(body: string): string {
   try {
     const parsed: unknown = JSON.parse(body);
     if (isRecord(parsed) && isRecord(parsed.error) && typeof parsed.error.message === "string") {
-      return parsed.error.message;
+      return capErrorText(parsed.error.message);
     }
   } catch {
     // The status is the useful diagnostic when the error body is not JSON.
   }
 
-  return body.slice(0, 200);
+  return capErrorText(body);
 }
 
 export class OpenAICompatibleClient implements ModelClient {
@@ -174,21 +237,23 @@ export class OpenAICompatibleClient implements ModelClient {
 
         if (!response.ok) {
           if (attempt < MAX_RETRIES && isRetryableStatus(response.status)) {
+            await discardResponseBody(response);
             await new Promise<void>((resolve) =>
               setTimeout(resolve, Math.min(RETRY_DELAY_MS, Math.max(0, this.timeoutMs))),
             );
             continue;
           }
 
-          const responseBody = await response.text();
+          const responseBody = await readResponseBody(response);
           throw new Error(
             `model request failed with status ${response.status}: ${errorDetail(responseBody)}`,
           );
         }
 
+        const responseBody = await readResponseBody(response);
         let providerResponse: unknown;
         try {
-          providerResponse = (await response.json()) as unknown;
+          providerResponse = JSON.parse(responseBody) as unknown;
         } catch (error) {
           throw new ValidationError("model response body must be valid JSON", { cause: error });
         }

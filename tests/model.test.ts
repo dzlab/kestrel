@@ -224,6 +224,83 @@ test("retries one 429 or 5xx response before succeeding", async () => {
   }
 });
 
+test("cancels a retryable response body before retrying", async () => {
+  let attempts = 0;
+  let canceled = false;
+  const fetchImpl: FetchImplementation = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("try again"));
+        },
+        cancel() {
+          canceled = true;
+        },
+      });
+      return new Response(body, { status: 429 });
+    }
+
+    expect(canceled).toBe(true);
+    return jsonResponse({ choices: [{ message: { role: "assistant", content: "Done" }, finish_reason: "stop" }] });
+  };
+
+  await expect(
+    new OpenAICompatibleClient({
+      baseUrl: "https://example.test",
+      model: "configured-model",
+      timeoutMs: 100,
+      fetchImpl,
+    }).complete(request),
+  ).resolves.toEqual(textResponse);
+  expect(canceled).toBe(true);
+  expect(attempts).toBe(2);
+});
+
+test("rejects an oversized successful model response body", async () => {
+  const fetchImpl: FetchImplementation = async () =>
+    new Response("x".repeat(1024 * 1024 + 1), { status: 200 });
+
+  await expect(
+    new OpenAICompatibleClient({
+      baseUrl: "https://example.test",
+      model: "configured-model",
+      timeoutMs: 100,
+      fetchImpl,
+    }).complete(request),
+  ).rejects.toThrow(/model response body exceeds the maximum size/);
+});
+
+test("rejects an oversized provider error body", async () => {
+  const fetchImpl: FetchImplementation = async () =>
+    new Response(JSON.stringify({ error: { message: "x".repeat(1024 * 1024 + 1) } }), { status: 400 });
+
+  await expect(
+    new OpenAICompatibleClient({
+      baseUrl: "https://example.test",
+      model: "configured-model",
+      timeoutMs: 100,
+      fetchImpl,
+    }).complete(request),
+  ).rejects.toThrow(/model response body exceeds the maximum size/);
+});
+
+test("caps propagated provider error text", async () => {
+  const detail = "provider detail ".repeat(100);
+  const fetchImpl: FetchImplementation = async () =>
+    jsonResponse({ error: { message: detail } }, 400);
+
+  const error = await new OpenAICompatibleClient({
+    baseUrl: "https://example.test",
+    model: "configured-model",
+    timeoutMs: 100,
+    fetchImpl,
+  }).complete(request).catch((caught: unknown) => caught);
+
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toBe(`model request failed with status 400: ${detail.slice(0, 200)}…`);
+});
+
 test("aborts a request that exceeds its timeout", async () => {
   let aborted = false;
   const fetchImpl: FetchImplementation = async (_input, init) =>
