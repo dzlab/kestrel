@@ -344,7 +344,13 @@ export function writeWorkspaceText(workspace: string, path: string, content: str
   }
 }
 
-export type SecureParent = { fd: number; name: string; created: SecureCreatedDirectory[] };
+export type SecureParent = {
+  fd: number;
+  name: string;
+  path: string;
+  identity: SecureIdentity;
+  created: SecureCreatedDirectory[];
+};
 
 export function openSecureParent(workspace: string, path: string, create: boolean): SecureParent {
   const { root, components } = componentsFor(workspace, path);
@@ -352,11 +358,36 @@ export function openSecureParent(workspace: string, path: string, create: boolea
   const name = components.pop()!;
   const parentPath = components.length === 0 ? root : `${root}${sep}${components.join(sep)}`;
   const parent = openDirectory(workspace, parentPath, create);
-  return { fd: parent.fd, name, created: parent.created };
+  return {
+    fd: parent.fd,
+    name,
+    path: parentPath,
+    identity: secureFileIdentity(parent.fd),
+    created: parent.created,
+  };
 }
 
 export function closeSecureParent(parent: SecureParent): void {
   closeFd(parent.fd);
+}
+
+export function revalidateSecureParent(workspace: string, parent: SecureParent): void {
+  let current: { fd: number; created: SecureCreatedDirectory[] };
+  try {
+    current = openDirectory(workspace, parent.path, false);
+  } catch (error) {
+    throw new ToolExecutionError("patch parent directory identity changed", { cause: error });
+  }
+  try {
+    if (!sameSecureIdentity(parent.identity, secureFileIdentity(parent.fd))) {
+      throw new ToolExecutionError("patch parent directory identity changed");
+    }
+    if (!sameSecureIdentity(parent.identity, secureFileIdentity(current.fd))) {
+      throw new ToolExecutionError("patch parent directory identity changed");
+    }
+  } finally {
+    closeFd(current.fd);
+  }
 }
 
 export function openPatchTarget(parent: SecureParent, name = parent.name): number | null {

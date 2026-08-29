@@ -20,6 +20,7 @@ import {
   openSecureParent,
   readSecureFileText,
   readWorkspaceText,
+  revalidateSecureParent,
   renameAt,
   safeDirectoryEntries,
   sameSecureIdentity,
@@ -284,6 +285,7 @@ function parsePatch(patch: string): FilePatch[] {
       continue;
     }
     if (lines[index].startsWith("diff --git")) {
+      if (gitMetadataAllowed) throw new ValidationError("Git metadata group has no file headers");
       validateGitMetadata(lines[index]);
       gitMetadataAllowed = true;
       index += 1;
@@ -384,6 +386,9 @@ function parsePatch(patch: string): FilePatch[] {
   if (files.length === 0) {
     throw new ValidationError("patch contains no file headers");
   }
+  if (gitMetadataAllowed) {
+    throw new ValidationError("Git metadata group has no file headers");
+  }
   return files;
 }
 
@@ -399,7 +404,7 @@ function applyHunks(original: string, hunks: Hunk[]): string {
   let cursor = 0;
   for (const hunk of hunks) {
     const start = hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
-    const newStart = hunk.newStart === 0 ? 0 : hunk.newStart - 1;
+    const newStart = hunk.newCount === 0 ? hunk.newStart : hunk.newStart === 0 ? 0 : hunk.newStart - 1;
     if (start < cursor || start > oldLines.length) {
       throw new ValidationError("patch hunk is out of order");
     }
@@ -482,6 +487,7 @@ function requireTargetIdentity(
 }
 
 async function unlinkVerifiedPath(
+  workspace: string,
   parent: ReturnType<typeof openSecureParent>,
   name: string,
   expected: SecureIdentity,
@@ -490,6 +496,7 @@ async function unlinkVerifiedPath(
   cleanupPath: string,
   beforeCleanup?: (path: string) => void | Promise<void>,
 ): Promise<void> {
+  revalidateSecureParent(workspace, parent);
   const current = openPatchTarget(parent, name);
   if (current === null) throw new ToolExecutionError(`${description} is missing`);
   try {
@@ -497,7 +504,11 @@ async function unlinkVerifiedPath(
     if (!sameSecureIdentity(expected, currentIdentity) || !sameSecureIdentity(expected, secureFileIdentity(heldFd))) {
       throw new ToolExecutionError(`${description} identity changed`);
     }
-    await beforeCleanup?.(cleanupPath);
+    try {
+      await beforeCleanup?.(cleanupPath);
+    } finally {
+      revalidateSecureParent(workspace, parent);
+    }
     const verified = openPatchTarget(parent, name);
     if (verified === null) throw new ToolExecutionError(`${description} identity changed`);
     try {
@@ -577,6 +588,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       existed: boolean;
       preconditionIdentity: SecureIdentity | null;
       originalFd: number | null;
+      parent: ReturnType<typeof openSecureParent> | null;
       content: string | null;
     }>;
     try {
@@ -589,22 +601,21 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       let existed = false;
       let preconditionIdentity: SecureIdentity | null = null;
       let originalFd: number | null = null;
+      let parent: ReturnType<typeof openSecureParent> | null = null;
       let original = "";
       try {
-        const parent = openSecureParent(context.workspace, path, false);
-        try {
-          const target = openPatchTarget(parent);
-          existed = target !== null;
-          if (target !== null) {
-            originalFd = target;
-            preconditionIdentity = secureFileIdentity(target);
-            original = readPatchTarget(target);
-          }
-        } finally {
-          closeSecureParent(parent);
+        parent = openSecureParent(context.workspace, path, false);
+        const target = openPatchTarget(parent);
+        existed = target !== null;
+        if (target !== null) {
+          originalFd = target;
+          preconditionIdentity = secureFileIdentity(target);
+          original = readPatchTarget(target);
         }
       } catch (error) {
         if (originalFd !== null) closeSecureFile(originalFd);
+        if (parent !== null) closeSecureParent(parent);
+        parent = null;
         if ((error as { code?: string }).code !== "ENOENT") throw error;
       }
       try {
@@ -616,16 +627,28 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (isDelete && patched !== "") {
           throw new ValidationError("deletion patch must match and remove the entire file");
         }
-        changes.push({ file, path, isDelete, existed, preconditionIdentity, originalFd, content: isDelete ? null : patched });
+        changes.push({
+          file,
+          path,
+          isDelete,
+          existed,
+          preconditionIdentity,
+          originalFd,
+          parent,
+          content: isDelete ? null : patched,
+        });
+        parent = null;
         originalFd = null;
       } catch (error) {
         if (originalFd !== null) closeSecureFile(originalFd);
+        if (parent !== null) closeSecureParent(parent);
         throw error;
       }
     }
     } catch (error) {
       for (const change of changes) {
         if (change.originalFd !== null) closeSecureFile(change.originalFd);
+        if (change.parent !== null) closeSecureParent(change.parent);
       }
       throw error;
     }
@@ -649,19 +672,25 @@ function patchTool(hooks: PatchHooks = {}): Tool {
     try {
       for (const change of changes) {
         let parent: ReturnType<typeof openSecureParent>;
-        try {
-          parent = openSecureParent(context.workspace, change.path, true);
-        } catch (error) {
-          for (const directory of (error as DirectoryOpenFailure).created ?? []) {
-            createdDirectories.set(directory.path, directory);
+        if (change.parent === null) {
+          try {
+            parent = openSecureParent(context.workspace, change.path, true);
+          } catch (error) {
+            for (const directory of (error as DirectoryOpenFailure).created ?? []) {
+              createdDirectories.set(directory.path, directory);
+            }
+            throw error;
           }
-          throw error;
+        } else {
+          parent = change.parent;
+          change.parent = null;
         }
         for (const directory of parent.created) createdDirectories.set(directory.path, directory);
         let tempName: string | null = null;
         let tempFd: number | null = null;
         let tempIdentity: SecureIdentity | null = null;
         try {
+          revalidateSecureParent(context.workspace, parent);
           if (!change.isDelete) {
             tempName = `.kestrel-patch-${randomUUID()}.tmp`;
             const temporary = createPatchTemp(parent, tempName, change.content ?? "");
@@ -690,6 +719,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
 
       for (const item of staged) {
         const { change } = item;
+        revalidateSecureParent(context.workspace, item.parent);
         const currentIdentity = targetIdentity(item.parent);
         if (change.existed !== (currentIdentity !== null)) {
           throw new ToolExecutionError("patch target changed during staging");
@@ -711,6 +741,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
           item.backupIdentity = recovery.identity;
           item.backupMade = true;
           await unlinkVerifiedPath(
+            context.workspace,
             item.parent,
             item.parent.name,
             change.preconditionIdentity,
@@ -731,22 +762,32 @@ function patchTool(hooks: PatchHooks = {}): Tool {
           item.backupMade = true;
         }
         if (item.tempName !== null) {
+          revalidateSecureParent(context.workspace, item.parent);
           renameAt(item.parent, item.tempName, item.parent.name);
           item.installed = true;
           if (item.tempIdentity === null) throw new ToolExecutionError("patch temporary identity is missing");
           item.installedIdentity = item.tempIdentity;
           requireTargetIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
-          await hooks.afterInstall?.(change.path);
+          try {
+            await hooks.afterInstall?.(change.path);
+          } finally {
+            revalidateSecureParent(context.workspace, item.parent);
+          }
           requireTargetIdentity(item.parent, item.parent.name, item.installedIdentity, "patch target");
         }
+      }
+      for (const item of staged) {
+        revalidateSecureParent(context.workspace, item.parent);
       }
       transactionCommitted = true;
       for (const item of staged) {
         if (item.backupMade && item.backupName !== null) {
           try {
+            revalidateSecureParent(context.workspace, item.parent);
             if (item.backupIdentity === null) throw new ToolExecutionError("patch backup identity is missing");
             if (item.backupFd === null) throw new ToolExecutionError("patch backup descriptor is missing");
             await unlinkVerifiedPath(
+              context.workspace,
               item.parent,
               item.backupName,
               item.backupIdentity,
@@ -774,6 +815,13 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       const rollbackFailures: string[] = [];
       for (const item of [...staged].reverse()) {
         try {
+          revalidateSecureParent(context.workspace, item.parent);
+        } catch (parentError) {
+          item.backupRetained = item.backupMade;
+          rollbackFailures.push(`${relativePath(context.workspace, item.change.path)} parent: ${String(parentError)}`);
+          continue;
+        }
+        try {
           ensureRecoveryBackup(item);
         } catch (recoveryError) {
           rollbackFailures.push(
@@ -786,6 +834,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
             if (item.installedIdentity === null) throw new ToolExecutionError("patch installed identity is missing");
             if (item.tempFd === null) throw new ToolExecutionError("patch temporary descriptor is missing");
             await unlinkVerifiedPath(
+              context.workspace,
               item.parent,
               item.parent.name,
               item.installedIdentity,
@@ -819,6 +868,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
               item.installed = false;
               item.backupRetained = false;
               await unlinkVerifiedPath(
+                context.workspace,
                 item.parent,
                 item.backupName,
                 item.backupIdentity,
@@ -836,6 +886,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
               );
             } else {
               await unlinkVerifiedPath(
+                context.workspace,
                 item.parent,
                 item.backupName,
                 item.backupIdentity,
@@ -868,6 +919,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
         if (item.tempName !== null && !item.installed && item.tempIdentity !== null && item.tempFd !== null) {
           try {
             await unlinkVerifiedPath(
+              context.workspace,
               item.parent,
               item.tempName,
               item.tempIdentity,
@@ -885,6 +937,7 @@ function patchTool(hooks: PatchHooks = {}): Tool {
       }
       for (const change of changes) {
         if (change.originalFd !== null) closeSecureFile(change.originalFd);
+        if (change.parent !== null) closeSecureParent(change.parent);
       }
       for (const directory of [...createdDirectories.values()].reverse()) {
         removeCreatedDirectory(context.workspace, directory);

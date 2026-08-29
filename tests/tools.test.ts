@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -196,6 +197,25 @@ test("patch applies a zero-old-count hunk at the standard EOF offset", async () 
   });
 });
 
+test("patch applies a zero-new-count deletion at the offset after newStart", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "delete-middle.txt"), "a\nb\nc\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "delete-middle",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/delete-middle.txt\n+++ b/delete-middle.txt\n@@ -2 +1,0 @@\n-b\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace, "delete-middle.txt"), "utf8")).toBe("a\nc\n");
+  });
+});
+
 test("patch accepts standard Git diff and index metadata between file sections", async () => {
   await withWorkspace(async (workspace, context) => {
     writeFileSync(join(workspace, "one.txt"), "one\n");
@@ -274,6 +294,48 @@ test("patch rejects Git metadata after the file headers", async () => {
 
     expect(result.ok).toBe(false);
     expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("before\n");
+  });
+});
+
+test("patch rejects trailing incomplete Git metadata groups", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "target.txt"), "before\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "trailing-git-metadata",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "diff --git a/target.txt b/target.txt\nindex 1111111..2222222 100644\n--- a/target.txt\n+++ b/target.txt\n@@ -1 +1 @@\n-before\n+after\ndiff --git a/missing.txt b/missing.txt\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("before\n");
+  });
+});
+
+test("patch rejects an incomplete Git metadata group before a new group", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "one.txt"), "one\n");
+    writeFileSync(join(workspace, "three.txt"), "three\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "incomplete-git-group",
+        name: "fs.patch",
+        arguments: {
+          patch:
+            "diff --git a/one.txt b/one.txt\nindex 1111111..2222222 100644\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+ONE\ndiff --git a/two.txt b/two.txt\nindex 3333333..4444444 100644\ndiff --git a/three.txt b/three.txt\nindex 5555555..6666666 100644\n--- a/three.txt\n+++ b/three.txt\n@@ -1 +1 @@\n-three\n+THREE\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "one.txt"), "utf8")).toBe("one\n");
+    expect(readFileSync(join(workspace, "three.txt"), "utf8")).toBe("three\n");
   });
 });
 
@@ -636,6 +698,44 @@ test("patch rollback does not unlink a replacement made during cleanup verificat
     expect(backups).toHaveLength(1);
     expect(readFileSync(join(workspace, backups[0]!), "utf8")).toBe("original\n");
     expect(result.content).toContain("recovery backup retained");
+  });
+});
+
+test("patch fails closed when a target parent directory is replaced after install", async () => {
+  await withWorkspace(async (workspace, context) => {
+    const parent = join(workspace, "nested");
+    const originalParent = join(workspace, "nested-original");
+    mkdirSync(parent);
+    writeFileSync(join(parent, "safe.txt"), "original\n");
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("nested/safe.txt")) {
+            renameSync(parent, originalParent);
+            mkdirSync(parent);
+            writeFileSync(join(parent, "safe.txt"), "replacement\n");
+          }
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "parent-replacement",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/nested/safe.txt\n+++ b/nested/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(parent, "safe.txt"), "utf8")).toBe("replacement\n");
+    const backups = readdirSync(originalParent).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(originalParent, backups[0]!), "utf8")).toBe("original\n");
+    expect(result.content).toContain("recovery backup");
   });
 });
 
