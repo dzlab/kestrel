@@ -5,7 +5,8 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "blocked_on_approval"
-  | "budget_exhausted";
+  | "budget_exhausted"
+  | "cancelled";
 
 export type ToolCall = {
   id: string;
@@ -32,6 +33,7 @@ export type ModelRequest = {
   tools: ToolDefinition[];
   model: string;
   temperature?: number;
+  signal?: AbortSignal;
 };
 
 export type ModelResponse = {

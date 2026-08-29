@@ -8,6 +8,8 @@ export type MemoryRecord = {
   content: string;
   tags: string[];
   source: string;
+  sourceTaskId: string;
+  confidence: number;
   runId: string | null;
   createdAt: number;
   updatedAt: number;
@@ -22,6 +24,8 @@ export type MemorySaveInput = {
   content: string;
   tags: string[];
   source: string;
+  sourceTaskId: string;
+  confidence: number;
   runId: string | null;
   expiresAt?: number | null;
   now?: number;

@@ -8,6 +8,7 @@ const terminalStatuses = [
   "failed",
   "blocked_on_approval",
   "budget_exhausted",
+  "cancelled",
 ] as const satisfies readonly Exclude<RunStatus, "running">[];
 
 test("parses a valid assistant tool call and JSON arguments", () => {
@@ -123,8 +124,8 @@ test("rejects negative and non-finite usage token counts", () => {
 });
 
 test("lists every terminal run status at runtime", () => {
-  expect(terminalStatuses).toHaveLength(4);
+  expect(terminalStatuses).toHaveLength(5);
   expect(new Set(terminalStatuses)).toEqual(
-    new Set(["completed", "failed", "blocked_on_approval", "budget_exhausted"]),
+    new Set(["completed", "failed", "blocked_on_approval", "budget_exhausted", "cancelled"]),
   );
 });

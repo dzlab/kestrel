@@ -12,7 +12,7 @@ import { createMemoryTools } from "../memory/tools";
 import { createScheduleTools } from "./schedule";
 import { createUpgradeTools } from "../upgrade/tools";
 import { boundToolResult } from "./types";
-import { isTrustedBuiltInTool } from "./types";
+import { isTrustedBuiltInTool } from "./trust";
 import type { Tool, ToolContext, ToolResult } from "./types";
 
 export type ToolRegistryOptions = {
@@ -21,8 +21,20 @@ export type ToolRegistryOptions = {
   policyContext?: PolicyContext | ((context: ToolContext, call: ReturnType<typeof parseToolCall>) => PolicyContext);
 };
 
-const automaticBuiltInNames = new Set(["fs.list", "fs.read", "fs.write", "fs.patch", "search.text", "memory.search", "schedule.list"]);
+const automaticBuiltInNames = new Set([
+  "fs.list",
+  "fs.read",
+  "fs.write",
+  "fs.patch",
+  "search.text",
+  "memory.search",
+  "memory.save",
+  "schedule.list",
+  "self.status",
+  "self.inspect",
+]);
 const agentRepository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+export const defaultSelfPaths: readonly string[] = [agentRepository];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -196,7 +208,7 @@ export class ToolRegistry {
         };
     const policyContext = {
       ...configuredPolicyContext,
-      selfPaths: configuredPolicyContext.selfPaths ?? [agentRepository],
+      selfPaths: configuredPolicyContext.selfPaths ?? defaultSelfPaths,
     };
     let decision;
     try {

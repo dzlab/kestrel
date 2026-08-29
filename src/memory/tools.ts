@@ -2,7 +2,7 @@ import { ValidationError } from "../errors";
 import { MemoryStore } from "./store";
 import { assertSafeMemory } from "./security";
 import type { MemoryScope } from "./types";
-import { registerTrustedBuiltInTool } from "../tools/types";
+import { markTrustedBuiltIn } from "../tools/trust";
 import type { Tool, ToolContext, ToolResult } from "../tools/types";
 
 function stringArgument(args: Record<string, unknown>, name: string): string {
@@ -23,7 +23,7 @@ function tagsArgument(args: Record<string, unknown>): string[] {
   return value;
 }
 
-const saveTool: Tool = registerTrustedBuiltInTool({
+const saveTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "memory.save",
     description: "Save an explicitly supplied, bounded fact or decision in the current user/task namespace.",
@@ -35,14 +35,21 @@ const saveTool: Tool = registerTrustedBuiltInTool({
         tags: { type: "array", items: { type: "string" } },
         scope: { type: "string" },
         expiresAt: { type: "number" },
+        sourceTaskId: { type: "string" },
+        confidence: { type: "number" },
       },
-      required: ["content"],
+      required: ["content", "sourceTaskId", "confidence"],
       additionalProperties: false,
     },
   },
   async execute(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
     const content = stringArgument(args, "content");
     const tags = tagsArgument(args);
+    const sourceTaskId = stringArgument(args, "sourceTaskId");
+    const confidence = args.confidence;
+    if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      throw new ValidationError("confidence must be between 0 and 1");
+    }
     assertSafeMemory(content, tags, context.secretPatterns ?? []);
     const scope = scopeArgument(args);
     const userId = context.userId ?? "local";
@@ -53,7 +60,9 @@ const saveTool: Tool = registerTrustedBuiltInTool({
       taskId: scope === "task" ? taskId : null,
       content,
       tags,
-      source: taskId ?? "interactive",
+      source: sourceTaskId,
+      sourceTaskId,
+      confidence,
       runId: context.runId,
       expiresAt: args.expiresAt === undefined ? null : (args.expiresAt as number),
     });
@@ -61,7 +70,7 @@ const saveTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-const searchTool: Tool = registerTrustedBuiltInTool({
+const searchTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "memory.search",
     description: "Search bounded untrusted memory records in the current user/task namespace.",

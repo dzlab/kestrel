@@ -120,6 +120,22 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
 }
 
+function delayWithSignal(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      reject(signal?.reason ?? new Error("model request cancelled"));
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function discardResponseBody(response: Response): Promise<void> {
   const body = response.body;
   if (body !== null && body !== undefined) {
@@ -225,6 +241,9 @@ export class OpenAICompatibleClient implements ModelClient {
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       const controller = new AbortController();
+      const onAbort = () => controller.abort(request.signal?.reason);
+      if (request.signal?.aborted) onAbort();
+      else request.signal?.addEventListener("abort", onAbort, { once: true });
       const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
       try {
@@ -238,9 +257,7 @@ export class OpenAICompatibleClient implements ModelClient {
         if (!response.ok) {
           if (attempt < MAX_RETRIES && isRetryableStatus(response.status)) {
             await discardResponseBody(response);
-            await new Promise<void>((resolve) =>
-              setTimeout(resolve, Math.min(RETRY_DELAY_MS, Math.max(0, this.timeoutMs))),
-            );
+            await delayWithSignal(Math.min(RETRY_DELAY_MS, Math.max(0, this.timeoutMs)), request.signal);
             continue;
           }
 
@@ -261,6 +278,7 @@ export class OpenAICompatibleClient implements ModelClient {
         return parseModelResponse(normalizeResponse(providerResponse));
       } finally {
         clearTimeout(timeout);
+        request.signal?.removeEventListener("abort", onAbort);
       }
     }
 

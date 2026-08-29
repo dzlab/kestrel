@@ -3,6 +3,8 @@ export {
   MAX_SCHEDULE_PROMPT_BYTES,
   MIN_SCHEDULE_INTERVAL_MS,
   nextOccurrence,
+  validateScheduleWorkspace,
+  MAX_SCHEDULE_ATTEMPTS,
   validateScheduleInput,
 } from "./expressions";
 export {

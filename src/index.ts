@@ -66,7 +66,7 @@ export function createKestrel(options: CreateKestrelOptions = {}): KestrelAgent 
       toolTimeoutMs: config.toolTimeoutMs,
       contextBytes: config.contextBytes,
     };
-    const kernel = new RunKernel({ model, repository, registry, approvals, modelName: config.modelName });
+    const kernel = new RunKernel({ model, repository, registry, approvals, modelName: config.modelName, selfPaths: config.selfPaths });
     let closed = false;
     return {
       config,
@@ -89,7 +89,7 @@ export function createKestrel(options: CreateKestrelOptions = {}): KestrelAgent 
 }
 
 export { SchedulerDaemon, retryDelayMs } from "./scheduler/daemon";
-export { nextOccurrence, validateScheduleInput } from "./scheduler/expressions";
+export { MAX_SCHEDULE_ATTEMPTS, nextOccurrence, validateScheduleInput, validateScheduleWorkspace } from "./scheduler/expressions";
 
 export { SelfUpgrade, createUpgradeTools } from "./upgrade";
 export type {
@@ -140,7 +140,7 @@ export { ApprovalManager } from "./policy/approvals";
 export { PolicyEngine, classifyTool, evaluateToolCall, canonicalJson, hashToolCall } from "./policy/rules";
 export type { ApprovalRequest, Decision, PolicyContext, Risk } from "./policy/types";
 export { ToolRegistry, createToolRegistry } from "./tools/registry";
-export { boundToolResult, isTrustedBuiltInTool, registerTrustedBuiltInTool } from "./tools/types";
+export { boundToolResult, isTrustedBuiltInTool } from "./tools/types";
 export type { Tool, ToolContext, ToolResult } from "./tools/types";
 export { parseMessage, parseModelResponse, parseToolCall } from "./protocol/validation";
 export type { Message, ModelRequest, ModelResponse, Role, RunStatus, ToolCall, ToolDefinition } from "./protocol/types";

@@ -50,6 +50,7 @@ test("public factory runs an end-to-end FakeModel task with every built-in tool 
       "self.upgrade",
       "self.apply",
       "self.status",
+      "self.inspect",
     ]);
     for (const name of names) expect(isTrustedBuiltInTool(agent.registry.get(name)!)).toBe(true);
     const result = await agent.kernel.run({ title: "create a file", prompt: "Create hello.txt", workspace });

@@ -69,7 +69,6 @@ export type UpgradeApplyInput = {
   workspace: string;
   runId: string;
   proposalId: string;
-  approvedByPolicy?: boolean;
 };
 
 export type UpgradeApplyResult = UpgradeProposal & {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { ValidationError } from "../errors";
 import type { ToolDefinition } from "../protocol/types";
@@ -32,6 +32,7 @@ const knownRules: Readonly<Record<string, Rule>> = {
   "self.upgrade": { capability: "self-modification", risk: "high" },
   "self.apply": { capability: "self-modification", risk: "high" },
   "self.status": { capability: "self-inspection", risk: "low" },
+  "self.inspect": { capability: "self-inspection", risk: "low" },
   "memory.search": { capability: "memory", risk: "low" },
   "memory.save": { capability: "memory", risk: "standard" },
   "schedule.list": { capability: "scheduler", risk: "low" },
@@ -222,7 +223,7 @@ function hasExternalPath(args: Record<string, unknown>, workspace: string): bool
 function selfModifying(definition: ToolDefinition, args: Record<string, unknown>, context: PolicyContext): boolean {
   const capability = definition.capability.toLowerCase().replace(/_/gu, "-");
   if (capability === "self-modification" || capability === "self") return true;
-  if (definition.name.startsWith("self.") && definition.name !== "self.status") return true;
+  if (definition.name.startsWith("self.") && !["self.status", "self.inspect"].includes(definition.name)) return true;
   if (args.selfModifying === true || args.selfModification === true) return true;
   const operation = args.operation;
   if (typeof operation === "string" && /self[- ]?modif|upgrade|apply/iu.test(operation)) return true;
@@ -233,7 +234,8 @@ function selfModifying(definition: ToolDefinition, args: Record<string, unknown>
         const root = realpathSync(workspace);
         const candidates = [...pathValues(args), ...patchPathValues(args.patch)];
         return context.selfPaths.some((path) => {
-          const configured = isAbsolute(path) ? resolve(path) : resolve(root, path);
+          const configuredPath = isAbsolute(path) ? resolve(path) : resolve(root, path);
+          const configured = existsSync(configuredPath) ? realpathSync(configuredPath) : configuredPath;
           return isWithin(root, configured) && candidates.some((candidate) => {
             const target = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
             return target === configured || isWithin(configured, target);

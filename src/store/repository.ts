@@ -82,6 +82,7 @@ export type MemoryRecord = {
   userId?: string;
   tags?: string[];
   source?: string;
+  sourceTaskId?: string;
   sourceRunId?: string | null;
   expiresAt?: number | null;
 };
@@ -192,6 +193,7 @@ const runStatuses: readonly RunStatus[] = [
   "failed",
   "blocked_on_approval",
   "budget_exhausted",
+  "cancelled",
 ];
 
 const taskStatuses: readonly TaskStatus[] = ["pending", ...runStatuses];
@@ -289,6 +291,7 @@ function memoryFromRow(row: Row): MemoryRecord {
     userId: row.user_id === null || row.user_id === undefined ? "legacy" : String(row.user_id),
     tags,
     source: row.source === null || row.source === undefined ? "legacy" : String(row.source),
+    sourceTaskId: row.source_task_id === null || row.source_task_id === undefined ? "legacy" : String(row.source_task_id),
     sourceRunId: row.source_run_id === null || row.source_run_id === undefined
       ? (row.run_id === null || row.run_id === undefined ? null : String(row.run_id))
       : String(row.source_run_id),
@@ -675,8 +678,8 @@ export class StoreRepository {
         .query(
           `INSERT INTO memories
             (id, task_id, run_id, kind, content, metadata, confidence, created_at, updated_at,
-             scope, user_id, tags, source, source_run_id, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             scope, user_id, tags, source, source_run_id, expires_at, source_task_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (id) DO UPDATE SET
              task_id = excluded.task_id,
              run_id = excluded.run_id,
@@ -688,6 +691,7 @@ export class StoreRepository {
              user_id = excluded.user_id,
              tags = excluded.tags,
              source = excluded.source,
+             source_task_id = excluded.source_task_id,
              source_run_id = excluded.source_run_id,
              expires_at = excluded.expires_at,
              updated_at = excluded.updated_at`,
@@ -708,6 +712,7 @@ export class StoreRepository {
           input.source ?? input.taskId ?? "legacy",
           input.sourceRunId ?? input.runId ?? null,
           input.expiresAt ?? null,
+          input.sourceTaskId ?? "legacy",
         );
     });
   }
@@ -715,6 +720,15 @@ export class StoreRepository {
   getMemory(id: string): MemoryRecord | null {
     const row = this.database.query("SELECT * FROM memories WHERE id = ?").get(id) as Row | null;
     return row === null ? null : memoryFromRow(row);
+  }
+
+  listMemories(limit = 50): MemoryRecord[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
+      throw new ValidationError("memory inspection limit must be between 1 and 100");
+    }
+    return (this.database
+      .query("SELECT * FROM memories ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?")
+      .all(limit) as Row[]).map(memoryFromRow);
   }
 
   searchMemories(query: string, limit: number, options: MemorySearchOptions = {}): MemoryRecord[] {

@@ -1,9 +1,22 @@
 import { ValidationError } from "../errors";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { ScheduleRecord } from "../store/repository";
 
 export const MIN_SCHEDULE_INTERVAL_MS = 60_000;
 export const MAX_SCHEDULE_PROMPT_BYTES = 4_096;
 export const MAX_SCHEDULE_NAME_LENGTH = 120;
+export const MAX_SCHEDULE_ATTEMPTS = 3;
+
+export function validateScheduleWorkspace(workspace: string): string {
+  if (typeof workspace !== "string" || workspace.trim().length === 0 || workspace.includes("\0")) {
+    throw new ValidationError("schedule workspace must be a non-empty path");
+  }
+  const requested = workspace.trim();
+  if (!existsSync(requested) || !lstatSync(requested).isDirectory()) {
+    throw new ValidationError("schedule workspace must be an existing directory");
+  }
+  return realpathSync(requested);
+}
 
 type ScheduleExpression = {
   intervalMs?: number;

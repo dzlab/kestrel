@@ -4,7 +4,7 @@ import {
   openSecureDirectoryPath,
   revalidateSecureDirectory,
 } from "./secure-fs";
-import { registerTrustedBuiltInTool } from "./types";
+import { markTrustedBuiltIn } from "./trust";
 import type { Tool, ToolContext, ToolResult } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES, truncateUtf8 } from "./types";
 import {
@@ -189,7 +189,7 @@ async function executeBun(args: Record<string, unknown>, context: ToolContext): 
   }
 }
 
-const shellTool: Tool = registerTrustedBuiltInTool({
+const shellTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "shell.exec",
     description: "Execute one approved process argv in the workspace.",
@@ -215,7 +215,7 @@ const shellTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-const bunTool: Tool = registerTrustedBuiltInTool({
+const bunTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "bun.run",
     description: "Run a workspace Bun script with explicit argv arguments.",

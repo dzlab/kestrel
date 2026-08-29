@@ -1,15 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { ValidationError } from "../errors";
-import { registerTrustedBuiltInTool } from "./types";
+import { markTrustedBuiltIn } from "./trust";
 import type { Tool, ToolContext, ToolResult } from "./types";
-import { validateScheduleInput } from "../scheduler/expressions";
+import { validateScheduleInput, validateScheduleWorkspace } from "../scheduler/expressions";
 
 function idArgument(args: Record<string, unknown>): string {
   if (typeof args.id !== "string" || args.id.trim().length === 0) throw new ValidationError("id must be non-empty");
   return args.id.trim();
 }
 
-export const scheduleListTool: Tool = registerTrustedBuiltInTool({
+export const scheduleListTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "schedule.list",
     description: "List durable scheduled tasks and their current lease/status metadata.",
@@ -22,7 +22,7 @@ export const scheduleListTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-export const scheduleCreateTool: Tool = registerTrustedBuiltInTool({
+export const scheduleCreateTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "schedule.create",
     description: "Create a bounded, timezone-explicit one-shot or recurring scheduled task.",
@@ -43,12 +43,13 @@ export const scheduleCreateTool: Tool = registerTrustedBuiltInTool({
   },
   async execute(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
     const input = validateScheduleInput(args);
+    const workspace = validateScheduleWorkspace(context.workspace);
     const id = randomUUID();
     const now = Date.now();
     const schedule = {
       id,
       name: input.name,
-      workspace: context.workspace,
+      workspace,
       prompt: input.prompt,
       nextRunAt: input.at === undefined ? now + (input.intervalMs ?? 0) : Date.parse(input.at),
       enabled: true,
@@ -65,7 +66,7 @@ export const scheduleCreateTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-export const scheduleCancelTool: Tool = registerTrustedBuiltInTool({
+export const scheduleCancelTool: Tool = markTrustedBuiltIn({
   definition: {
     name: "schedule.cancel",
     description: "Disable a durable scheduled task while retaining its history.",

@@ -1,5 +1,5 @@
 import { ApprovalManager } from "../policy/approvals";
-import { registerTrustedBuiltInTool } from "../tools/types";
+import { markTrustedBuiltIn } from "../tools/trust";
 import type { Tool, ToolContext, ToolResult } from "../tools/types";
 import { SelfUpgrade } from "./workflow";
 
@@ -8,7 +8,7 @@ function failure(error: unknown): ToolResult {
 }
 
 export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
-  const upgradeTool: Tool = registerTrustedBuiltInTool({
+  const upgradeTool: Tool = markTrustedBuiltIn({
     definition: {
       name: "self.upgrade",
       description: "Propose a bounded, verified Kestrel source patch without applying it.",
@@ -47,7 +47,7 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
     },
   });
 
-  const applyTool: Tool = registerTrustedBuiltInTool({
+  const applyTool: Tool = markTrustedBuiltIn({
     definition: {
       name: "self.apply",
       description: "Apply one approved Kestrel upgrade proposal and verify it.",
@@ -68,7 +68,6 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
           workspace: context.workspace,
           runId: context.runId,
           proposalId: String(args.proposalId),
-          approvedByPolicy: context.approvalConsumed === true,
         });
         return { ok: true, content: `applied ${result.id}`, data: result };
       } catch (error) {
@@ -77,7 +76,7 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
     },
   });
 
-  const statusTool: Tool = registerTrustedBuiltInTool({
+  const statusTool: Tool = markTrustedBuiltIn({
     definition: {
       name: "self.status",
       description: "Read the durable status of a Kestrel upgrade proposal.",
@@ -101,5 +100,29 @@ export function createUpgradeTools(approvals?: ApprovalManager): Tool[] {
     },
   });
 
-  return [upgradeTool, applyTool, statusTool];
+  const inspectTool: Tool = markTrustedBuiltIn({
+    definition: {
+      name: "self.inspect",
+      description: "Inspect the bounded durable status of a Kestrel upgrade proposal.",
+      capability: "self-inspection",
+      inputSchema: {
+        type: "object",
+        properties: { proposalId: { type: "string" } },
+        additionalProperties: false,
+      },
+    },
+    async execute(args, context) {
+      try {
+        const proposal = new SelfUpgrade({
+          repository: context.repository,
+          approvals: approvals ?? new ApprovalManager(),
+        }).status(context.runId, typeof args.proposalId === "string" ? args.proposalId : undefined);
+        return { ok: proposal !== null, content: proposal === null ? "upgrade proposal not found" : proposal.status, data: proposal };
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  });
+
+  return [upgradeTool, applyTool, statusTool, inspectTool];
 }

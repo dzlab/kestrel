@@ -134,7 +134,29 @@ test("scheduled risky work pauses at the same approval boundary", async () => {
     const result = await daemon.runOnce(1_000);
     expect(result?.status).toBe("blocked_on_approval");
     expect(state.approvals.get("scheduled-shell")?.status).toBe("pending");
-    expect(state.repository.getSchedule("approval")).toMatchObject({ claimedBy: null, leaseToken: null, enabled: false, pendingRunId: result?.runId });
+    expect(state.repository.getSchedule("approval")).toMatchObject({ claimedBy: null, leaseToken: null, enabled: false, nextRunAt: null, pendingRunId: result?.runId });
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("approval-paused recurring schedules resume the pending run on the next occurrence", async () => {
+  const state = setup(new FakeModel([
+    { message: { role: "assistant", content: "", toolCalls: [{ id: "recurring-shell", name: "shell.exec", arguments: { argv: ["echo", "unsafe"] } }] }, finishReason: "tool_calls" },
+    assistant("resumed"),
+  ]));
+  try {
+    state.repository.createSchedule({ id: "recurring-approval", name: "Recurring approval", workspace: state.directory, prompt: "run", intervalMs: 60_000, timeZone: "UTC", nextRunAt: 1_000, enabled: true });
+    const daemon = new SchedulerDaemon({ repository: state.repository, owner: "worker", kernel: state.kernel, now: () => 1_000 });
+    const paused = await daemon.runOnce(1_000);
+    expect(paused?.status).toBe("blocked_on_approval");
+    expect(state.repository.getSchedule("recurring-approval")).toMatchObject({ enabled: true, nextRunAt: 61_000, pendingRunId: paused?.runId });
+
+    state.approvals.approve("recurring-shell");
+    const resumed = await daemon.runOnce(61_000);
+    expect(resumed?.status).toBe("completed");
+    expect(resumed?.runId).toBe(paused?.runId);
+    expect(state.repository.getSchedule("recurring-approval")).toMatchObject({ enabled: true, nextRunAt: 121_000, pendingRunId: null });
   } finally {
     state.cleanup();
   }

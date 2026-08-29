@@ -278,7 +278,7 @@ export class SelfUpgrade {
       throw new ValidationError("upgrade proposal is stale: workspace or target changed");
     }
     const approvalArguments = { proposalId: proposal.id, patchHash: proposal.patchHash };
-    const approved = input.approvedByPolicy === true || this.approvals.consume(
+    const approved = this.approvals.consume(
       { id: proposal.approval.id, tool: "self.apply", arguments: approvalArguments },
       undefined,
       this.now(),

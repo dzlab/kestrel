@@ -82,6 +82,22 @@ test("requires and consumes the exact durable approval once", async () => {
   }
 });
 
+test("direct self-upgrade input cannot forge policy approval", async () => {
+  const value = fixture();
+  try {
+    const proposal = await proposed(value);
+    const upgrade = new SelfUpgrade({ repository: value.repository, approvals: value.approvals, runner: value.runner });
+    await expect(upgrade.apply({
+      workspace: value.workspace,
+      runId: value.runId,
+      proposalId: proposal.id,
+      approvedByPolicy: true,
+    } as never)).rejects.toThrow(/approval/i);
+  } finally {
+    value.close();
+  }
+});
+
 test("rejects a proposal when a target hash is stale", async () => {
   const value = fixture();
   try {

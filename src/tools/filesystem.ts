@@ -5,7 +5,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
-import { registerTrustedBuiltInTool } from "./types";
+import { markTrustedBuiltIn } from "./trust";
 import type { Tool } from "./types";
 import { MAX_TOOL_OUTPUT_BYTES } from "./types";
 import type { ToolContext, ToolResult } from "./types";
@@ -163,7 +163,7 @@ function fileDefinition(name: string, description: string, properties: Record<st
   };
 }
 
-const listTool: Tool = registerTrustedBuiltInTool({
+const listTool: Tool = markTrustedBuiltIn({
   definition: fileDefinition("fs.list", "List entries in a workspace directory.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
@@ -188,7 +188,7 @@ const listTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-const readTool: Tool = registerTrustedBuiltInTool({
+const readTool: Tool = markTrustedBuiltIn({
   definition: fileDefinition("fs.read", "Read bounded UTF-8 text from a workspace file.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
@@ -197,7 +197,7 @@ const readTool: Tool = registerTrustedBuiltInTool({
   },
 });
 
-const writeTool: Tool = registerTrustedBuiltInTool({
+const writeTool: Tool = markTrustedBuiltIn({
   definition: fileDefinition(
     "fs.write",
     "Write UTF-8 text to a workspace file.",
@@ -578,7 +578,7 @@ function ensureRecoveryBackup(item: PatchRecoveryItem): void {
 }
 
 function patchTool(hooks: PatchHooks = {}): Tool {
-  return registerTrustedBuiltInTool({
+  return markTrustedBuiltIn({
   definition: fileDefinition("fs.patch", "Apply a unified patch to workspace files.", { patch: { type: "string" } }, ["patch"]),
   async execute(args, context) {
     const patches = parsePatch(stringArgument(args, "patch"));

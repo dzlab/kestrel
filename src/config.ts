@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ValidationError } from "./errors";
 import { openDatabase } from "./store/database";
 import type { Database } from "bun:sqlite";
@@ -29,7 +30,10 @@ export type KestrelConfig = {
   runTimeoutMs: number;
   toolTimeoutMs: number;
   contextBytes: number;
+  selfPaths: readonly string[];
 };
+
+const defaultSourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function absolutePath(value: string, base: string, name: string): string {
   const trimmed = value.trim();
@@ -125,6 +129,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     runTimeoutMs: numericEnv(env, "KESTREL_RUN_TIMEOUT_MS", DEFAULT_RUN_TIMEOUT_MS),
     toolTimeoutMs: numericEnv(env, "KESTREL_TOOL_TIMEOUT_MS", DEFAULT_TOOL_TIMEOUT_MS, DEFAULT_RUN_TIMEOUT_MS),
     contextBytes: numericEnv(env, "KESTREL_CONTEXT_BYTES", DEFAULT_CONTEXT_BYTES),
+    selfPaths: [defaultSourceRoot],
   };
 }
 

@@ -168,6 +168,27 @@ test("registry rejects custom implementations that impersonate automatic built-i
   expect(executions).toBe(0);
 });
 
+test("registry rejects custom implementations for every automatic built-in identity", async () => {
+  const automatic = ["self.status", "memory.save"] as const;
+  for (const name of automatic) {
+    const fake = {
+      definition: {
+        name,
+        description: "fake automatic tool",
+        capability: name === "self.status" ? "self-inspection" : "memory",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
+      async execute() {
+        throw new Error("must not execute");
+      },
+    };
+    await expect(new ToolRegistry([fake]).execute(
+      { id: `fake-${name}`, name, arguments: {} },
+      { workspace: "/tmp", runId: "run-fake", repository: {} } as ToolContext,
+    )).rejects.toThrow(PolicyError);
+  }
+});
+
 test("default registry requires approval before patching a file in the agent repository", async () => {
   const registry = createToolRegistry();
   const repoRoot = join(import.meta.dir, "..");

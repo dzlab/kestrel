@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ValidationError } from "../errors";
-import { nextOccurrence } from "./expressions";
+import { MAX_SCHEDULE_ATTEMPTS, nextOccurrence, validateScheduleWorkspace } from "./expressions";
 import { SCHEDULE_LEASE_TIMEOUT_MS } from "../store/repository";
 import type { ScheduleRecord, StoreRepository } from "../store/repository";
 import type { RunKernel, RunSummary } from "../kernel/loop";
@@ -79,17 +79,20 @@ export class SchedulerDaemon {
 
     let summary: RunSummary;
     try {
-      const taskInput = {
-        ...(schedule.taskId === null || schedule.taskId === undefined ? {} : { id: schedule.taskId }),
-        title: schedule.name ?? schedule.id,
-        prompt: schedule.prompt,
-        workspace: schedule.workspace ?? "",
-      };
-      if (taskInput.workspace.length === 0) throw new ValidationError(`schedule ${schedule.id} has no workspace`);
-      summary = await this.kernel.run(taskInput, {
-        idempotencyKey: `schedule:${schedule.id}:${schedule.nextRunAt ?? now}`,
-        userId: "local",
-      });
+      const workspace = validateScheduleWorkspace(schedule.workspace ?? "");
+      if (schedule.pendingRunId !== null && schedule.pendingRunId !== undefined) {
+        summary = await this.kernel.resume(schedule.pendingRunId, { userId: "local" });
+      } else {
+        summary = await this.kernel.run({
+          ...(schedule.taskId === null || schedule.taskId === undefined ? {} : { id: schedule.taskId }),
+          title: schedule.name ?? schedule.id,
+          prompt: schedule.prompt,
+          workspace,
+        }, {
+          idempotencyKey: `schedule:${schedule.id}:${schedule.nextRunAt ?? now}`,
+          userId: "local",
+        });
+      }
     } catch (error) {
       summary = { taskId: schedule.taskId ?? "unknown", runId: "unknown", status: "failed", error: errorText(error) };
     } finally {
@@ -100,12 +103,14 @@ export class SchedulerDaemon {
     const attempts = (schedule.attempts ?? 0) + 1;
     const blocked = summary.status === "blocked_on_approval";
     const successful = summary.status === "completed";
+    const recurring = schedule.intervalMs !== null && schedule.intervalMs !== undefined || schedule.rrule !== null && schedule.rrule !== undefined;
     const nextRunAt = blocked
-      ? null
+      ? dueNextRun(schedule, finishedAt)
       : successful
         ? dueNextRun(schedule, finishedAt)
-        : finishedAt + retryDelayMs(Math.max(0, attempts - 1));
-    const enabled = !blocked && nextRunAt !== null;
+        : attempts >= MAX_SCHEDULE_ATTEMPTS ? null : finishedAt + retryDelayMs(Math.max(0, attempts - 1));
+    const terminalFailure = !successful && !blocked && attempts >= MAX_SCHEDULE_ATTEMPTS;
+    const enabled = blocked ? recurring && nextRunAt !== null : nextRunAt !== null;
     const error = successful ? null : (summary.error ?? `scheduled run ended with ${summary.status}`);
     const updated = this.repository.finishScheduleRun({
       id: schedule.id,
@@ -125,7 +130,7 @@ export class SchedulerDaemon {
       const eventTaskId = summary.taskId === "unknown" ? schedule.taskId : summary.taskId;
       this.repository.appendScheduleEvent(
         schedule.id,
-        blocked ? "schedule.paused" : successful ? "schedule.completed" : "schedule.failed",
+        blocked ? "schedule.paused" : successful ? "schedule.completed" : terminalFailure ? "schedule.terminal" : "schedule.failed",
         { status: summary.status, nextRunAt, error },
         eventTaskId,
         summary.runId === "unknown" ? null : summary.runId,
@@ -153,4 +158,4 @@ export class SchedulerDaemon {
   }
 }
 
-export { MIN_SCHEDULE_INTERVAL_MS, nextOccurrence } from "./expressions";
+export { MAX_SCHEDULE_ATTEMPTS, MIN_SCHEDULE_INTERVAL_MS, nextOccurrence, validateScheduleWorkspace } from "./expressions";

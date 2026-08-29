@@ -14,5 +14,7 @@ test("--help prints actionable commands and exits cleanly", () => {
   expect(output[0]).toContain("kestrel schedule");
   expect(output[0]).toContain("kestrel tick");
   expect(output[0]).toContain("kestrel daemon");
+  expect(output[0]).toContain("kestrel memory list");
+  expect(output[0]).toContain("kestrel self inspect");
   expect(output[0]).toContain("KESTREL_MODEL_BASE_URL");
 });

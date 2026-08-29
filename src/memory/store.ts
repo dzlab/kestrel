@@ -28,6 +28,7 @@ function memoryId(input: MemorySaveInput, tags: string[]): string {
     content: input.content,
     tags,
     source: input.source,
+    sourceTaskId: input.sourceTaskId,
   })).digest("hex")}`;
 }
 
@@ -50,6 +51,10 @@ function validateCommon(input: MemorySaveInput): string[] {
   if (input.content.trim().length === 0) throw new ValidationError("memory content must be non-empty");
   if (Buffer.byteLength(input.content, "utf8") > MAX_MEMORY_CONTENT_BYTES) throw new ValidationError("memory content is too large");
   if (input.source.trim().length === 0) throw new ValidationError("memory source must be non-empty");
+  if (input.sourceTaskId.trim().length === 0) throw new ValidationError("memory source task id must be non-empty");
+  if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
+    throw new ValidationError("memory confidence must be between 0 and 1");
+  }
   if (input.expiresAt !== undefined && input.expiresAt !== null && (!Number.isFinite(input.expiresAt) || input.expiresAt < 0)) {
     throw new ValidationError("memory expiry must be a non-negative timestamp");
   }
@@ -66,6 +71,8 @@ function fromPersisted(record: PersistedMemoryRecord): MemoryRecord {
     content: record.content,
     tags: record.tags ?? [],
     source: record.source ?? record.taskId ?? "legacy",
+    sourceTaskId: record.sourceTaskId ?? "legacy",
+    confidence: record.confidence ?? 0,
     runId: record.sourceRunId ?? record.runId ?? null,
     createdAt: record.createdAt ?? 0,
     updatedAt: record.updatedAt ?? 0,
@@ -79,6 +86,9 @@ export class MemoryStore {
   save(input: MemorySaveInput): MemoryRecord {
     const now = input.now ?? this.clock();
     const tags = validateCommon(input);
+    if (this.repository.getTask(input.sourceTaskId) === null) {
+      throw new ValidationError("memory source task was not found");
+    }
     const id = memoryId(input, tags);
     const persisted: PersistedMemoryRecord = {
       id,
@@ -87,13 +97,14 @@ export class MemoryStore {
       taskId: input.taskId,
       runId: input.runId,
       metadata: {},
-      confidence: null,
+      confidence: input.confidence,
       createdAt: now,
       updatedAt: now,
       scope: input.scope,
       userId: input.userId,
       tags,
       source: input.source,
+      sourceTaskId: input.sourceTaskId,
       sourceRunId: input.runId,
       expiresAt: input.expiresAt ?? null,
     };

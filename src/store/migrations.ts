@@ -292,6 +292,30 @@ const versionEightSql = `
       WHERE name = '';
     `;
 
+const versionNineSql = `
+      ALTER TABLE memories ADD COLUMN source_task_id TEXT NOT NULL DEFAULT 'legacy';
+      DROP TRIGGER IF EXISTS tasks_status_insert_guard;
+      DROP TRIGGER IF EXISTS tasks_status_update_guard;
+      DROP TRIGGER IF EXISTS runs_status_insert_guard;
+      DROP TRIGGER IF EXISTS runs_status_update_guard;
+      CREATE TRIGGER tasks_status_insert_guard
+      BEFORE INSERT ON tasks
+      WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+      BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+      CREATE TRIGGER tasks_status_update_guard
+      BEFORE UPDATE OF status ON tasks
+      WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+      BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+      CREATE TRIGGER runs_status_insert_guard
+      BEFORE INSERT ON runs
+      WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+      BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+      CREATE TRIGGER runs_status_update_guard
+      BEFORE UPDATE OF status ON runs
+      WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+      BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -307,6 +331,7 @@ export const migrations: readonly Migration[] = [
   { version: 6, sql: versionSixSql },
   { version: 7, sql: versionSevenSql },
   { version: 8, sql: versionEightSql },
+  { version: 9, sql: versionNineSql, prepare: prepareVersionNine },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -377,6 +402,7 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "source", type: "TEXT" },
     { name: "source_run_id", type: "TEXT" },
     { name: "expires_at", type: "INTEGER" },
+    { name: "source_task_id", type: "TEXT" },
   ],
   schedules: [
     { name: "id", type: "TEXT" },
@@ -438,7 +464,7 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   messages: ["run_id", "sequence_number", "payload", "created_at"],
   tool_calls: ["run_id", "call_id", "name", "arguments", "state", "created_at"],
   events: ["type", "payload", "created_at"],
-  memories: ["kind", "content", "metadata", "created_at", "updated_at", "scope", "user_id", "tags", "source"],
+  memories: ["kind", "content", "metadata", "created_at", "updated_at", "scope", "user_id", "tags", "source", "source_task_id"],
   schedules: ["prompt", "enabled", "created_at", "name", "workspace", "time_zone", "attempts"],
   approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at", "version"],
 };
@@ -774,6 +800,202 @@ function prepareVersionFour(database: Database): void {
     DROP TABLE schedules;
     ALTER TABLE schedules_v4 RENAME TO schedules;
   `);
+}
+
+// The hardened v1 lineage put the run/task status allow-list in inline CHECK
+// constraints. SQLite cannot alter those constraints, so rebuild the schema
+// before v9 installs the trigger guards that include the new cancelled state.
+// Rebuild every table so foreign-key metadata continues to refer to the new
+// parent tables, while copying all data and AUTOINCREMENT high-water marks.
+function prepareVersionNine(database: Database): void {
+  if (!schemaLineageFor(database, true).hasInlineStatusChecks) {
+    return;
+  }
+
+  const backupTables = [
+    "tasks",
+    "runs",
+    "messages",
+    "tool_calls",
+    "events",
+    "memories",
+    "schedules",
+    "approvals",
+  ] as const;
+
+  database.exec("CREATE TEMP TABLE _kestrel_v9_sequences AS SELECT name, seq FROM sqlite_sequence");
+  for (const table of backupTables) {
+    database.exec(`CREATE TEMP TABLE _kestrel_v9_${table} AS SELECT * FROM ${table}`);
+  }
+
+  const indexes = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
+    .all() as Array<{ name: string }>;
+  for (const index of indexes) {
+    database.exec(`DROP INDEX ${quoteIdentifier(index.name)}`);
+  }
+  database.exec(`
+    DROP TRIGGER IF EXISTS tasks_status_insert_guard;
+    DROP TRIGGER IF EXISTS tasks_status_update_guard;
+    DROP TRIGGER IF EXISTS runs_status_insert_guard;
+    DROP TRIGGER IF EXISTS runs_status_update_guard;
+    DROP TABLE approvals;
+    DROP TABLE schedules;
+    DROP TABLE memories;
+    DROP TABLE events;
+    DROP TABLE tool_calls;
+    DROP TABLE messages;
+    DROP TABLE runs;
+    DROP TABLE tasks;
+  `);
+
+  database.exec(`
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      workspace TEXT NOT NULL,
+      max_steps INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      idempotency_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      UNIQUE (task_id, idempotency_key)
+    );
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      sequence_number INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      UNIQUE (run_id, sequence_number)
+    );
+    CREATE TABLE tool_calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      call_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      arguments TEXT NOT NULL,
+      state TEXT NOT NULL,
+      result TEXT,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER
+    );
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT REFERENCES tasks(id),
+      run_id TEXT REFERENCES runs(id),
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY,
+      task_id TEXT REFERENCES tasks(id),
+      run_id TEXT REFERENCES runs(id),
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      metadata TEXT NOT NULL,
+      confidence REAL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      scope TEXT NOT NULL DEFAULT 'legacy',
+      user_id TEXT NOT NULL DEFAULT 'legacy',
+      tags TEXT NOT NULL DEFAULT '[]',
+      source TEXT NOT NULL DEFAULT 'legacy',
+      source_run_id TEXT,
+      expires_at INTEGER
+    );
+    CREATE TABLE schedules (
+      id TEXT PRIMARY KEY,
+      task_id TEXT REFERENCES tasks(id),
+      prompt TEXT NOT NULL,
+      cron TEXT,
+      next_run_at INTEGER,
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      lease_token TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      workspace TEXT NOT NULL DEFAULT '',
+      rrule TEXT,
+      interval_ms INTEGER,
+      time_zone TEXT NOT NULL DEFAULT 'UTC',
+      lease_until INTEGER,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_run_at INTEGER,
+      pending_run_id TEXT,
+      pending_approval_id TEXT,
+      CHECK (
+        (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+        OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
+      )
+    );
+    CREATE TABLE approvals (
+      call_id TEXT NOT NULL,
+      arguments_hash TEXT NOT NULL,
+      task_id TEXT REFERENCES tasks(id),
+      run_id TEXT REFERENCES runs(id),
+      capability TEXT NOT NULL,
+      risk_level TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+      requested_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      tool TEXT NOT NULL DEFAULT '',
+      expires_at INTEGER NOT NULL DEFAULT 0,
+      consumed_at INTEGER,
+      expired_at INTEGER,
+      version INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (call_id, arguments_hash)
+    );
+  `);
+
+  for (const table of backupTables) {
+    database.exec(`INSERT INTO ${table} SELECT * FROM _kestrel_v9_${table}`);
+  }
+  for (const index of requiredIndexes) {
+    database.exec(index.sql);
+  }
+  database.exec(`
+    CREATE TRIGGER tasks_status_insert_guard
+    BEFORE INSERT ON tasks
+    WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+    BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+    CREATE TRIGGER tasks_status_update_guard
+    BEFORE UPDATE OF status ON tasks
+    WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+    BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;
+    CREATE TRIGGER runs_status_insert_guard
+    BEFORE INSERT ON runs
+    WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+    BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+    CREATE TRIGGER runs_status_update_guard
+    BEFORE UPDATE OF status ON runs
+    WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
+    BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;
+  `);
+
+  const sequences = database
+    .query("SELECT name, seq FROM _kestrel_v9_sequences")
+    .all() as Array<{ name: string; seq: number }>;
+  for (const sequence of sequences) {
+    database
+      .query("INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES (?, ?)")
+      .run(sequence.name, sequence.seq);
+  }
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 type TableInfoRow = { name: string; type: string; notnull: number; pk: number };
@@ -1199,19 +1421,19 @@ function assertPreVersionTwoLineage(database: Database, hasChecksum: boolean): v
 const requiredTriggerDefinitions = [
   {
     name: "tasks_status_insert_guard",
-    sql: "CREATE TRIGGER tasks_status_insert_guard BEFORE INSERT ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
+    sql: "CREATE TRIGGER tasks_status_insert_guard BEFORE INSERT ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
   },
   {
     name: "tasks_status_update_guard",
-    sql: "CREATE TRIGGER tasks_status_update_guard BEFORE UPDATE OF status ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
+    sql: "CREATE TRIGGER tasks_status_update_guard BEFORE UPDATE OF status ON tasks WHEN NEW.status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled') BEGIN SELECT RAISE(ABORT, 'invalid task status'); END;",
   },
   {
     name: "runs_status_insert_guard",
-    sql: "CREATE TRIGGER runs_status_insert_guard BEFORE INSERT ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
+    sql: "CREATE TRIGGER runs_status_insert_guard BEFORE INSERT ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
   },
   {
     name: "runs_status_update_guard",
-    sql: "CREATE TRIGGER runs_status_update_guard BEFORE UPDATE OF status ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
+    sql: "CREATE TRIGGER runs_status_update_guard BEFORE UPDATE OF status ON runs WHEN NEW.status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled') BEGIN SELECT RAISE(ABORT, 'invalid run status'); END;",
   },
 ] as const;
 
@@ -1385,7 +1607,8 @@ const requiredCurrentTableDefinitions = [
         tags TEXT NOT NULL DEFAULT '[]',
         source TEXT NOT NULL DEFAULT 'legacy',
         source_run_id TEXT,
-        expires_at INTEGER
+        expires_at INTEGER,
+        source_task_id TEXT NOT NULL DEFAULT 'legacy'
       )
     `),
   },
@@ -1508,7 +1731,7 @@ function assertRequiredSchema(database: Database): void {
     database
       .query(
         `SELECT 1 AS invalid FROM tasks
-         WHERE status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+         WHERE status NOT IN ('pending', 'running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
          LIMIT 1`,
       )
       .get() !== null
@@ -1519,7 +1742,7 @@ function assertRequiredSchema(database: Database): void {
     database
       .query(
         `SELECT 1 AS invalid FROM runs
-         WHERE status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted')
+         WHERE status NOT IN ('running', 'completed', 'failed', 'blocked_on_approval', 'budget_exhausted', 'cancelled')
          LIMIT 1`,
       )
       .get() !== null
@@ -1690,7 +1913,12 @@ export function runMigrations(database: Database): void {
         checksum: string | null;
       }>,
     );
-    assertLineageSchema(database, schemaLineageFor(database, true), false);
+    const lineage = schemaLineageFor(database, true);
+    const historicalStatusConstraintsUpgraded = lineage.hasInlineStatusChecks &&
+      database.query("SELECT 1 FROM schema_migrations WHERE version = 9").get() !== null;
+    if (!historicalStatusConstraintsUpgraded) {
+      assertLineageSchema(database, lineage, false);
+    }
     assertRequiredSchema(database);
   });
 

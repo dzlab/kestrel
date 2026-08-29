@@ -31,16 +31,7 @@ export interface Tool {
   execute(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult>;
 }
 
-const trustedBuiltInTools = new WeakSet<object>();
-
-export function registerTrustedBuiltInTool<T extends object>(tool: T): T {
-  trustedBuiltInTools.add(tool);
-  return tool;
-}
-
-export function isTrustedBuiltInTool(tool: object): boolean {
-  return trustedBuiltInTools.has(tool);
-}
+export { isTrustedBuiltInTool } from "./trust";
 
 export function truncateUtf8(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, "utf8");

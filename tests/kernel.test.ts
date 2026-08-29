@@ -25,7 +25,7 @@ function toolCall(id: string, name: string, args: Record<string, unknown>): Mode
   };
 }
 
-function setup() {
+function setup(model: FakeModel = new FakeModel([assistant("default")])) {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-kernel-"));
   writeFileSync(join(workspace, "note.txt"), "bounded tool context\n");
   const database = openDatabase();
@@ -36,7 +36,7 @@ function setup() {
     database.close();
     rmSync(workspace, { recursive: true, force: true });
   };
-  return { workspace, database, repository, approvals, registry, cleanup };
+  return { workspace, database, repository, approvals, registry, model, cleanup };
 }
 
 test("runs multiple tool turns, persists messages/events, and returns the final answer", async () => {
@@ -168,6 +168,101 @@ test("bounds the system context and prior messages sent to the model", async () 
     const requestBytes = Buffer.byteLength(JSON.stringify(model.requests[0]), "utf8");
     expect(requestBytes).toBeLessThanOrEqual(1_200 + 4_500);
     expect(model.requests[0]?.messages).toHaveLength(2);
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("enforces maxTokens when the provider omits usage", async () => {
+  const state = setup();
+  try {
+    const model = new FakeModel([assistant("x".repeat(10_000))]);
+    const kernel = new RunKernel({ model, repository: state.repository, registry: state.registry });
+
+    const result = await kernel.run(
+      { title: "Token bound", prompt: "Answer", workspace: state.workspace },
+      { maxTokens: 1 },
+    );
+
+    expect(result.status).toBe("budget_exhausted");
+    expect(result.error).toMatch(/token/i);
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("cancels a pending model request and persists a distinct terminal status", async () => {
+  const state = setup();
+  try {
+    const model = {
+      async complete(request: { signal?: AbortSignal }): Promise<ModelResponse> {
+        return new Promise((_resolve, reject) => {
+          request.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+    };
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 10);
+    const result = await new RunKernel({ model, repository: state.repository, registry: state.registry }).run(
+      { title: "Cancel", prompt: "wait", workspace: state.workspace },
+      { signal: controller.signal, timeoutMs: 5_000 },
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(state.repository.getRun(result.runId)?.status).toBe("cancelled");
+    expect(Date.now() - started).toBeLessThan(500);
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("derives self-targeting policy from configured source roots", async () => {
+  const state = setup();
+  try {
+    const model = new FakeModel([{
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "self-patch",
+          name: "fs.patch",
+          arguments: { patch: "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-bounded tool context\n+self change\n" },
+        }],
+      },
+      finishReason: "tool_calls",
+    }]);
+    const result = await new RunKernel({
+      model,
+      repository: state.repository,
+      registry: state.registry,
+      selfPaths: [state.workspace],
+    }).run({ title: "Self patch", prompt: "patch the source", workspace: state.workspace });
+
+    expect(result.status).toBe("blocked_on_approval");
+    expect(state.approvals.get("self-patch")?.status).toBe("pending");
+    expect(state.repository.getEvents(result.runId).some((event) => event.type === "run.blocked_on_approval")).toBe(true);
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("cancellation aborts an active approved subprocess", async () => {
+  const state = setup(new FakeModel([
+    toolCall("sleep-call", "shell.exec", { argv: ["/bin/sleep", "1"], timeoutMs: 5_000 }),
+    assistant("unreachable"),
+  ]));
+  try {
+    const kernel = new RunKernel({ model: state.model, repository: state.repository, registry: state.registry });
+    const paused = await kernel.run({ title: "Cancel process", prompt: "run", workspace: state.workspace });
+    expect(paused).toMatchObject({ status: "blocked_on_approval" });
+    state.approvals.approve("sleep-call");
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 10);
+    const started = Date.now();
+    const result = await kernel.resume(paused.runId, { signal: controller.signal, timeoutMs: 5_000 });
+    expect(result.status).toBe("cancelled");
+    expect(Date.now() - started).toBeLessThan(500);
   } finally {
     state.cleanup();
   }

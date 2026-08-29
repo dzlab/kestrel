@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { createKestrel, loadConfig, openConfiguredDatabase } from "../index";
 import { SchedulerDaemon } from "../scheduler/daemon";
 import { StoreRepository } from "../store/repository";
+import { MemoryStore } from "../memory/store";
+import { SelfUpgrade } from "../upgrade/workflow";
 import type { ApprovalManager } from "../policy/approvals";
 import type { RunKernel, RunOptions } from "../kernel";
 
@@ -16,6 +18,9 @@ Usage:
   kestrel deny <call-id>           Deny the exact pending tool call
   kestrel history                  Show recent durable tasks
   kestrel status [task-or-run-id]  Show durable task or run status
+  kestrel memory list [limit]      Inspect recent durable memory
+  kestrel memory search <query>    Search durable memory for the local user
+  kestrel self inspect <run-id> [proposal-id]  Inspect an upgrade proposal
   kestrel schedule list             List schedules
   kestrel schedule cancel <id>     Cancel a schedule without deleting history
   kestrel tick                     Claim and run one due schedule
@@ -179,6 +184,53 @@ async function statusCommand(args: readonly string[], write: (message: string) =
   }
 }
 
+async function memoryCommand(args: readonly string[], write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
+  const action = args[1];
+  if (action !== "list" && action !== "search") {
+    write("memory requires list or search");
+    return 1;
+  }
+  const selected = runtime === undefined
+    ? (() => {
+        const config = loadConfig();
+        const database = openConfiguredDatabase(config);
+        return { runtime: { repository: new StoreRepository(database) } as CliRuntime, owned: true, close: () => database.close() };
+      })()
+    : { runtime, owned: false, close: () => undefined };
+  try {
+    if (action === "list") {
+      const limit = args[2] === undefined ? 50 : Number(args[2]);
+      write(JSON.stringify(selected.runtime.repository.listMemories(limit)));
+      return 0;
+    }
+    const query = args.slice(2).join(" ").trim();
+    if (query.length === 0) {
+      write("memory search requires a query");
+      return 1;
+    }
+    write(JSON.stringify(new MemoryStore(selected.runtime.repository).search({ query, userId: "local", taskId: null })));
+    return 0;
+  } finally {
+    if (selected.owned) selected.close();
+  }
+}
+
+async function selfCommand(args: readonly string[], write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
+  if (args[1] !== "inspect" || args[2] === undefined || args[2].length === 0) {
+    write("self inspect requires a run id");
+    return 1;
+  }
+  const selected = getRuntime(runtime);
+  try {
+    const proposal = new SelfUpgrade({ repository: selected.runtime.repository, approvals: selected.runtime.approvals })
+      .status(args[2], args[3]);
+    write(JSON.stringify(proposal));
+    return proposal === null ? 1 : 0;
+  } finally {
+    if (selected.owned) selected.runtime.close?.();
+  }
+}
+
 async function tickCommand(write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
   const selected = getRuntime(runtime);
   try {
@@ -272,6 +324,14 @@ export function runCli(
     return 1;
   });
   if (command === "status") return statusCommand(args, write).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
+  if (command === "memory") return memoryCommand(args, write, runtime).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
+  if (command === "self") return selfCommand(args, write, runtime).catch((error) => {
     write(error instanceof Error ? error.message : String(error));
     return 1;
   });
