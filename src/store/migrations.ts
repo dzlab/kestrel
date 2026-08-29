@@ -275,6 +275,23 @@ const versionSevenSql = `
       ALTER TABLE memories ADD COLUMN expires_at INTEGER;
     `;
 
+const versionEightSql = `
+      ALTER TABLE schedules ADD COLUMN name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE schedules ADD COLUMN workspace TEXT NOT NULL DEFAULT '';
+      ALTER TABLE schedules ADD COLUMN rrule TEXT;
+      ALTER TABLE schedules ADD COLUMN interval_ms INTEGER;
+      ALTER TABLE schedules ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC';
+      ALTER TABLE schedules ADD COLUMN lease_until INTEGER;
+      ALTER TABLE schedules ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE schedules ADD COLUMN last_run_at INTEGER;
+      ALTER TABLE schedules ADD COLUMN pending_run_id TEXT;
+      ALTER TABLE schedules ADD COLUMN pending_approval_id TEXT;
+      UPDATE schedules
+      SET name = id,
+          lease_until = CASE WHEN claimed_at IS NULL THEN NULL ELSE claimed_at + 60000 END
+      WHERE name = '';
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -289,6 +306,7 @@ export const migrations: readonly Migration[] = [
   { version: 5, sql: versionFiveSql },
   { version: 6, sql: versionSixSql },
   { version: 7, sql: versionSevenSql },
+  { version: 8, sql: versionEightSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -372,6 +390,16 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "lease_token", type: "TEXT" },
     { name: "last_error", type: "TEXT" },
     { name: "created_at", type: "INTEGER" },
+    { name: "name", type: "TEXT" },
+    { name: "workspace", type: "TEXT" },
+    { name: "rrule", type: "TEXT" },
+    { name: "interval_ms", type: "INTEGER" },
+    { name: "time_zone", type: "TEXT" },
+    { name: "lease_until", type: "INTEGER" },
+    { name: "attempts", type: "INTEGER" },
+    { name: "last_run_at", type: "INTEGER" },
+    { name: "pending_run_id", type: "TEXT" },
+    { name: "pending_approval_id", type: "TEXT" },
   ],
   approvals: [
     { name: "call_id", type: "TEXT" },
@@ -411,7 +439,7 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   tool_calls: ["run_id", "call_id", "name", "arguments", "state", "created_at"],
   events: ["type", "payload", "created_at"],
   memories: ["kind", "content", "metadata", "created_at", "updated_at", "scope", "user_id", "tags", "source"],
-  schedules: ["prompt", "enabled", "created_at"],
+  schedules: ["prompt", "enabled", "created_at", "name", "workspace", "time_zone", "attempts"],
   approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at", "version"],
 };
 
@@ -425,6 +453,20 @@ const legacyMemoryColumns: readonly ColumnDefinition[] = [
   { name: "confidence", type: "REAL" },
   { name: "created_at", type: "INTEGER" },
   { name: "updated_at", type: "INTEGER" },
+];
+
+const legacyScheduleColumns: readonly ColumnDefinition[] = [
+  { name: "id", type: "TEXT" },
+  { name: "task_id", type: "TEXT" },
+  { name: "prompt", type: "TEXT" },
+  { name: "cron", type: "TEXT" },
+  { name: "next_run_at", type: "INTEGER" },
+  { name: "enabled", type: "INTEGER" },
+  { name: "claimed_by", type: "TEXT" },
+  { name: "claimed_at", type: "INTEGER" },
+  { name: "lease_token", type: "TEXT" },
+  { name: "last_error", type: "TEXT" },
+  { name: "created_at", type: "INTEGER" },
 ];
 
 const legacyApprovalColumns: readonly ColumnDefinition[] = [
@@ -742,10 +784,16 @@ function tableInfo(database: Database, table: string): TableInfoRow[] {
 
 function assertScheduleLeaseTuples(database: Database): void {
   const hasLeaseToken = tableInfo(database, "schedules").some((column) => column.name === "lease_token");
+  const hasLeaseUntil = tableInfo(database, "schedules").some((column) => column.name === "lease_until");
   const malformedLease = hasLeaseToken
-    ? `
-       (claimed_by IS NULL) != (claimed_at IS NULL)
-       OR (claimed_by IS NULL) != (lease_token IS NULL)`
+    ? hasLeaseUntil
+      ? `
+         (claimed_by IS NULL) != (claimed_at IS NULL)
+         OR (claimed_by IS NULL) != (lease_token IS NULL)
+         OR (claimed_by IS NULL) != (lease_until IS NULL)`
+      : `
+         (claimed_by IS NULL) != (claimed_at IS NULL)
+         OR (claimed_by IS NULL) != (lease_token IS NULL)`
     : `(claimed_by IS NULL) != (claimed_at IS NULL)`;
   const malformed = database
     .query(
@@ -1059,7 +1107,9 @@ function assertHistoricalLineageTables(database: Database, lineage: SchemaLineag
   for (const table of lineageTables) {
     const columns = (table === "approvals"
       ? legacyApprovalColumns
-      : table === "memories" ? legacyMemoryColumns : requiredTableColumns[table])
+      : table === "memories" ? legacyMemoryColumns
+        : table === "schedules" ? legacyScheduleColumns
+          : requiredTableColumns[table])
       .filter((column) => column.name !== "lease_token");
     if (!hasTable(database, table)) {
       fail(`migration 1 checksum does not match the schema lineage for table ${table}`);
@@ -1207,6 +1257,39 @@ const requiredTableDefinitions = [
   },
 ] as const;
 
+const currentScheduleTableDefinition = {
+  table: "schedules",
+  sql: normalizedSql(`
+    CREATE TABLE "schedules" (
+      id TEXT PRIMARY KEY,
+      task_id TEXT REFERENCES tasks(id),
+      prompt TEXT NOT NULL,
+      cron TEXT,
+      next_run_at INTEGER,
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      lease_token TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      workspace TEXT NOT NULL DEFAULT '',
+      rrule TEXT,
+      interval_ms INTEGER,
+      time_zone TEXT NOT NULL DEFAULT 'UTC',
+      lease_until INTEGER,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_run_at INTEGER,
+      pending_run_id TEXT,
+      pending_approval_id TEXT,
+      CHECK (
+        (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
+        OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL)
+      )
+    )
+  `),
+} as const;
+
 const currentApprovalTableDefinition = {
   table: "approvals",
   sql: normalizedSql(`
@@ -1333,7 +1416,7 @@ function assertRequiredSchema(database: Database): void {
     assertForeignKeys(database, table, requiredForeignKeys[table]);
   }
 
-  for (const requiredTable of requiredTableDefinitions.filter((table) => table.table !== "approvals")) {
+  for (const requiredTable of [currentScheduleTableDefinition]) {
     const actual = database
       .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(requiredTable.table) as { sql: string } | null;

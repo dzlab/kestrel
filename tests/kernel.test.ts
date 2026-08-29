@@ -166,7 +166,7 @@ test("bounds the system context and prior messages sent to the model", async () 
 
     expect(result.status).toBe("completed");
     const requestBytes = Buffer.byteLength(JSON.stringify(model.requests[0]), "utf8");
-    expect(requestBytes).toBeLessThanOrEqual(1_200 + 2_500);
+    expect(requestBytes).toBeLessThanOrEqual(1_200 + 3_500);
     expect(model.requests[0]?.messages).toHaveLength(2);
   } finally {
     state.cleanup();

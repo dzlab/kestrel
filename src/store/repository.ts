@@ -96,14 +96,25 @@ export type MemorySearchOptions = {
 
 export type ScheduleRecord = {
   id: string;
+  name?: string;
+  workspace?: string;
   prompt: string;
   nextRunAt: number | null;
   taskId?: string | null;
   cron?: string | null;
+  rrule?: string | null;
+  intervalMs?: number | null;
+  timeZone?: string;
   enabled?: boolean;
   claimedBy?: string | null;
+  owner?: string | null;
   claimedAt?: number | null;
+  leaseUntil?: number | null;
   leaseToken?: string | null;
+  attempts?: number;
+  lastRunAt?: number | null;
+  pendingRunId?: string | null;
+  pendingApprovalId?: string | null;
   lastError?: string | null;
   createdAt?: number;
 };
@@ -292,19 +303,31 @@ function scheduleFromRow(row: Row): ScheduleRecord {
   const hasClaimedBy = row.claimed_by !== null && row.claimed_by !== undefined;
   const hasClaimedAt = row.claimed_at !== null && row.claimed_at !== undefined;
   const hasLeaseToken = row.lease_token !== null && row.lease_token !== undefined;
-  if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken) {
+  const hasLeaseUntil = row.lease_until !== null && row.lease_until !== undefined;
+  if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken || hasClaimedBy !== hasLeaseUntil) {
     throw new PersistenceError(`invalid persisted schedule lease tuple for ${String(row.id)}`);
   }
   return {
     id: String(row.id),
+    name: row.name === null || row.name === undefined || String(row.name).length === 0 ? String(row.id) : String(row.name),
+    workspace: row.workspace === null || row.workspace === undefined ? "" : String(row.workspace),
     prompt: String(row.prompt),
     nextRunAt: row.next_run_at === null || row.next_run_at === undefined ? null : Number(row.next_run_at),
     taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
     cron: row.cron === null || row.cron === undefined ? null : String(row.cron),
+    rrule: row.rrule === null || row.rrule === undefined ? null : String(row.rrule),
+    intervalMs: row.interval_ms === null || row.interval_ms === undefined ? null : Number(row.interval_ms),
+    timeZone: row.time_zone === null || row.time_zone === undefined ? "UTC" : String(row.time_zone),
     enabled: row.enabled === 1,
     claimedBy: row.claimed_by === null || row.claimed_by === undefined ? null : String(row.claimed_by),
+    owner: row.claimed_by === null || row.claimed_by === undefined ? null : String(row.claimed_by),
     claimedAt: row.claimed_at === null || row.claimed_at === undefined ? null : Number(row.claimed_at),
+    leaseUntil: row.lease_until === null || row.lease_until === undefined ? null : Number(row.lease_until),
     leaseToken: row.lease_token === null || row.lease_token === undefined ? null : String(row.lease_token),
+    attempts: row.attempts === null || row.attempts === undefined ? 0 : Number(row.attempts),
+    lastRunAt: row.last_run_at === null || row.last_run_at === undefined ? null : Number(row.last_run_at),
+    pendingRunId: row.pending_run_id === null || row.pending_run_id === undefined ? null : String(row.pending_run_id),
+    pendingApprovalId: row.pending_approval_id === null || row.pending_approval_id === undefined ? null : String(row.pending_approval_id),
     lastError: row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
     createdAt: Number(row.created_at),
   };
@@ -748,15 +771,17 @@ export class StoreRepository {
     const hasClaimedBy = input.claimedBy !== null && input.claimedBy !== undefined;
     const hasClaimedAt = input.claimedAt !== null && input.claimedAt !== undefined;
     const hasLeaseToken = input.leaseToken !== null && input.leaseToken !== undefined;
-    if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken) {
+    const hasLeaseUntil = input.leaseUntil !== null && input.leaseUntil !== undefined;
+    if (hasClaimedBy !== hasClaimedAt || hasClaimedBy !== hasLeaseToken || hasClaimedBy !== hasLeaseUntil) {
       throw new PersistenceError("schedule claimed_by, claimed_at, and lease_token must be all set or all null");
     }
     immediateTransaction(this.database, () => {
       this.database
         .query(
           `INSERT INTO schedules
-            (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, task_id, prompt, cron, next_run_at, enabled, claimed_by, claimed_at, lease_token, last_error, created_at,
+             name, workspace, rrule, interval_ms, time_zone, lease_until, attempts, last_run_at, pending_run_id, pending_approval_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.id,
@@ -770,12 +795,21 @@ export class StoreRepository {
           input.leaseToken ?? null,
           input.lastError ?? null,
           input.createdAt ?? Date.now(),
+          input.name ?? input.id,
+          input.workspace ?? "",
+          input.rrule ?? null,
+          input.intervalMs ?? null,
+          input.timeZone ?? "UTC",
+          input.leaseUntil ?? null,
+          input.attempts ?? 0,
+          input.lastRunAt ?? null,
+          input.pendingRunId ?? null,
+          input.pendingApprovalId ?? null,
         );
     });
   }
 
   claimDueSchedule(now: number, owner: string): ScheduleRecord | null {
-    const staleBefore = now - SCHEDULE_LEASE_TIMEOUT_MS;
     return immediateTransaction(this.database, () => {
       const row = this.database
         .query(
@@ -783,12 +817,13 @@ export class StoreRepository {
            WHERE enabled = 1 AND next_run_at <= ?
              AND (
                (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
-               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND claimed_at <= ?)
+               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL
+                   AND (lease_until IS NULL OR lease_until <= ?))
              )
            ORDER BY next_run_at, id
            LIMIT 1`,
         )
-        .get(now, staleBefore) as { id: string } | null;
+        .get(now, now) as { id: string } | null;
       if (row === null) {
         return null;
       }
@@ -797,14 +832,15 @@ export class StoreRepository {
       const updated = this.database
         .query(
           `UPDATE schedules
-           SET claimed_by = ?, claimed_at = ?, lease_token = ?
+           SET claimed_by = ?, claimed_at = ?, lease_token = ?, lease_until = ?
            WHERE id = ? AND enabled = 1 AND next_run_at <= ?
              AND (
                (claimed_by IS NULL AND claimed_at IS NULL AND lease_token IS NULL)
-               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND claimed_at <= ?)
+               OR (claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL
+                   AND (lease_until IS NULL OR lease_until <= ?))
              )`,
         )
-        .run(owner, now, leaseToken, row.id, now, staleBefore);
+        .run(owner, now, leaseToken, now + SCHEDULE_LEASE_TIMEOUT_MS, row.id, now, now);
       if (updated.changes !== 1) {
         return null;
       }
@@ -814,17 +850,16 @@ export class StoreRepository {
   }
 
   renewScheduleLease(id: string, owner: string, leaseToken: string, now: number): boolean {
-    const staleBefore = now - SCHEDULE_LEASE_TIMEOUT_MS;
     return immediateTransaction(this.database, () => {
       const update = this.database
         .query(
           `UPDATE schedules
-           SET claimed_at = ?
+           SET claimed_at = ?, lease_until = ?
            WHERE id = ? AND claimed_by = ? AND lease_token = ?
              AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND lease_token IS NOT NULL
-             AND claimed_at > ?`,
+             AND (lease_until IS NULL OR lease_until > ?)`,
         )
-        .run(now, id, owner, leaseToken, staleBefore);
+        .run(now, now + SCHEDULE_LEASE_TIMEOUT_MS, id, owner, leaseToken, now);
       return update.changes === 1;
     });
   }
@@ -840,12 +875,85 @@ export class StoreRepository {
       const update = this.database
         .query(
           `UPDATE schedules
-           SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL,
+           SET next_run_at = ?, last_error = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_until = NULL,
                enabled = CASE WHEN ? IS NULL THEN 0 ELSE enabled END
            WHERE id = ? AND claimed_by = ? AND claimed_at IS NOT NULL AND lease_token IS NOT NULL AND lease_token = ?`,
         )
         .run(nextRunAt, error, nextRunAt, id, owner, leaseToken);
       return update.changes === 1;
+    });
+  }
+
+  listSchedules(): ScheduleRecord[] {
+    return (this.database.query("SELECT * FROM schedules ORDER BY created_at, id").all() as Row[]).map(scheduleFromRow);
+  }
+
+  cancelSchedule(id: string): boolean {
+    return immediateTransaction(this.database, () => {
+      const update = this.database
+        .query("UPDATE schedules SET enabled = 0, next_run_at = NULL, claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_until = NULL WHERE id = ?")
+        .run(id);
+      return update.changes === 1;
+    });
+  }
+
+  releaseScheduleLease(id: string, owner: string, leaseToken: string): boolean {
+    return immediateTransaction(this.database, () => {
+      const update = this.database
+        .query(
+          `UPDATE schedules SET claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_until = NULL
+           WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
+        )
+        .run(id, owner, leaseToken);
+      return update.changes === 1;
+    });
+  }
+
+  finishScheduleRun(input: {
+    id: string;
+    owner: string;
+    leaseToken: string;
+    taskId?: string | null;
+    nextRunAt: number | null;
+    error: string | null;
+    enabled: boolean;
+    attempts: number;
+    lastRunAt: number;
+    pendingRunId?: string | null;
+    pendingApprovalId?: string | null;
+    now?: number;
+  }): boolean {
+    return immediateTransaction(this.database, () => {
+      const now = input.now ?? Date.now();
+      const update = this.database
+        .query(
+          `UPDATE schedules
+           SET task_id = COALESCE(?, task_id), next_run_at = ?, last_error = ?, enabled = ?, attempts = ?, last_run_at = ?,
+               pending_run_id = ?, pending_approval_id = ?, claimed_by = NULL, claimed_at = NULL, lease_token = NULL, lease_until = NULL
+           WHERE id = ? AND claimed_by = ? AND lease_token = ?`,
+        )
+        .run(
+          input.taskId ?? null,
+          input.nextRunAt,
+          input.error,
+          input.enabled ? 1 : 0,
+          input.attempts,
+          input.lastRunAt,
+          input.pendingRunId ?? null,
+          input.pendingApprovalId ?? null,
+          input.id,
+          input.owner,
+          input.leaseToken,
+        );
+      return update.changes === 1;
+    });
+  }
+
+  appendScheduleEvent(scheduleId: string, type: string, payload: unknown, taskId?: string | null, runId?: string | null): void {
+    immediateTransaction(this.database, () => {
+      this.database
+        .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(taskId ?? null, runId ?? null, type, json({ scheduleId, ...((payload !== null && typeof payload === "object") ? payload : { value: payload }) }), Date.now());
     });
   }
 
