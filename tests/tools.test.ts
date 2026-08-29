@@ -3,18 +3,25 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { dlopen, FFIType } from "bun:ffi";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ValidationError } from "../src/errors";
+import { createFilesystemTools, resolveWorkspacePath } from "../src/tools/filesystem";
 import { ToolRegistry, createToolRegistry } from "../src/tools/registry";
-import { resolveWorkspacePath } from "../src/tools/filesystem";
 import { MAX_READ_BYTES, MAX_TOOL_OUTPUT_BYTES } from "../src/tools/types";
 import type { ToolContext } from "../src/tools/types";
+
+const libc = dlopen("/usr/lib/libSystem.B.dylib", {
+  mkfifo: { args: [FFIType.cstring, FFIType.u16], returns: FFIType.i32 },
+});
 
 function withWorkspace<T>(callback: (workspace: string, context: ToolContext) => T | Promise<T>): T | Promise<T> {
   const workspace = mkdtempSync(join(tmpdir(), "kestrel-tools-"));
@@ -45,6 +52,27 @@ test("registry rejects malformed, unknown, and schema-invalid tool calls", async
   await expect(registry.execute({ name: "fs.read", arguments: { path: "x" } }, context)).rejects.toThrow(
     ValidationError,
   );
+});
+
+test("registry rejects malformed tool schemas instead of silently accepting arguments", () => {
+  const tool = {
+    definition: {
+      name: "broken",
+      description: "broken schema",
+      capability: "filesystem",
+      inputSchema: {
+        type: "object",
+        properties: { value: { type: "unsupported" } },
+        required: ["missing"],
+        additionalProperties: false,
+      },
+    },
+    async execute() {
+      return { ok: true, content: "executed" };
+    },
+  };
+
+  expect(() => new ToolRegistry([tool])).toThrow(ValidationError);
 });
 
 test("lists and reads workspace files with a bounded read", async () => {
@@ -182,6 +210,109 @@ test("patch validates every target before changing any file", async () => {
     );
     expect(result.ok).toBe(false);
     expect(readFileSync(join(workspace, "safe.txt"), "utf8")).toBe("safe\n");
+  });
+});
+
+test("patch-created files preserve the patch newline semantics", async () => {
+  await withWorkspace(async (workspace, context) => {
+    const result = await createToolRegistry().execute(
+      {
+        id: "create-newline",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace, "created.txt"), "utf8")).toBe("created\n");
+
+    const noNewline = await createToolRegistry().execute(
+      {
+        id: "create-no-newline",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- /dev/null\n+++ b/no-newline.txt\n@@ -0,0 +1 @@\n+created\n\\ No newline at end of file\n",
+        },
+      },
+      context,
+    );
+
+    expect(noNewline.ok).toBe(true);
+    expect(readFileSync(join(workspace, "no-newline.txt"), "utf8")).toBe("created");
+  });
+});
+
+test("patch rejects non-empty lines between headers and hunks", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "target.txt"), "before\n");
+    const result = await createToolRegistry().execute(
+      {
+        id: "malformed-patch",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/target.txt\n+++ b/target.txt\nunexpected\n@@ -1 +1 @@\n-before\n+after\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("before\n");
+  });
+});
+
+test("read rejects a FIFO without blocking", async () => {
+  await withWorkspace(async (workspace, context) => {
+    const fifo = join(workspace, "pipe");
+    expect(libc.symbols.mkfifo(fifo, 0o600)).toBe(0);
+
+    const result = await Promise.race([
+      createToolRegistry().execute(
+        { id: "read-fifo", name: "fs.read", arguments: { path: "pipe" } },
+        context,
+      ),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("FIFO read blocked")), 250)),
+    ]);
+
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("regular file");
+  });
+});
+
+test("patch retains the only backup when restoration fails", async () => {
+  await withWorkspace(async (workspace, context) => {
+    writeFileSync(join(workspace, "safe.txt"), "original\n");
+    const registry = new ToolRegistry(
+      createFilesystemTools({
+        afterInstall(path) {
+          if (path.endsWith("safe.txt")) {
+            unlinkSync(path);
+            mkdirSync(path);
+            throw new Error("force rollback");
+          }
+        },
+      }),
+    );
+
+    const result = await registry.execute(
+      {
+        id: "failed-rollback",
+        name: "fs.patch",
+        arguments: {
+          patch: "--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-original\n+changed\n",
+        },
+      },
+      context,
+    );
+
+    expect(result.ok).toBe(false);
+    const backups = readdirSync(workspace).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(workspace, backups[0]!), "utf8")).toBe("original\n");
+    expect(result.content).toContain("backup");
   });
 });
 

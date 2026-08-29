@@ -1,33 +1,28 @@
 import {
-  mkdir,
-  open,
-  readdir,
-  rename,
-  rmdir,
-  unlink,
-} from "node:fs/promises";
-import {
-  constants,
   lstatSync,
   realpathSync,
 } from "node:fs";
-import type { Dirent, Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ToolExecutionError, ValidationError } from "../errors";
 import type { Tool } from "./types";
 import {
-  MAX_READ_BYTES,
   boundToolResult,
-  truncateUtf8,
 } from "./types";
 import type { ToolContext, ToolResult } from "./types";
-
-const NO_FOLLOW = constants.O_NOFOLLOW;
-const READ_DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | NO_FOLLOW;
-const READ_FILE_FLAGS = constants.O_RDONLY | NO_FOLLOW;
-const WRITE_FILE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NO_FOLLOW;
-const CREATE_FILE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NO_FOLLOW;
+import {
+  closeSecureFile,
+  closeSecureParent,
+  createPatchTemp,
+  openPatchTarget,
+  openSecureParent,
+  readWorkspaceText,
+  renameAt,
+  safeDirectoryEntries,
+  unlinkAt,
+  workspacePathInfo,
+  writeWorkspaceText,
+} from "./secure-fs";
 
 function stringArgument(args: Record<string, unknown>, name: string): string {
   const value = args[name];
@@ -144,127 +139,10 @@ function result(content: string, data?: unknown): ToolResult {
   return boundToolResult({ ok: true, content, ...(data === undefined ? {} : { data }) });
 }
 
-async function withOpenFile<T>(path: string, callback: (handle: Awaited<ReturnType<typeof open>>) => Promise<T>): Promise<T> {
-  // O_NOFOLLOW makes the final component fail closed if it is replaced by a
-  // symlink. Node/Bun expose no openat-style parent directory traversal, so
-  // callers also validate canonical components immediately before opening.
-  const handle = await open(path, READ_FILE_FLAGS);
-  try {
-    return await callback(handle);
-  } finally {
-    await handle.close();
-  }
-}
-
-export async function readWorkspaceText(path: string): Promise<{ content: string; truncated: boolean }> {
-  return withOpenFile(path, async (handle) => {
-    const info = await handle.stat();
-    if (!info.isFile()) throw new ToolExecutionError("path is not a regular file");
-    const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
-    const content = buffer.subarray(0, bytesRead).toString("utf8");
-    return { content: truncateUtf8(content, MAX_READ_BYTES), truncated: bytesRead > MAX_READ_BYTES };
-  });
-}
-
-export async function workspacePathInfo(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean }> {
-  return withOpenFile(path, async (handle) => handle.stat());
-}
-
-async function readWorkspaceTextForPatch(path: string): Promise<string> {
-  const read = await readWorkspaceText(path);
+async function readWorkspaceTextForPatch(workspace: string, path: string): Promise<string> {
+  const read = readWorkspaceText(workspace, path);
   if (read.truncated) throw new ToolExecutionError("patch target exceeds the bounded read limit");
   return read.content;
-}
-
-async function assertSafeDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, READ_DIRECTORY_FLAGS);
-  try {
-    const info = await handle.stat();
-    if (!info.isDirectory()) throw new ToolExecutionError("path is not a directory");
-  } finally {
-    await handle.close();
-  }
-}
-
-async function ensureSafeDirectory(workspace: string, directory: string): Promise<string[]> {
-  const workspaceRealpath = realpathSync(workspace);
-  const remainder = relative(workspaceRealpath, directory);
-  if (!isWithin(workspaceRealpath, directory)) {
-    throw new ValidationError("path resolves outside workspace");
-  }
-  if (remainder.length === 0) {
-    await assertSafeDirectory(workspaceRealpath);
-    return [];
-  }
-
-  const created: string[] = [];
-  let current = workspaceRealpath;
-  await assertSafeDirectory(current);
-  for (const component of remainder.split(sep)) {
-    current = join(current, component);
-    let made = false;
-    try {
-      await mkdir(current);
-      made = true;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
-    }
-    await assertSafeDirectory(current);
-    if (made) created.push(current);
-  }
-  return created;
-}
-
-function safeLstat(path: string): Stats | null {
-  try {
-    return lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-export async function safeDirectoryEntries(path: string): Promise<Dirent[]> {
-  const handle = await open(path, READ_DIRECTORY_FLAGS);
-  try {
-    // Node/Bun do not expose readdir/openat relative to an already-open directory
-    // handle. Keep the no-follow handle open while revalidating and listing the
-    // canonical path; this narrows the final-component race, but a hostile
-    // process can still replace a parent component between these pathname calls.
-    await handle.stat();
-    const checked = lstatSync(path);
-    if (checked.isSymbolicLink() || !checked.isDirectory()) {
-      throw new ValidationError("workspace path is not a safe directory");
-    }
-    const entries = await readdir(path, { encoding: "utf8", withFileTypes: true });
-    return entries;
-  } finally {
-    await handle.close();
-  }
-}
-
-async function writeWorkspaceText(workspace: string, path: string, content: string): Promise<void> {
-  await ensureSafeDirectory(workspace, dirname(path));
-  const handle = await open(path, WRITE_FILE_FLAGS, 0o666);
-  try {
-    const info = await handle.stat();
-    if (!info.isFile()) throw new ToolExecutionError("path is not a regular file");
-    await handle.writeFile(content, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-async function removeTaskFile(path: string): Promise<void> {
-  // unlinkat(dirfd, ...) is not exposed by Node/Bun. Restrict this fallback to
-  // exact, generated regular-file paths; an external parent replacement remains
-  // an unavoidable TOCTOU limitation of the available APIs.
-  const entry = safeLstat(path);
-  if (entry === null || entry.isSymbolicLink() || !entry.isFile()) return;
-  await unlink(path);
 }
 
 function fileDefinition(name: string, description: string, properties: Record<string, unknown>, required: string[]): Tool["definition"] {
@@ -280,11 +158,11 @@ const listTool: Tool = {
   definition: fileDefinition("fs.list", "List entries in a workspace directory.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
-    const entries = (await safeDirectoryEntries(path))
+    const entries = safeDirectoryEntries(context.workspace, path)
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((entry) => ({
         name: entry.name,
-        type: entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "symlink" : "file",
+        type: entry.type,
       }));
     return result(JSON.stringify(entries), entries);
   },
@@ -294,7 +172,7 @@ const readTool: Tool = {
   definition: fileDefinition("fs.read", "Read bounded UTF-8 text from a workspace file.", { path: { type: "string" } }, ["path"]),
   async execute(args, context) {
     const path = resolveWorkspacePath(context.workspace, stringArgument(args, "path"));
-    const read = await readWorkspaceText(path);
+    const read = readWorkspaceText(context.workspace, path);
     return result(read.content, { path: relativePath(context.workspace, path), truncated: read.truncated });
   },
 };
@@ -310,9 +188,8 @@ const writeTool: Tool = {
     const requested = stringArgument(args, "path");
     const content = stringArgument(args, "content");
     const path = resolveWorkspacePath(context.workspace, requested);
-    await ensureSafeDirectory(context.workspace, dirname(path));
-    const finalPath = resolveWorkspacePath(context.workspace, requested);
-    await writeWorkspaceText(context.workspace, finalPath, content);
+    writeWorkspaceText(context.workspace, path, content);
+    const finalPath = path;
     return result(`wrote ${relativePath(context.workspace, finalPath)}`, {
       path: relativePath(context.workspace, finalPath),
       bytes: Buffer.byteLength(content, "utf8"),
@@ -354,6 +231,7 @@ function parsePatch(patch: string): FilePatch[] {
     while (index < lines.length && !lines[index].startsWith("--- ")) {
       const header = lines[index];
       if (!header.startsWith("@@ ")) {
+        if (header.trim().length > 0) throw new ValidationError("unexpected unified patch line");
         index += 1;
         continue;
       }
@@ -364,6 +242,17 @@ function parsePatch(patch: string): FilePatch[] {
       const oldStart = Number(match[1]);
       const oldCount = match[2] === undefined ? 1 : Number(match[2]);
       const newCount = match[4] === undefined ? 1 : Number(match[4]);
+      const newStart = Number(match[3]);
+      if (
+        !Number.isSafeInteger(oldStart) ||
+        !Number.isSafeInteger(oldCount) ||
+        !Number.isSafeInteger(newStart) ||
+        !Number.isSafeInteger(newCount) ||
+        (oldStart === 0 && oldCount !== 0) ||
+        (newStart === 0 && newCount !== 0)
+      ) {
+        throw new ValidationError("unified patch hunk range is invalid");
+      }
       index += 1;
       const hunkLines: string[] = [];
       while (index < lines.length && !lines[index].startsWith("@@ ") && !lines[index].startsWith("--- ")) {
@@ -412,37 +301,66 @@ function parsePatch(patch: string): FilePatch[] {
 
 function applyHunks(original: string, hunks: Hunk[]): string {
   const hadTrailingNewline = original.endsWith("\n");
-  const oldLines = original.length === 0 ? [] : original.split("\n");
-  if (hadTrailingNewline) oldLines.pop();
-  const output: string[] = [];
+  const oldTextLines = original.length === 0 ? [] : original.split("\n");
+  if (hadTrailingNewline) oldTextLines.pop();
+  const oldLines = oldTextLines.map((text, index) => ({
+    text,
+    newline: index < oldTextLines.length - 1 || hadTrailingNewline,
+  }));
+  const output: Array<{ text: string; newline: boolean }> = [];
   let cursor = 0;
   for (const hunk of hunks) {
     const start = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
     if (start < cursor || start > oldLines.length) throw new ValidationError("patch hunk is out of order");
     output.push(...oldLines.slice(cursor, start));
     cursor = start;
-    for (const line of hunk.lines) {
-      if (line === "\\ No newline at end of file") continue;
+    for (let lineIndex = 0; lineIndex < hunk.lines.length; lineIndex += 1) {
+      const line = hunk.lines[lineIndex]!;
+      if (line === "\\ No newline at end of file") {
+        const previous = hunk.lines[lineIndex - 1];
+        if ((previous?.startsWith("+") || previous?.startsWith(" ")) && output.length > 0) {
+          output[output.length - 1]!.newline = false;
+        }
+        continue;
+      }
       const marker = line[0];
       const text = line.slice(1);
       if (marker === " ") {
-        if (oldLines[cursor] !== text) throw new ValidationError("patch context does not match file");
-        output.push(text);
+        if (oldLines[cursor]?.text !== text) throw new ValidationError("patch context does not match file");
+        output.push(oldLines[cursor]!);
         cursor += 1;
       } else if (marker === "-") {
-        if (oldLines[cursor] !== text) throw new ValidationError("patch deletion does not match file");
+        if (oldLines[cursor]?.text !== text) throw new ValidationError("patch deletion does not match file");
         cursor += 1;
       } else {
-        output.push(text);
+        output.push({ text, newline: true });
       }
     }
   }
   output.push(...oldLines.slice(cursor));
-  const patched = output.join("\n");
-  return hadTrailingNewline && patched.length > 0 ? `${patched}\n` : patched;
+  const patched = output.map((line) => line.text).join("\n");
+  return output.at(-1)?.newline === true && patched.length > 0 ? `${patched}\n` : patched;
 }
 
-const patchTool: Tool = {
+export type PatchHooks = {
+  afterInstall?: (path: string) => void | Promise<void>;
+};
+
+function removeCreatedDirectory(workspace: string, path: string): void {
+  try {
+    const parent = openSecureParent(workspace, path, false);
+    try {
+      unlinkAt(parent, parent.name, true);
+    } finally {
+      closeSecureParent(parent);
+    }
+  } catch {
+    // A directory is removed only when the secure parent handle proves it is empty.
+  }
+}
+
+function patchTool(hooks: PatchHooks = {}): Tool {
+  return {
   definition: fileDefinition("fs.patch", "Apply a unified patch to workspace files.", { patch: { type: "string" } }, ["patch"]),
   async execute(args, context) {
     const patches = parsePatch(stringArgument(args, "patch"));
@@ -469,16 +387,24 @@ const patchTool: Tool = {
       seen.add(path);
 
       const isDelete = file.newPath === null;
-      const entry = safeLstat(path);
-      const existed = entry !== null;
-      if (entry !== null && (entry.isSymbolicLink() || !entry.isFile())) {
-        throw new ToolExecutionError("patch target is not a regular file");
+      let existed = false;
+      try {
+        const parent = openSecureParent(context.workspace, path, false);
+        try {
+          const target = openPatchTarget(parent);
+          existed = target !== null;
+          if (target !== null) closeSecureFile(target);
+        } finally {
+          closeSecureParent(parent);
+        }
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
       }
       if ((file.oldPath === null) === existed) {
         throw new ValidationError(isDelete ? "cannot delete a missing file" : "patch target already exists or is missing");
       }
 
-      const original = existed ? await readWorkspaceTextForPatch(path) : "";
+      const original = existed ? await readWorkspaceTextForPatch(context.workspace, path) : "";
       const patched = applyHunks(original, file.hunks);
       if (isDelete && patched !== "") {
         throw new ValidationError("deletion patch must match and remove the entire file");
@@ -486,105 +412,124 @@ const patchTool: Tool = {
       changes.push({ file, path, isDelete, existed, content: isDelete ? null : patched });
     }
 
-    const staged: Array<{ change: (typeof changes)[number]; tempPath: string | null; backupPath: string | null; backupMade: boolean; installed: boolean }> = [];
-    const createdDirectories: string[] = [];
+    const staged: Array<{
+      change: (typeof changes)[number];
+      parent: ReturnType<typeof openSecureParent>;
+      tempName: string | null;
+      backupName: string | null;
+      backupMade: boolean;
+      installed: boolean;
+      backupRetained: boolean;
+    }> = [];
+    const createdDirectories = new Set<string>();
+    let transactionCommitted = false;
     try {
       for (const change of changes) {
-        const directory = dirname(change.path);
-        createdDirectories.push(...await ensureSafeDirectory(context.workspace, directory));
-        let tempPath: string | null = null;
-        if (!change.isDelete) {
-          tempPath = join(directory, `.kestrel-patch-${randomUUID()}.tmp`);
-          try {
-            const handle = await open(tempPath, CREATE_FILE_FLAGS, 0o600);
-            try {
-              await handle.writeFile(change.content ?? "", "utf8");
-              await handle.sync();
-            } finally {
-              await handle.close();
-            }
-          } catch (error) {
-            try {
-              await removeTaskFile(tempPath);
-            } catch {
-              // Cleanup is limited to this generated temporary path.
-            }
-            throw error;
+        const parent = openSecureParent(context.workspace, change.path, true);
+        for (const directory of parent.created) createdDirectories.add(directory);
+        let tempName: string | null = null;
+        try {
+          if (!change.isDelete) {
+            tempName = `.kestrel-patch-${randomUUID()}.tmp`;
+            createPatchTemp(parent, tempName, change.content ?? "");
           }
+          staged.push({ change, parent, tempName, backupName: null, backupMade: false, installed: false, backupRetained: false });
+        } catch (error) {
+          closeSecureParent(parent);
+          throw error;
         }
-        staged.push({ change, tempPath, backupPath: null, backupMade: false, installed: false });
       }
 
       for (const item of staged) {
         const { change } = item;
-        // The public Node/Bun APIs have no descriptor-relative rename/unlink
-        // operation. Revalidate every component and use same-directory renames;
-        // O_NOFOLLOW protects opened files, while a hostile parent replacement
-        // between these calls remains an OS/API limitation documented here.
-        checkNoSymlinkComponents(realpathSync(context.workspace), change.path);
-        const current = safeLstat(change.path);
-        if (change.existed && (current === null || current.isSymbolicLink() || !current.isFile())) {
+        const current = openPatchTarget(item.parent);
+        if (current !== null) closeSecureFile(current);
+        if (change.existed !== (current !== null)) {
           throw new ToolExecutionError("patch target changed during staging");
-        }
-        if (!change.existed && current !== null) {
-          throw new ToolExecutionError("patch target appeared during staging");
         }
 
         if (change.existed) {
-          item.backupPath = join(dirname(change.path), `.kestrel-patch-${randomUUID()}.bak`);
-          await rename(change.path, item.backupPath);
+          item.backupName = `.kestrel-patch-${randomUUID()}.bak`;
+          renameAt(item.parent, item.parent.name, item.backupName);
           item.backupMade = true;
         }
-        if (item.tempPath !== null) {
-          await rename(item.tempPath, change.path);
+        if (item.tempName !== null) {
+          renameAt(item.parent, item.tempName, item.parent.name);
           item.installed = true;
+          await hooks.afterInstall?.(change.path);
         }
       }
-
-    } catch (error) {
-      for (const item of [...staged].reverse()) {
-        try {
-          if (item.installed) await removeTaskFile(item.change.path);
-          if (item.backupMade && item.backupPath !== null) await rename(item.backupPath, item.change.path);
-        } catch {
-          // Best-effort rollback cannot solve an external concurrent rename;
-          // never broaden cleanup to an untracked path.
+      transactionCommitted = true;
+      for (const item of staged) {
+        if (item.backupMade && item.backupName !== null) {
+          try {
+            unlinkAt(item.parent, item.backupName);
+            item.backupMade = false;
+          } catch (error) {
+            item.backupRetained = true;
+            throw new ToolExecutionError(
+              `patch applied but backup cleanup failed; recovery backup retained at ${relativePath(context.workspace, join(dirname(item.change.path), item.backupName))}`,
+              { cause: error },
+            );
+          }
         }
+      }
+    } catch (error) {
+      if (transactionCommitted) throw error;
+      const rollbackFailures: string[] = [];
+      for (const item of [...staged].reverse()) {
+        if (item.installed) {
+          try {
+            unlinkAt(item.parent, item.parent.name);
+          } catch (rollbackError) {
+            rollbackFailures.push(`${relativePath(context.workspace, item.change.path)}: ${String(rollbackError)}`);
+          }
+        }
+        if (item.backupMade && item.backupName !== null) {
+          try {
+            renameAt(item.parent, item.backupName, item.parent.name);
+            item.backupMade = false;
+          } catch (rollbackError) {
+            item.backupRetained = true;
+            rollbackFailures.push(
+              `${relativePath(context.workspace, item.change.path)} backup: ${String(rollbackError)}`,
+            );
+          }
+        }
+      }
+      if (rollbackFailures.length > 0) {
+        const retained = staged
+          .filter((item) => item.backupRetained && item.backupName !== null)
+          .map((item) => relativePath(context.workspace, join(dirname(item.change.path), item.backupName!)));
+        throw new ToolExecutionError(
+          `patch failed and rollback was incomplete: ${rollbackFailures.join("; ")}; recovery backup retained at ${retained.join(", ") || "the original patch directory"}`,
+          { cause: error },
+        );
       }
       throw error;
     } finally {
       for (const item of staged) {
-        if (item.tempPath !== null) {
+        if (item.tempName !== null) {
           try {
-            await removeTaskFile(item.tempPath);
+            unlinkAt(item.parent, item.tempName);
           } catch {
-            // Cleanup is limited to this generated temporary path.
+            // The temporary file was already installed or was never created.
           }
         }
-        if (item.backupPath !== null) {
-          try {
-            await removeTaskFile(item.backupPath);
-          } catch {
-            // Cleanup is limited to this generated backup path.
-          }
-        }
+        closeSecureParent(item.parent);
       }
-      for (const directory of [...createdDirectories].reverse()) {
-        try {
-          await rmdir(directory);
-        } catch {
-          // Only directories created by this patch are considered for cleanup.
-        }
-      }
+      for (const directory of [...createdDirectories].reverse()) removeCreatedDirectory(context.workspace, directory);
     }
 
     const paths = changes.map((change) => relativePath(context.workspace, change.path));
     return result(`patched ${paths.length} file(s)`, paths);
-  },
-};
-
-export function createFilesystemTools(): Tool[] {
-  return [listTool, readTool, writeTool, patchTool];
+    },
+  };
 }
 
-export { listTool, readTool, writeTool, patchTool };
+export function createFilesystemTools(hooks?: PatchHooks): Tool[] {
+  return [listTool, readTool, writeTool, patchTool(hooks)];
+}
+
+export { readWorkspaceText, safeDirectoryEntries, workspacePathInfo } from "./secure-fs";
+export { listTool, readTool, writeTool };

@@ -31,13 +31,13 @@ function boundedMatches(matches: Match[]): Match[] {
 }
 
 async function collectFiles(workspace: string, root: string, files: string[]): Promise<void> {
-  const entries = (await safeDirectoryEntries(root)).sort((left, right) => left.name.localeCompare(right.name));
+  const entries = safeDirectoryEntries(workspace, root).sort((left, right) => left.name.localeCompare(right.name));
   for (const entry of entries) {
     if (entry.name === ".git" || entry.name === "node_modules") continue;
-    if (entry.isSymbolicLink()) continue;
+    if (entry.type === "symlink" || entry.type === "special") continue;
     const child = resolveWorkspacePath(workspace, `${root}${sep}${entry.name}`);
-    if (entry.isDirectory()) await collectFiles(workspace, child, files);
-    else if (entry.isFile()) files.push(child);
+    if (entry.type === "directory") await collectFiles(workspace, child, files);
+    else if (entry.type === "file") files.push(child);
   }
 }
 
@@ -58,7 +58,7 @@ const searchTool: Tool = {
     if (query.length === 0) throw new ValidationError("query must be non-empty");
     const requestedPath = args.path === undefined ? "." : stringArgument(args, "path");
     const root = resolveWorkspacePath(context.workspace, requestedPath);
-    const rootInfo = await workspacePathInfo(root);
+    const rootInfo = workspacePathInfo(context.workspace, root);
     const files: string[] = [];
     if (rootInfo.isDirectory()) await collectFiles(context.workspace, root, files);
     else if (rootInfo.isFile()) files.push(root);
@@ -66,7 +66,7 @@ const searchTool: Tool = {
     const matches: Match[] = [];
     for (const file of files) {
       if (matches.length >= MAX_SEARCH_MATCHES) break;
-      const text = (await readWorkspaceText(file)).content;
+      const text = readWorkspaceText(context.workspace, file).content;
       const lines = text.split("\n");
       for (let index = 0; index < lines.length && matches.length < MAX_SEARCH_MATCHES; index += 1) {
         if (lines[index].includes(query)) {

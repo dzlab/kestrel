@@ -9,6 +9,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const schemaTypes = new Set(["object", "string", "number", "boolean"]);
+
+function validateSchemaDefinition(schema: unknown, path: string): asserts schema is Record<string, unknown> {
+  if (!isRecord(schema)) {
+    throw new ValidationError(`${path} must be a schema object`);
+  }
+  if (typeof schema.type !== "string" || !schemaTypes.has(schema.type)) {
+    throw new ValidationError(`${path}.type is unsupported`);
+  }
+  if (schema.type !== "object") return;
+
+  if (schema.properties !== undefined && !isRecord(schema.properties)) {
+    throw new ValidationError(`${path}.properties must be an object`);
+  }
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    validateSchemaDefinition(propertySchema, `${path}.properties.${key}`);
+  }
+    if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required) || schema.required.some((field) => typeof field !== "string")) {
+      throw new ValidationError(`${path}.required must contain only strings`);
+    }
+    if (new Set(schema.required).size !== schema.required.length) {
+      throw new ValidationError(`${path}.required contains duplicate fields`);
+    }
+    for (const field of schema.required) {
+      if (!Object.hasOwn(properties, field)) {
+        throw new ValidationError(`${path}.required references an unknown field ${field}`);
+      }
+    }
+  }
+  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") {
+    throw new ValidationError(`${path}.additionalProperties must be a boolean`);
+  }
+}
+
 function validateSchema(value: unknown, schema: Record<string, unknown>, path: string): void {
   const schemaType = schema.type;
   if (schemaType === "object") {
@@ -24,13 +60,13 @@ function validateSchema(value: unknown, schema: Record<string, unknown>, path: s
     }
     if (schema.additionalProperties === false) {
       for (const key of Object.keys(value)) {
-        if (!(key in properties)) {
+        if (!Object.hasOwn(properties, key)) {
           throw new ValidationError(`${path}.${key} is not allowed`);
         }
       }
     }
     for (const [key, propertySchema] of Object.entries(properties)) {
-      if (value[key] !== undefined && isRecord(propertySchema)) {
+      if (Object.hasOwn(value, key) && isRecord(propertySchema)) {
         validateSchema(value[key], propertySchema, `${path}.${key}`);
       }
     }
@@ -70,6 +106,13 @@ export class ToolRegistry {
     if (this.tools.has(name)) {
       throw new ValidationError(`duplicate tool definition: ${name}`);
     }
+    if (typeof tool.definition.description !== "string" || tool.definition.description.length === 0) {
+      throw new ValidationError(`tool definition description must be non-empty: ${name}`);
+    }
+    if (typeof tool.definition.capability !== "string" || tool.definition.capability.length === 0) {
+      throw new ValidationError(`tool definition capability must be non-empty: ${name}`);
+    }
+    validateSchemaDefinition(tool.definition.inputSchema, `tool ${name} inputSchema`);
     this.tools.set(name, tool);
   }
 
