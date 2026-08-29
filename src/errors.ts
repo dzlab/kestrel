@@ -53,3 +53,17 @@ export class PersistenceError extends KestrelError {
     super(message, options);
   }
 }
+
+function freezeErrorCode(errorType: typeof KestrelError): void {
+  Object.defineProperty(errorType, "code", {
+    writable: false,
+    configurable: false,
+  });
+}
+
+freezeErrorCode(KestrelError);
+freezeErrorCode(ValidationError);
+freezeErrorCode(PolicyError);
+freezeErrorCode(ApprovalRequiredError);
+freezeErrorCode(ToolExecutionError);
+freezeErrorCode(PersistenceError);

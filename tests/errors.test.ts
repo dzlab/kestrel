@@ -36,3 +36,24 @@ test("error codes cannot be changed at runtime", () => {
     expect(error.code).toBe(code);
   }
 });
+
+test("new errors keep stable codes when constructor statics are mutated", () => {
+  const constructors = [
+    [KestrelError, "KESTREL_ERROR"],
+    [ValidationError, "VALIDATION_ERROR"],
+    [PolicyError, "POLICY_ERROR"],
+    [ApprovalRequiredError, "APPROVAL_REQUIRED"],
+    [ToolExecutionError, "TOOL_EXECUTION_ERROR"],
+    [PersistenceError, "PERSISTENCE_ERROR"],
+  ] as const;
+
+  for (const [ErrorType, code] of constructors) {
+    try {
+      (ErrorType as { code: string }).code = "MUTATED";
+    } catch {
+      // A frozen static property may reject assignment in strict mode.
+    }
+
+    expect(new ErrorType("x").code).toBe(code);
+  }
+});
