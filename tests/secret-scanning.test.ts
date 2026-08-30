@@ -119,6 +119,23 @@ function directChildIndent(parent: WorkflowBlock): number {
   return Math.min(...indents);
 }
 
+function directChildKeys(parent: WorkflowBlock): string[] {
+  const childIndent = directChildIndent(parent);
+  const keyPattern = new RegExp(
+    `^${" ".repeat(childIndent)}((?:[A-Za-z0-9_-]+|'[^']*'|"[^"]*")):[^\\n]*$`,
+  );
+
+  return meaningfulLines(parent.text).flatMap((line) => {
+    const match = keyPattern.exec(line);
+    if (match === null) {
+      return [];
+    }
+
+    const key = match[1];
+    return [key.startsWith("'") || key.startsWith('"') ? key.slice(1, -1) : key];
+  });
+}
+
 function namedChildMapping(step: WorkflowBlock, name: string): WorkflowBlock {
   const childIndent = directChildIndent(step);
   const mappings = blockAtIndent(step.text, name, childIndent);
@@ -235,10 +252,39 @@ test("secret scanning runs on pull requests, main pushes, and manual dispatch", 
   expect(workflowDispatchBlocks[0].text).toMatch(
     lineAt(workflowDispatchBlocks[0].indent, "workflow_dispatch:"),
   );
+
+  const concurrencyBlocks = topLevelBlocks(source, "concurrency");
+  expect(concurrencyBlocks).toHaveLength(1);
+  if (concurrencyBlocks.length !== 1) {
+    return;
+  }
+
+  const concurrencyBlock = concurrencyBlocks[0];
+  const concurrencyChildIndent = directChildIndent(concurrencyBlock);
+  expect(directChildKeys(concurrencyBlock)).toEqual([
+    "group",
+    "cancel-in-progress",
+  ]);
+  expect(concurrencyBlock.text).toMatch(
+    lineAt(concurrencyChildIndent, `group:[ \\t]+.+`),
+  );
+  expect(concurrencyBlock.text).toMatch(
+    lineAt(
+      concurrencyChildIndent,
+      `cancel-in-progress:[ \\t]*(?:true|"true"|'true')`,
+    ),
+  );
 });
 
 test("secret scanning checks complete history with a pinned Gitleaks action", () => {
   const source = workflow();
+  const jobsBlocks = topLevelBlocks(source, "jobs");
+  expect(jobsBlocks).toHaveLength(1);
+  if (jobsBlocks.length !== 1) {
+    return;
+  }
+
+  expect(directChildKeys(jobsBlocks[0])).toEqual(["gitleaks"]);
   const job = gitleaksJob(source);
   const checkoutStep = namedStep(job, "Check out repository history");
   const scanStep = namedStep(job, "Scan repository and Git history");
@@ -249,6 +295,12 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   const scanChildIndent = directChildIndent(scanStep);
   const scanEnvChildIndent = directChildIndent(scanEnv);
 
+  expect(job.text).toMatch(
+    lineAt(
+      directChildIndent(job),
+      `runs-on:[ \\t]*(?:ubuntu-latest|"ubuntu-latest"|'ubuntu-latest')`,
+    ),
+  );
   expect(checkoutStep.text).toMatch(
     lineAt(checkoutChildIndent, `uses:[ \\t]+actions\\/checkout@[^\\s#]+`),
   );
@@ -276,6 +328,17 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
       `GITHUB_TOKEN:[ \\t]*\\$\\{\\{[ \\t]*secrets\\.GITHUB_TOKEN[ \\t]*\\}\\}`,
     ),
   );
+  expect(declaredKeys(scanStep.text, "with")).toHaveLength(0);
+  for (const key of [
+    "GITLEAKS_CONFIG",
+    "GITLEAKS_VERSION",
+    "GITLEAKS_LICENSE",
+  ]) {
+    expect(declaredKeys(scanStep.text, key)).toHaveLength(0);
+  }
+  const onBlock = topLevelBlocks(source, "on")[0];
+  const workflowDispatchBlock = childBlocks(onBlock, "workflow_dispatch")[0];
+  expect(declaredKeys(workflowDispatchBlock.text, "inputs")).toHaveLength(0);
 });
 
 test("secret scanning uses least privilege and does not publish findings", () => {
