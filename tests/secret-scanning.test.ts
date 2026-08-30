@@ -422,7 +422,7 @@ test("full-history selection includes a merged second-parent commit", () => {
     execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" }).trim();
 
   try {
-    runGit("init", "-q");
+    runGit("init", "-q", "-b", "main");
     runGit("config", "user.email", "kestrel-tests@example.invalid");
     runGit("config", "user.name", "Kestrel Tests");
     writeFileSync(join(repository, "README.md"), "base\n");
