@@ -92,4 +92,8 @@ mise exec -- bun run smoke
 
 GitHub Actions runs the same `check` and `smoke` commands on macOS and Linux for both Bun 1.4.0 and the latest Bun release on pull requests and pushes to `main`. Unsupported operating systems fail closed. The repository also runs actionlint, scheduled CodeQL analysis, and pull-request dependency review. CI installs the committed npm lockfile with `npm ci --ignore-scripts`; local Bun development remains supported through `bun install`.
 
+## Secret scanning
+
+The dedicated Gitleaks workflow checks pull-request trees and the complete reachable Git history, including merged second-parent commits. It runs with redacted output, read-only permissions, and a fail-closed result; findings appear in the failed check and workflow run under the **Actions tab**. If GitHub-native Secret Scanning is enabled by a repository administrator, its provider-aware alerts appear under the **Security tab** → **Secret scanning**. Treat any finding as compromised: revoke or rotate the credential, remove it from the current tree, and remediate history when appropriate. This project does not enable or provide push protection; see [docs/security.md](docs/security.md) for the exact API verification/enablement path and current pending status.
+
 The public `createKestrel` factory accepts an injected `FakeModel`, so integration tests can construct the complete registry/kernel/store without network access. See [docs/architecture.md](docs/architecture.md) and [docs/security.md](docs/security.md) for the system flow and threat model.

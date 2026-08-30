@@ -295,6 +295,10 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   expect(directChildKeys(jobsBlocks[0])).toEqual(["gitleaks"]);
   const job = gitleaksJob(source);
   const checkoutStep = namedStep(job, "Check out repository history");
+  const configGuardStep = namedStep(
+    job,
+    "Reject unreviewed root Gitleaks configuration",
+  );
   const scanStep = namedStep(job, "Scan repository and Git history");
   const explicitScanStep = namedStep(job, "Run explicit tree and full-history scans");
   const checkoutWith = namedChildMapping(checkoutStep, "with");
@@ -328,6 +332,14 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
       `persist-credentials:[ \\t]*(?:false|"false"|'false')`,
     ),
   );
+  expect(
+    job.text.indexOf("- name: Reject unreviewed root Gitleaks configuration"),
+  ).toBeGreaterThan(job.text.indexOf("- name: Check out repository history"));
+  expect(
+    job.text.indexOf("- name: Reject unreviewed root Gitleaks configuration"),
+  ).toBeLessThan(job.text.indexOf("- name: Scan repository and Git history"));
+  expect(configGuardStep.text).toContain("gitleaks.toml");
+  expect(configGuardStep.text).toContain(".gitleaks.toml");
   expect(scanStep.text).toMatch(
     lineAt(
       scanChildIndent,
@@ -349,8 +361,6 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   );
   expect(explicitScanStep.text).toContain("steps.event-range.outcome");
   expect(explicitScanStep.text).toContain("always()");
-  expect(explicitScanStep.text).toContain("gitleaks.toml");
-  expect(explicitScanStep.text).toContain(".gitleaks.toml");
   expect(scanEnv.text).toMatch(
     lineAt(
       scanEnvChildIndent,
@@ -491,4 +501,21 @@ test("secret scanning uses least privilege and does not publish findings", () =>
       `GITLEAKS_ENABLE_SUMMARY:[ \\t]*(?:true|"true"|'true')`,
     ),
   );
+});
+
+test("security documentation explains alert locations and remediation", () => {
+  const security = readFileSync(join(import.meta.dir, "../docs/security.md"), "utf8");
+  const readme = readFileSync(join(import.meta.dir, "../README.md"), "utf8");
+  const documentation = `${security}\n${readme}`;
+
+  expect(documentation).toMatch(/Gitleaks/);
+  expect(documentation).toMatch(/Security tab|security tab/);
+  expect(documentation).toMatch(/revoke|rotate/i);
+  expect(documentation).toMatch(/push protection/i);
+  expect(documentation).toMatch(/fails closed/i);
+  expect(security).toContain("gh api repos/dzlab/kestrel");
+  expect(security).toContain("security_and_analysis");
+  expect(security).toMatch(/PATCH/);
+  expect(security).toMatch(/admin=false/);
+  expect(security).toMatch(/404/);
 });
