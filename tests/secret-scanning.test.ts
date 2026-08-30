@@ -31,7 +31,9 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
 test("secret scanning uses least privilege and does not publish findings", () => {
   const source = workflow();
 
-  expect(source).toMatch(/^permissions:[ \t]*\n  contents:[ \t]*read[ \t]*$/m);
+  expect(source).toMatch(
+    /^permissions:[ \t]*\n  contents:[ \t]*read[ \t]*(?:\n(?:[ \t]*\n)*(?=[^ \t#\r\n])|(?![\s\S]))/m,
+  );
   expect(source).not.toMatch(/^[ \t]*pull-requests:[ \t]+write[ \t]*$/m);
   expect(source).toMatch(
     /^[ \t]+GITLEAKS_ENABLE_COMMENTS:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
