@@ -21,45 +21,101 @@ function meaningfulLines(block: string): string[] {
   return block.split("\n").filter((line) => !isIgnorableLine(line));
 }
 
-function blockAtIndent(source: string, name: string, indent: number): string[] {
+function lineAt(indent: number, content: string): RegExp {
+  return new RegExp(`^${" ".repeat(indent)}${content}[ \\t]*(?:#.*)?$`);
+}
+
+type WorkflowBlock = {
+  indent: number;
+  text: string;
+};
+
+function blockAtIndent(
+  source: string,
+  name: string,
+  indent?: number,
+): WorkflowBlock[] {
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const header = new RegExp(
-    `^${" ".repeat(indent)}${escapedName}:[ \\t]*(?:#.*)?$`,
+    `^([ ]*)${escapedName}:[ \\t]*(?:#.*)?$`,
   );
   const lines = source.split("\n");
-  const starts = lines.flatMap((line, index) =>
-    header.test(line) ? [index] : [],
-  );
+  const starts = lines.flatMap((line, index) => {
+    const match = header.exec(line);
+    if (match === null || (indent !== undefined && match[1].length !== indent)) {
+      return [];
+    }
 
-  return starts.map((start) => {
+    return [{ index, indent: match[1].length }];
+  });
+
+  return starts.map(({ index: start, indent: blockIndent }) => {
     const end = lines.findIndex((line, index) => {
       if (index <= start || isIgnorableLine(line)) {
         return false;
       }
 
-      return indentOf(line) <= indent;
+      return indentOf(line) <= blockIndent;
     });
 
-    return lines
-      .slice(start, end === -1 ? lines.length : end)
-      .join("\n")
-      .replace(/(?:\n[ \t]*)+$/, "");
+    return {
+      indent: blockIndent,
+      text: lines
+        .slice(start, end === -1 ? lines.length : end)
+        .join("\n")
+        .replace(/(?:\n[ \t]*)+$/, ""),
+    };
   });
 }
 
-function namedStep(jobBlock: string, name: string): string {
-  const lines = jobBlock.split("\n");
-  const stepsHeaders = lines.flatMap((line, index) =>
-    /^([ ]+)steps:[ \t]*(?:#.*)?$/.test(line) ? [index] : [],
-  );
+function rootIndent(source: string): number {
+  const firstMeaningfulLine = source.split("\n").find((line) => !isIgnorableLine(line));
+  if (firstMeaningfulLine === undefined) {
+    throw new Error("Workflow is empty");
+  }
 
-  if (stepsHeaders.length !== 1) {
+  return indentOf(firstMeaningfulLine);
+}
+
+function topLevelBlocks(source: string, name: string): WorkflowBlock[] {
+  return blockAtIndent(source, name, rootIndent(source));
+}
+
+function childBlocks(parent: WorkflowBlock, name: string): WorkflowBlock[] {
+  const candidates = blockAtIndent(parent.text, name).filter(
+    (block) => block.indent > parent.indent,
+  );
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  const childIndent = Math.min(...candidates.map((block) => block.indent));
+  return candidates.filter((block) => block.indent === childIndent);
+}
+
+function namedStep(jobBlock: WorkflowBlock, name: string): string {
+  const stepsBlocks = childBlocks(jobBlock, "steps");
+  if (stepsBlocks.length !== 1) {
     throw new Error(
-      `Expected exactly one steps block in gitleaks job; found ${stepsHeaders.length}`,
+      `Expected exactly one steps block in gitleaks job; found ${stepsBlocks.length}`,
     );
   }
 
-  const stepIndent = indentOf(lines[stepsHeaders[0]]) + 2;
+  const stepsBlock = stepsBlocks[0];
+  const lines = stepsBlock.text.split("\n");
+  const stepIndentCandidates = lines.flatMap((line) => {
+    if (isIgnorableLine(line) || !/^ +-[ \t]+/.test(line)) {
+      return [];
+    }
+
+    const indent = indentOf(line);
+    return indent > stepsBlock.indent ? [indent] : [];
+  });
+  if (stepIndentCandidates.length === 0) {
+    throw new Error("Expected named steps inside gitleaks steps block");
+  }
+
+  const stepIndent = Math.min(...stepIndentCandidates);
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const header = new RegExp(
     `^${" ".repeat(stepIndent)}- name:[ \\t]+${escapedName}[ \\t]*(?:#.*)?$`,
@@ -85,13 +141,13 @@ function namedStep(jobBlock: string, name: string): string {
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
 }
 
-function gitleaksJob(source: string): string {
-  const jobsBlocks = blockAtIndent(source, "jobs", 0);
+function gitleaksJob(source: string): WorkflowBlock {
+  const jobsBlocks = topLevelBlocks(source, "jobs");
   if (jobsBlocks.length !== 1) {
     throw new Error(`Expected exactly one top-level jobs block; found ${jobsBlocks.length}`);
   }
 
-  const gitleaksBlocks = blockAtIndent(jobsBlocks[0], "gitleaks", 2);
+  const gitleaksBlocks = childBlocks(jobsBlocks[0], "gitleaks");
   if (gitleaksBlocks.length !== 1) {
     throw new Error(
       `Expected exactly one gitleaks job; found ${gitleaksBlocks.length}`,
@@ -103,20 +159,41 @@ function gitleaksJob(source: string): string {
 
 test("secret scanning runs on pull requests, main pushes, and manual dispatch", () => {
   const source = workflow();
-  const onBlocks = blockAtIndent(source, "on", 0);
+  const onBlocks = topLevelBlocks(source, "on");
 
   expect(onBlocks).toHaveLength(1);
   const onBlock = onBlocks[0];
-  const pushBlocks = blockAtIndent(onBlock, "push", 2);
+  const pullRequestBlocks = childBlocks(onBlock, "pull_request");
+  const pushBlocks = childBlocks(onBlock, "push");
+  const workflowDispatchBlocks = childBlocks(onBlock, "workflow_dispatch");
 
-  expect(onBlock).toMatch(/^  pull_request:[ \t]*(?:#.*)?$/m);
+  expect(pullRequestBlocks).toHaveLength(1);
+  expect(pullRequestBlocks[0].text).toMatch(
+    lineAt(pullRequestBlocks[0].indent, "pull_request:"),
+  );
   expect(pushBlocks).toHaveLength(1);
-  const pushLines = meaningfulLines(pushBlocks[0]);
+  const pushBlock = pushBlocks[0];
+  const branchesBlocks = childBlocks(pushBlock, "branches");
+  expect(branchesBlocks).toHaveLength(1);
+  const branchesBlock = branchesBlocks[0];
+  const pushLines = meaningfulLines(pushBlock.text);
   expect(pushLines).toHaveLength(3);
-  expect(pushLines[0]).toMatch(/^  push:[ \t]*(?:#.*)?$/);
-  expect(pushLines[1]).toMatch(/^    branches:[ \t]*(?:#.*)?$/);
-  expect(pushLines[2]).toMatch(/^      - (?:main|"main"|'main')[ \t]*(?:#.*)?$/);
-  expect(onBlock).toMatch(/^  workflow_dispatch:[ \t]*(?:#.*)?$/m);
+  expect(pushLines[0]).toMatch(lineAt(pushBlock.indent, "push:"));
+  expect(pushLines[1]).toMatch(lineAt(branchesBlock.indent, "branches:"));
+
+  const branchesLines = meaningfulLines(branchesBlock.text);
+  expect(branchesLines).toHaveLength(2);
+  const listItemIndent = indentOf(branchesLines[1]);
+  expect(branchesLines[1]).toMatch(
+    lineAt(
+      listItemIndent,
+      `-[ \\t]+(?:main|"main"|'main')`,
+    ),
+  );
+  expect(workflowDispatchBlocks).toHaveLength(1);
+  expect(workflowDispatchBlocks[0].text).toMatch(
+    lineAt(workflowDispatchBlocks[0].indent, "workflow_dispatch:"),
+  );
 });
 
 test("secret scanning checks complete history with a pinned Gitleaks action", () => {
@@ -145,26 +222,35 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
 test("secret scanning uses least privilege and does not publish findings", () => {
   const source = workflow();
   const scanStep = namedStep(gitleaksJob(source), "Scan repository and Git history");
-  const permissionsBlocks = blockAtIndent(source, "permissions", 0);
+  const permissionsBlocks = topLevelBlocks(source, "permissions");
 
   expect(permissionsBlocks).toHaveLength(1);
-  const permissionLines = meaningfulLines(permissionsBlocks[0]);
+  const permissionsBlock = permissionsBlocks[0];
+  const permissionLines = meaningfulLines(permissionsBlock.text);
   expect(permissionLines).toHaveLength(2);
-  expect(permissionLines[0]).toMatch(/^permissions:[ \t]*(?:#.*)?$/);
+  expect(permissionLines[0]).toMatch(lineAt(permissionsBlock.indent, "permissions:"));
+  const permissionEntryIndent = indentOf(permissionLines[1]);
+  expect(permissionEntryIndent).toBeGreaterThan(permissionsBlock.indent);
   expect(permissionLines[1]).toMatch(
-    /^  contents:[ \t]*(?:read|"read"|'read')[ \t]*(?:#.*)?$/,
+    lineAt(
+      permissionEntryIndent,
+      `contents:[ \\t]*(?:read|"read"|'read')`,
+    ),
   );
-  expect(source).not.toMatch(/^[ \t]+permissions:[^\n]*$/m);
+  const nestedPermissions = blockAtIndent(source, "permissions").filter(
+    (block) => block.indent > permissionsBlock.indent,
+  );
+  expect(nestedPermissions).toHaveLength(0);
   expect(source).not.toMatch(
     /^[ \t]*(?:#[ \t]*)?[A-Za-z0-9_-]+:[ \t]*(?:write|"write"|'write')(?:[ \t]+#.*)?[ \t]*$/m,
   );
   expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_COMMENTS:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
+    /^[ \t]+GITLEAKS_ENABLE_COMMENTS:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
   );
   expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_UPLOAD_ARTIFACT:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
+    /^[ \t]+GITLEAKS_ENABLE_UPLOAD_ARTIFACT:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
   );
   expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_SUMMARY:[ \t]*(?:true|"true"|'true')[ \t]*$/m,
+    /^[ \t]+GITLEAKS_ENABLE_SUMMARY:[ \t]*(?:true|"true"|'true')[ \t]*(?:#.*)?$/m,
   );
 });
