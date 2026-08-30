@@ -25,6 +25,18 @@ function lineAt(indent: number, content: string): RegExp {
   return new RegExp(`^${" ".repeat(indent)}${content}[ \\t]*(?:#.*)?$`);
 }
 
+function declaredKeys(source: string, name: string): WorkflowBlock[] {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declaration = new RegExp(`^([ ]*)${escapedName}:`);
+
+  return source.split("\n").flatMap((line) => {
+    const match = declaration.exec(line);
+    return match === null
+      ? []
+      : [{ indent: match[1].length, text: line }];
+  });
+}
+
 type WorkflowBlock = {
   indent: number;
   text: string;
@@ -93,7 +105,30 @@ function childBlocks(parent: WorkflowBlock, name: string): WorkflowBlock[] {
   return candidates.filter((block) => block.indent === childIndent);
 }
 
-function namedStep(jobBlock: WorkflowBlock, name: string): string {
+function directChildIndent(parent: WorkflowBlock): number {
+  const indents = meaningfulLines(parent.text)
+    .map((line) => indentOf(line))
+    .filter((indent) => indent > parent.indent);
+  if (indents.length === 0) {
+    throw new Error("Expected a child mapping");
+  }
+
+  return Math.min(...indents);
+}
+
+function namedChildMapping(step: WorkflowBlock, name: string): WorkflowBlock {
+  const childIndent = directChildIndent(step);
+  const mappings = blockAtIndent(step.text, name, childIndent);
+  if (mappings.length !== 1) {
+    throw new Error(
+      `Expected exactly one ${name} mapping in named step; found ${mappings.length}`,
+    );
+  }
+
+  return mappings[0];
+}
+
+function namedStep(jobBlock: WorkflowBlock, name: string): WorkflowBlock {
   const stepsBlocks = childBlocks(jobBlock, "steps");
   if (stepsBlocks.length !== 1) {
     throw new Error(
@@ -138,7 +173,10 @@ function namedStep(jobBlock: WorkflowBlock, name: string): string {
       indentOf(line) <= stepIndent,
   );
 
-  return lines.slice(start, end === -1 ? lines.length : end).join("\n");
+  return {
+    indent: stepIndent,
+    text: lines.slice(start, end === -1 ? lines.length : end).join("\n"),
+  };
 }
 
 function gitleaksJob(source: string): WorkflowBlock {
@@ -201,33 +239,62 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   const job = gitleaksJob(source);
   const checkoutStep = namedStep(job, "Check out repository history");
   const scanStep = namedStep(job, "Scan repository and Git history");
+  const checkoutWith = namedChildMapping(checkoutStep, "with");
+  const scanEnv = namedChildMapping(scanStep, "env");
+  const checkoutChildIndent = directChildIndent(checkoutStep);
+  const checkoutWithChildIndent = directChildIndent(checkoutWith);
+  const scanChildIndent = directChildIndent(scanStep);
+  const scanEnvChildIndent = directChildIndent(scanEnv);
 
-  expect(checkoutStep).toMatch(
-    /^[ \t]+uses:[ \t]+actions\/checkout@[^\s#]+[ \t]*(?:#.*)?$/m,
+  expect(checkoutStep.text).toMatch(
+    lineAt(checkoutChildIndent, `uses:[ \\t]+actions\\/checkout@[^\\s#]+`),
   );
-  expect(checkoutStep).toMatch(
-    /^[ \t]+fetch-depth:[ \t]*(?:0|"0"|'0')[ \t]*(?:#.*)?$/m,
+  expect(checkoutWith.text).toMatch(
+    lineAt(
+      checkoutWithChildIndent,
+      `fetch-depth:[ \\t]*(?:0|"0"|'0')`,
+    ),
   );
-  expect(checkoutStep).toMatch(
-    /^[ \t]+persist-credentials:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
+  expect(checkoutWith.text).toMatch(
+    lineAt(
+      checkoutWithChildIndent,
+      `persist-credentials:[ \\t]*(?:false|"false"|'false')`,
+    ),
   );
-  expect(scanStep).toMatch(
-    /^[ \t]+uses:[ \t]+gitleaks\/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e[ \t]+# v3\.0\.0[ \t]*$/m,
+  expect(scanStep.text).toMatch(
+    lineAt(
+      scanChildIndent,
+      `uses:[ \\t]+gitleaks\\/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e[ \\t]+# v3\\.0\\.0`,
+    ),
   );
-  expect(scanStep).toMatch(
-    /^[ \t]+GITHUB_TOKEN:[ \t]*\$\{\{[ \t]*secrets\.GITHUB_TOKEN[ \t]*\}\}[ \t]*(?:#.*)?$/m,
+  expect(scanEnv.text).toMatch(
+    lineAt(
+      scanEnvChildIndent,
+      `GITHUB_TOKEN:[ \\t]*\\$\\{\\{[ \\t]*secrets\\.GITHUB_TOKEN[ \\t]*\\}\\}`,
+    ),
   );
 });
 
 test("secret scanning uses least privilege and does not publish findings", () => {
   const source = workflow();
   const scanStep = namedStep(gitleaksJob(source), "Scan repository and Git history");
+  const scanEnv = namedChildMapping(scanStep, "env");
+  const scanEnvChildIndent = directChildIndent(scanEnv);
   const permissionsBlocks = topLevelBlocks(source, "permissions");
 
   expect(permissionsBlocks).toHaveLength(1);
+  if (permissionsBlocks.length !== 1) {
+    return;
+  }
+
   const permissionsBlock = permissionsBlocks[0];
   const permissionLines = meaningfulLines(permissionsBlock.text);
+  const permissionDeclarations = declaredKeys(source, "permissions");
+  const topLevelPermissionDeclarations = permissionDeclarations.filter(
+    (declaration) => declaration.indent === permissionsBlock.indent,
+  );
   expect(permissionLines).toHaveLength(2);
+  expect(topLevelPermissionDeclarations).toHaveLength(1);
   expect(permissionLines[0]).toMatch(lineAt(permissionsBlock.indent, "permissions:"));
   const permissionEntryIndent = indentOf(permissionLines[1]);
   expect(permissionEntryIndent).toBeGreaterThan(permissionsBlock.indent);
@@ -237,20 +304,32 @@ test("secret scanning uses least privilege and does not publish findings", () =>
       `contents:[ \\t]*(?:read|"read"|'read')`,
     ),
   );
-  const nestedPermissions = blockAtIndent(source, "permissions").filter(
+  const nestedPermissions = permissionDeclarations.filter(
     (block) => block.indent > permissionsBlock.indent,
   );
   expect(nestedPermissions).toHaveLength(0);
   expect(source).not.toMatch(
+    /^[ \t]*(?:#[ \t]*)?permissions:[^\n]*\bwrite\b[^\n]*$/m,
+  );
+  expect(source).not.toMatch(
     /^[ \t]*(?:#[ \t]*)?[A-Za-z0-9_-]+:[ \t]*(?:write|"write"|'write')(?:[ \t]+#.*)?[ \t]*$/m,
   );
-  expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_COMMENTS:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
+  expect(scanEnv.text).toMatch(
+    lineAt(
+      scanEnvChildIndent,
+      `GITLEAKS_ENABLE_COMMENTS:[ \\t]*(?:false|"false"|'false')`,
+    ),
   );
-  expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_UPLOAD_ARTIFACT:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
+  expect(scanEnv.text).toMatch(
+    lineAt(
+      scanEnvChildIndent,
+      `GITLEAKS_ENABLE_UPLOAD_ARTIFACT:[ \\t]*(?:false|"false"|'false')`,
+    ),
   );
-  expect(scanStep).toMatch(
-    /^[ \t]+GITLEAKS_ENABLE_SUMMARY:[ \t]*(?:true|"true"|'true')[ \t]*(?:#.*)?$/m,
+  expect(scanEnv.text).toMatch(
+    lineAt(
+      scanEnvChildIndent,
+      `GITLEAKS_ENABLE_SUMMARY:[ \\t]*(?:true|"true"|'true')`,
+    ),
   );
 });
