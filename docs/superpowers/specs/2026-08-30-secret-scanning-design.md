@@ -24,7 +24,9 @@ This change does not include push protection, automatic secret rotation, custom 
 
 Add `.github/workflows/secret-scanning.yml` with `pull_request`, pushes to `main`, and `workflow_dispatch` triggers. The job runs on `ubuntu-latest`, checks out the repository with `fetch-depth: 0`, and invokes the official `gitleaks/gitleaks-action` using a fixed release commit. The full checkout allows Gitleaks to inspect both the current pull-request tree and all reachable Git history.
 
-The workflow grants only `contents: read`. It supplies the read-only `GITHUB_TOKEN` required by the action, sets `GITLEAKS_ENABLE_COMMENTS=false` and `GITLEAKS_ENABLE_UPLOAD_ARTIFACT=false`, and retains a concise job summary. The workflow must not expose secret values in logs.
+The workflow grants only `contents: read`. It supplies the read-only `GITHUB_TOKEN` required by the action, sets `GITLEAKS_ENABLE_COMMENTS=false` and `GITLEAKS_ENABLE_UPLOAD_ARTIFACT=false`, and retains a concise job summary. Because the official action narrows pull-request and push scans to an event range and first-parent history, the workflow also runs explicit `gitleaks dir --redact --exit-code=2 .` and `gitleaks git --redact --exit-code=2 --log-opts='--all'` commands after the action. The action step may continue long enough for diagnostics, but a final aggregation condition fails the job when the action or either direct scan fails. The workflow must not expose secret values in logs.
+
+The checkout action is pinned to the immutable v6.1.0 commit `d23441a48e516b6c34aea4fa41551a30e30af803`; the Gitleaks action is pinned to its v3.0.0 release commit. No root `gitleaks.toml` or `.gitleaks.toml` is accepted: the workflow fails closed if either unreviewed configuration file appears. This keeps custom suppressions and alternate scanner configuration out of the default policy.
 
 ### GitHub-native Secret Scanning
 
@@ -37,6 +39,8 @@ Native Secret Scanning remains independent of Gitleaks and is responsible for pe
 - Never print, persist, or include detected secret values in workflow output, documentation, or application logs.
 - Fail the Gitleaks job when a secret is detected.
 - Use a pinned action commit rather than a mutable branch or floating tag.
+- Scan the full reachable commit graph with `--all`; do not rely on first-parent event-range behavior for history coverage.
+- Reject unreviewed root Gitleaks configuration files rather than silently accepting custom suppressions.
 - Keep workflow permissions read-only; no PR write token is needed for a blocking scan.
 - Treat existing findings as a release/security decision: remove and rotate real credentials, and document any intentional test fixtures before adding an explicit narrow exception.
 - Do not use user-controlled workflow inputs or repository content to select an alternate scanner binary, config path, or network endpoint.
@@ -47,7 +51,9 @@ Repository tests will validate the workflow text and YAML shape without embeddin
 
 - Gitleaks workflow triggers pull requests, pushes to `main`, and manual dispatch.
 - Checkout uses full history.
-- The scanner action is pinned and runs with read-only permissions.
+- The checkout and scanner actions are pinned to immutable commits, and explicit tree/full-graph scans run after the event-range action scan.
+- The workflow fails closed if the action or either direct scan fails, including when a merged second-parent commit contains a finding.
+- No unreviewed root Gitleaks configuration file is accepted.
 - No workflow setting grants PR write access or logs secret contents.
 - The current repository tree passes a local Gitleaks scan when the scanner is available.
 - The GitHub-native Secret Scanning API reports enabled after configuration, or the exact entitlement/permission limitation is reported without weakening the CI gate.

@@ -4,7 +4,7 @@
 
 **Goal:** Add a least-privilege Gitleaks CI gate that scans pull-request trees and complete Git history, enable GitHub-native Secret Scanning for `dzlab/kestrel`, and document remediation.
 
-**Architecture:** Keep secret detection in a dedicated Ubuntu workflow. A full-history checkout feeds the official Gitleaks Action pinned to its v3.0.0 release commit; comments and artifact uploads are disabled so the job needs only read access. GitHub-native Secret Scanning is enabled separately through the repository security API and verified after the workflow is committed.
+**Architecture:** Keep secret detection in a dedicated Ubuntu workflow. A full-history checkout feeds the official Gitleaks Action pinned to its v3.0.0 release commit for the event-range gate, followed by explicit redacted current-tree and `--all` full-graph history scans. The action result and both direct scan results are aggregated fail-closed; comments and artifact uploads are disabled so the job needs only read access. The checkout action is pinned to its immutable v6.1.0 commit. Root `gitleaks.toml` and `.gitleaks.toml` files are rejected until a reviewed configuration policy exists. GitHub-native Secret Scanning is enabled separately through the repository security API and verified after the workflow is committed.
 
 **Tech Stack:** GitHub Actions YAML, Gitleaks Action v3.0.0, GitHub REST API via `gh`, Bun tests, TypeScript repository tooling.
 
@@ -12,8 +12,8 @@
 
 ## File map
 
-- Create `.github/workflows/secret-scanning.yml`: the pull-request, main-branch, and manual Gitleaks workflow.
-- Create `tests/secret-scanning.test.ts`: deterministic assertions for workflow triggers, immutable action references, full-history checkout, permissions, and safe output settings.
+- Create `.github/workflows/secret-scanning.yml`: the pull-request, main-branch, and manual Gitleaks workflow with explicit tree/full-graph scans and fail-closed aggregation.
+- Create `tests/secret-scanning.test.ts`: deterministic assertions for workflow triggers, immutable action references, full-history checkout, direct scan commands, permissions, safe output settings, and a temporary merged second-parent history fixture.
 - Modify `docs/security.md`: operational guidance for CI findings, native alerts, credential rotation, and the explicit push-protection boundary.
 - Modify `README.md`: point contributors to the secret-scanning workflow and GitHub Security tab.
 - Create `docs/superpowers/specs/2026-08-30-secret-scanning-design.md`: approved design, already completed before this plan.
@@ -97,7 +97,7 @@ git commit -m "test: specify secret scanning workflow contract"
 
 - [ ] **Step 1: Add the minimal workflow that satisfies the contract.**
 
-Use the following workflow. `fetch-depth: 0` makes all reachable history available to the scanner. The Gitleaks v3.0.0 release commit is immutable; comments and artifact uploads stay disabled so the workflow has no write permission.
+Use the workflow with `fetch-depth: 0` and the immutable checkout pin `d23441a48e516b6c34aea4fa41551a30e30af803` (v6.1.0). Keep the Gitleaks v3.0.0 action pin for the event-range scan, allow that step to continue only so explicit diagnostics can run, and aggregate its result with `gitleaks dir --redact --exit-code=2 .` and `gitleaks git --redact --exit-code=2 --log-opts='--all'`. Reject root `gitleaks.toml` and `.gitleaks.toml` files before scanning.
 
 ```yaml
 name: Secret Scanning
@@ -123,17 +123,39 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository history
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Scan repository and Git history
+        id: event-range
+        continue-on-error: true
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: "false"
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
           GITLEAKS_ENABLE_SUMMARY: "true"
+      - name: Run explicit tree and full-history scans
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          for config in gitleaks.toml .gitleaks.toml; do
+            if [ -e "$config" ]; then
+              echo "Refusing to scan with an unreviewed root Gitleaks configuration: $config"
+              exit 1
+            fi
+          done
+
+          tree_status=0
+          history_status=0
+          gitleaks dir --redact --exit-code=2 . || tree_status=$?
+          gitleaks git --redact --exit-code=2 --log-opts='--all' || history_status=$?
+
+          if [ "$tree_status" -ne 0 ] || [ "$history_status" -ne 0 ] || [ "${{ steps.event-range.outcome }}" != "success" ]; then
+            echo "Secret scanning failed; review the redacted findings and rotate any exposed credentials."
+            exit 1
+          fi
 ```
 
 - [ ] **Step 2: Run the contract tests and inspect the workflow.**

@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const workflowPath = join(import.meta.dir, "../.github/workflows/secret-scanning.yml");
 
@@ -288,6 +296,7 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   const job = gitleaksJob(source);
   const checkoutStep = namedStep(job, "Check out repository history");
   const scanStep = namedStep(job, "Scan repository and Git history");
+  const explicitScanStep = namedStep(job, "Run explicit tree and full-history scans");
   const checkoutWith = namedChildMapping(checkoutStep, "with");
   const scanEnv = namedChildMapping(scanStep, "env");
   const checkoutChildIndent = directChildIndent(checkoutStep);
@@ -302,7 +311,10 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
     ),
   );
   expect(checkoutStep.text).toMatch(
-    lineAt(checkoutChildIndent, `uses:[ \\t]+actions\\/checkout@[^\\s#]+`),
+    lineAt(
+      checkoutChildIndent,
+      `uses:[ \\t]+actions\\/checkout@d23441a48e516b6c34aea4fa41551a30e30af803[ \\t]+# v6\\.1\\.0`,
+    ),
   );
   expect(checkoutWith.text).toMatch(
     lineAt(
@@ -322,6 +334,23 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
       `uses:[ \\t]+gitleaks\\/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e[ \\t]+# v3\\.0\\.0`,
     ),
   );
+  expect(scanStep.text).toMatch(
+    lineAt(scanChildIndent, `id:[ \\t]+event-range`),
+  );
+  expect(scanStep.text).toMatch(
+    lineAt(
+      scanChildIndent,
+      `continue-on-error:[ \\t]*(?:true|"true"|'true')`,
+    ),
+  );
+  expect(explicitScanStep.text).toContain("gitleaks dir --redact --exit-code=2 .");
+  expect(explicitScanStep.text).toContain(
+    "gitleaks git --redact --exit-code=2 --log-opts='--all'",
+  );
+  expect(explicitScanStep.text).toContain("steps.event-range.outcome");
+  expect(explicitScanStep.text).toContain("always()");
+  expect(explicitScanStep.text).toContain("gitleaks.toml");
+  expect(explicitScanStep.text).toContain(".gitleaks.toml");
   expect(scanEnv.text).toMatch(
     lineAt(
       scanEnvChildIndent,
@@ -339,6 +368,68 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   const onBlock = topLevelBlocks(source, "on")[0];
   const workflowDispatchBlock = childBlocks(onBlock, "workflow_dispatch")[0];
   expect(declaredKeys(workflowDispatchBlock.text, "inputs")).toHaveLength(0);
+  expect(existsSync(join(import.meta.dir, "../gitleaks.toml"))).toBe(false);
+  expect(existsSync(join(import.meta.dir, "../.gitleaks.toml"))).toBe(false);
+});
+
+test("full-history selection includes a merged second-parent commit", () => {
+  const repository = mkdtempSync(join(tmpdir(), "kestrel-secret-history-"));
+  const marker = "KSTREL_SYNTHETIC_SECRET_MARKER_DO_NOT_USE";
+  const runGit = (...args: string[]) =>
+    execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" }).trim();
+
+  try {
+    runGit("init", "-q");
+    runGit("config", "user.email", "kestrel-tests@example.invalid");
+    runGit("config", "user.name", "Kestrel Tests");
+    writeFileSync(join(repository, "README.md"), "base\n");
+    runGit("add", "README.md");
+    runGit("commit", "-qm", "base");
+    const base = runGit("rev-parse", "HEAD");
+
+    runGit("checkout", "-qb", "second-parent");
+    writeFileSync(
+      join(repository, "fixture.txt"),
+      `${marker}\n`,
+    );
+    runGit("add", "fixture.txt");
+    runGit("commit", "-qm", "synthetic second-parent fixture");
+    const secondParentCommit = runGit("rev-parse", "HEAD");
+
+    runGit("checkout", "-q", "main");
+    writeFileSync(join(repository, "main.txt"), "main\n");
+    runGit("add", "main.txt");
+    runGit("commit", "-qm", "main branch");
+    runGit("merge", "--no-ff", "second-parent", "-qm", "merge fixture");
+
+    const allCommits = runGit("rev-list", "--all").split("\n");
+    const firstParentCommits = runGit("rev-list", "--first-parent", "HEAD").split("\n");
+    const allHistoryWithMarker = runGit(
+      "log",
+      "--all",
+      "-S",
+      marker,
+      "--format=%H",
+      "--",
+      "fixture.txt",
+    ).split("\n");
+    const firstParentHistoryWithMarker = runGit(
+      "log",
+      "--first-parent",
+      "-S",
+      marker,
+      "--format=%H",
+      "--",
+      "fixture.txt",
+    ).split("\n");
+
+    expect(allCommits).toContain(secondParentCommit);
+    expect(firstParentCommits).not.toContain(secondParentCommit);
+    expect(allHistoryWithMarker).toContain(secondParentCommit);
+    expect(firstParentHistoryWithMarker).not.toContain(secondParentCommit);
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
 });
 
 test("secret scanning uses least privilege and does not publish findings", () => {
