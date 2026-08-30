@@ -22,7 +22,7 @@ function meaningfulLines(block: string): string[] {
 }
 
 function lineAt(indent: number, content: string): RegExp {
-  return new RegExp(`^${" ".repeat(indent)}${content}[ \\t]*(?:#.*)?$`);
+  return new RegExp(`^${" ".repeat(indent)}${content}[ \\t]*(?:#.*)?$`, "m");
 }
 
 function yamlKey(name: string): string {
