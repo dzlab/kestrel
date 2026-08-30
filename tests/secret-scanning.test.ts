@@ -25,9 +25,13 @@ function lineAt(indent: number, content: string): RegExp {
   return new RegExp(`^${" ".repeat(indent)}${content}[ \\t]*(?:#.*)?$`);
 }
 
-function declaredKeys(source: string, name: string): WorkflowBlock[] {
+function yamlKey(name: string): string {
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const declaration = new RegExp(`^([ ]*)${escapedName}:`);
+  return `(?:${escapedName}|'${escapedName}'|"${escapedName}")`;
+}
+
+function declaredKeys(source: string, name: string): WorkflowBlock[] {
+  const declaration = new RegExp(`^([ ]*)${yamlKey(name)}:`);
 
   return source.split("\n").flatMap((line) => {
     const match = declaration.exec(line);
@@ -47,9 +51,8 @@ function blockAtIndent(
   name: string,
   indent?: number,
 ): WorkflowBlock[] {
-  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const header = new RegExp(
-    `^([ ]*)${escapedName}:[ \\t]*(?:#.*)?$`,
+    `^([ ]*)${yamlKey(name)}:[ \\t]*(?:#.*)?$`,
   );
   const lines = source.split("\n");
   const starts = lines.flatMap((line, index) => {
@@ -295,7 +298,9 @@ test("secret scanning uses least privilege and does not publish findings", () =>
   );
   expect(permissionLines).toHaveLength(2);
   expect(topLevelPermissionDeclarations).toHaveLength(1);
-  expect(permissionLines[0]).toMatch(lineAt(permissionsBlock.indent, "permissions:"));
+  expect(permissionLines[0]).toMatch(
+    lineAt(permissionsBlock.indent, `${yamlKey("permissions")}:`),
+  );
   const permissionEntryIndent = indentOf(permissionLines[1]);
   expect(permissionEntryIndent).toBeGreaterThan(permissionsBlock.indent);
   expect(permissionLines[1]).toMatch(
@@ -309,7 +314,7 @@ test("secret scanning uses least privilege and does not publish findings", () =>
   );
   expect(nestedPermissions).toHaveLength(0);
   expect(source).not.toMatch(
-    /^[ \t]*(?:#[ \t]*)?permissions:[^\n]*\bwrite\b[^\n]*$/m,
+    /^[ \t]*(?:#[ \t]*)?(?:permissions|'permissions'|"permissions"):[^\n]*\bwrite\b[^\n]*$/m,
   );
   expect(source).not.toMatch(
     /^[ \t]*(?:#[ \t]*)?[A-Za-z0-9_-]+:[ \t]*(?:write|"write"|'write')(?:[ \t]+#.*)?[ \t]*$/m,
