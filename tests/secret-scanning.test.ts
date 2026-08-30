@@ -8,34 +8,21 @@ function workflow(): string {
   return readFileSync(workflowPath, "utf8").replace(/\r\n?/g, "\n");
 }
 
-function stepBlock(source: string, name: string): string {
-  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const header = new RegExp(`^      - name:[ \\t]+${escapedName}[ \\t]*$`);
-  const lines = source.split("\n");
-  const start = lines.findIndex((line) => header.test(line));
-
-  if (start === -1) {
-    throw new Error(`Missing named workflow step: ${name}`);
-  }
-
-  const end = lines.findIndex(
-    (line, index) => index > start && line !== "" && !/^ {8}/.test(line),
-  );
-
-  return lines.slice(start, end === -1 ? lines.length : end).join("\n");
-}
-
-function topLevelBlocks(source: string, name: string): string[] {
+function blockAtIndent(source: string, name: string, indent: number): string[] {
+  const prefix = `${" ".repeat(indent)}${name}:`;
   const lines = source.split("\n");
   const starts = lines.flatMap((line, index) =>
-    line.startsWith(`${name}:`) ? [index] : [],
+    line.startsWith(prefix) ? [index] : [],
   );
 
   return starts.map((start) => {
-    const end = lines.findIndex(
-      (line, index) =>
-        index > start && /^[^ \t#\r\n][^:]*:/.test(line),
-    );
+    const end = lines.findIndex((line, index) => {
+      if (index <= start || line === "") {
+        return false;
+      }
+
+      return line.length - line.trimStart().length <= indent;
+    });
 
     return lines
       .slice(start, end === -1 ? lines.length : end)
@@ -44,25 +31,75 @@ function topLevelBlocks(source: string, name: string): string[] {
   });
 }
 
+function namedStep(jobBlock: string, name: string): string {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const header = new RegExp(`^      - name:[ \\t]+${escapedName}[ \\t]*$`);
+  const lines = jobBlock.split("\n");
+  const starts = lines.flatMap((line, index) =>
+    header.test(line) ? [index] : [],
+  );
+
+  if (starts.length !== 1) {
+    throw new Error(
+      `Expected exactly one named workflow step: ${name}; found ${starts.length}`,
+    );
+  }
+
+  const start = starts[0];
+  const end = lines.findIndex(
+    (line, index) =>
+      index > start &&
+      line !== "" &&
+      line.length - line.trimStart().length <= 6,
+  );
+
+  return lines.slice(start, end === -1 ? lines.length : end).join("\n");
+}
+
+function gitleaksJob(source: string): string {
+  const jobsBlocks = blockAtIndent(source, "jobs", 0);
+  if (jobsBlocks.length !== 1) {
+    throw new Error(`Expected exactly one top-level jobs block; found ${jobsBlocks.length}`);
+  }
+
+  const gitleaksBlocks = blockAtIndent(jobsBlocks[0], "gitleaks", 2);
+  if (gitleaksBlocks.length !== 1) {
+    throw new Error(
+      `Expected exactly one gitleaks job; found ${gitleaksBlocks.length}`,
+    );
+  }
+
+  return gitleaksBlocks[0];
+}
+
 test("secret scanning runs on pull requests, main pushes, and manual dispatch", () => {
   const source = workflow();
+  const onBlocks = blockAtIndent(source, "on", 0);
 
-  expect(source).toMatch(/^  pull_request:[ \t]*$/m);
-  expect(source).toMatch(/^  push:[ \t]*\n    branches:[ \t]*\n      - main[ \t]*$/m);
-  expect(source).toMatch(/^  workflow_dispatch:[ \t]*$/m);
+  expect(onBlocks).toHaveLength(1);
+  const onBlock = onBlocks[0];
+  const pushBlocks = blockAtIndent(onBlock, "push", 2);
+
+  expect(onBlock).toMatch(/^  pull_request:[ \t]*$/m);
+  expect(pushBlocks).toHaveLength(1);
+  expect(pushBlocks[0]).toBe("  push:\n    branches:\n      - main");
+  expect(onBlock).toMatch(/^  workflow_dispatch:[ \t]*$/m);
 });
 
 test("secret scanning checks complete history with a pinned Gitleaks action", () => {
   const source = workflow();
-  const checkoutStep = stepBlock(source, "Check out repository history");
-  const scanStep = stepBlock(source, "Scan repository and Git history");
+  const job = gitleaksJob(source);
+  const checkoutStep = namedStep(job, "Check out repository history");
+  const scanStep = namedStep(job, "Scan repository and Git history");
 
   expect(checkoutStep).toMatch(
     /^[ \t]+uses:[ \t]+actions\/checkout@[^\s#]+[ \t]*$/m,
   );
-  expect(checkoutStep).toMatch(/^[ \t]+fetch-depth:[ \t]*0[ \t]*$/m);
   expect(checkoutStep).toMatch(
-    /^[ \t]+persist-credentials:[ \t]*false[ \t]*$/m,
+    /^[ \t]+fetch-depth:[ \t]*(?:0|"0"|'0')[ \t]*$/m,
+  );
+  expect(checkoutStep).toMatch(
+    /^[ \t]+persist-credentials:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
   );
   expect(scanStep).toMatch(
     /^[ \t]+uses:[ \t]+gitleaks\/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e[ \t]+# v3\.0\.0[ \t]*$/m,
@@ -74,12 +111,15 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
 
 test("secret scanning uses least privilege and does not publish findings", () => {
   const source = workflow();
-  const scanStep = stepBlock(source, "Scan repository and Git history");
-  const permissionsBlocks = topLevelBlocks(source, "permissions");
+  const scanStep = namedStep(gitleaksJob(source), "Scan repository and Git history");
+  const permissionsBlocks = blockAtIndent(source, "permissions", 0);
 
   expect(permissionsBlocks).toHaveLength(1);
   expect(permissionsBlocks[0]).toBe("permissions:\n  contents: read");
-  expect(source).not.toMatch(/^[ \t]*(?:#[ \t]*)?pull-requests:[ \t]+write[ \t]*$/m);
+  expect(source).not.toMatch(/^[ \t]+permissions:[^\n]*$/m);
+  expect(source).not.toMatch(
+    /^[ \t]*(?:#[ \t]*)?[A-Za-z0-9_-]+:[ \t]*(?:write|"write"|'write')(?:[ \t]+#.*)?[ \t]*$/m,
+  );
   expect(scanStep).toMatch(
     /^[ \t]+GITLEAKS_ENABLE_COMMENTS:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
   );
