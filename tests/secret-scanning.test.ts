@@ -8,20 +8,36 @@ function workflow(): string {
   return readFileSync(workflowPath, "utf8").replace(/\r\n?/g, "\n");
 }
 
+function indentOf(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+function isIgnorableLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed === "" || trimmed.startsWith("#");
+}
+
+function meaningfulLines(block: string): string[] {
+  return block.split("\n").filter((line) => !isIgnorableLine(line));
+}
+
 function blockAtIndent(source: string, name: string, indent: number): string[] {
-  const prefix = `${" ".repeat(indent)}${name}:`;
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const header = new RegExp(
+    `^${" ".repeat(indent)}${escapedName}:[ \\t]*(?:#.*)?$`,
+  );
   const lines = source.split("\n");
   const starts = lines.flatMap((line, index) =>
-    line.startsWith(prefix) ? [index] : [],
+    header.test(line) ? [index] : [],
   );
 
   return starts.map((start) => {
     const end = lines.findIndex((line, index) => {
-      if (index <= start || line === "") {
+      if (index <= start || isIgnorableLine(line)) {
         return false;
       }
 
-      return line.length - line.trimStart().length <= indent;
+      return indentOf(line) <= indent;
     });
 
     return lines
@@ -32,9 +48,22 @@ function blockAtIndent(source: string, name: string, indent: number): string[] {
 }
 
 function namedStep(jobBlock: string, name: string): string {
-  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const header = new RegExp(`^      - name:[ \\t]+${escapedName}[ \\t]*$`);
   const lines = jobBlock.split("\n");
+  const stepsHeaders = lines.flatMap((line, index) =>
+    /^([ ]+)steps:[ \t]*(?:#.*)?$/.test(line) ? [index] : [],
+  );
+
+  if (stepsHeaders.length !== 1) {
+    throw new Error(
+      `Expected exactly one steps block in gitleaks job; found ${stepsHeaders.length}`,
+    );
+  }
+
+  const stepIndent = indentOf(lines[stepsHeaders[0]]) + 2;
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const header = new RegExp(
+    `^${" ".repeat(stepIndent)}- name:[ \\t]+${escapedName}[ \\t]*(?:#.*)?$`,
+  );
   const starts = lines.flatMap((line, index) =>
     header.test(line) ? [index] : [],
   );
@@ -49,8 +78,8 @@ function namedStep(jobBlock: string, name: string): string {
   const end = lines.findIndex(
     (line, index) =>
       index > start &&
-      line !== "" &&
-      line.length - line.trimStart().length <= 6,
+      !isIgnorableLine(line) &&
+      indentOf(line) <= stepIndent,
   );
 
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
@@ -80,10 +109,14 @@ test("secret scanning runs on pull requests, main pushes, and manual dispatch", 
   const onBlock = onBlocks[0];
   const pushBlocks = blockAtIndent(onBlock, "push", 2);
 
-  expect(onBlock).toMatch(/^  pull_request:[ \t]*$/m);
+  expect(onBlock).toMatch(/^  pull_request:[ \t]*(?:#.*)?$/m);
   expect(pushBlocks).toHaveLength(1);
-  expect(pushBlocks[0]).toBe("  push:\n    branches:\n      - main");
-  expect(onBlock).toMatch(/^  workflow_dispatch:[ \t]*$/m);
+  const pushLines = meaningfulLines(pushBlocks[0]);
+  expect(pushLines).toHaveLength(3);
+  expect(pushLines[0]).toMatch(/^  push:[ \t]*(?:#.*)?$/);
+  expect(pushLines[1]).toMatch(/^    branches:[ \t]*(?:#.*)?$/);
+  expect(pushLines[2]).toMatch(/^      - (?:main|"main"|'main')[ \t]*(?:#.*)?$/);
+  expect(onBlock).toMatch(/^  workflow_dispatch:[ \t]*(?:#.*)?$/m);
 });
 
 test("secret scanning checks complete history with a pinned Gitleaks action", () => {
@@ -93,19 +126,19 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   const scanStep = namedStep(job, "Scan repository and Git history");
 
   expect(checkoutStep).toMatch(
-    /^[ \t]+uses:[ \t]+actions\/checkout@[^\s#]+[ \t]*$/m,
+    /^[ \t]+uses:[ \t]+actions\/checkout@[^\s#]+[ \t]*(?:#.*)?$/m,
   );
   expect(checkoutStep).toMatch(
-    /^[ \t]+fetch-depth:[ \t]*(?:0|"0"|'0')[ \t]*$/m,
+    /^[ \t]+fetch-depth:[ \t]*(?:0|"0"|'0')[ \t]*(?:#.*)?$/m,
   );
   expect(checkoutStep).toMatch(
-    /^[ \t]+persist-credentials:[ \t]*(?:false|"false"|'false')[ \t]*$/m,
+    /^[ \t]+persist-credentials:[ \t]*(?:false|"false"|'false')[ \t]*(?:#.*)?$/m,
   );
   expect(scanStep).toMatch(
     /^[ \t]+uses:[ \t]+gitleaks\/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e[ \t]+# v3\.0\.0[ \t]*$/m,
   );
   expect(scanStep).toMatch(
-    /^[ \t]+GITHUB_TOKEN:[ \t]*\$\{\{[ \t]*secrets\.GITHUB_TOKEN[ \t]*\}\}[ \t]*$/m,
+    /^[ \t]+GITHUB_TOKEN:[ \t]*\$\{\{[ \t]*secrets\.GITHUB_TOKEN[ \t]*\}\}[ \t]*(?:#.*)?$/m,
   );
 });
 
@@ -115,7 +148,12 @@ test("secret scanning uses least privilege and does not publish findings", () =>
   const permissionsBlocks = blockAtIndent(source, "permissions", 0);
 
   expect(permissionsBlocks).toHaveLength(1);
-  expect(permissionsBlocks[0]).toBe("permissions:\n  contents: read");
+  const permissionLines = meaningfulLines(permissionsBlocks[0]);
+  expect(permissionLines).toHaveLength(2);
+  expect(permissionLines[0]).toMatch(/^permissions:[ \t]*(?:#.*)?$/);
+  expect(permissionLines[1]).toMatch(
+    /^  contents:[ \t]*(?:read|"read"|'read')[ \t]*(?:#.*)?$/,
+  );
   expect(source).not.toMatch(/^[ \t]+permissions:[^\n]*$/m);
   expect(source).not.toMatch(
     /^[ \t]*(?:#[ \t]*)?[A-Za-z0-9_-]+:[ \t]*(?:write|"write"|'write')(?:[ \t]+#.*)?[ \t]*$/m,
