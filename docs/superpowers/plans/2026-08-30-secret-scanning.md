@@ -127,17 +127,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Scan repository and Git history
-        id: event-range
-        continue-on-error: true
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: "false"
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          GITLEAKS_ENABLE_SUMMARY: "true"
-      - name: Run explicit tree and full-history scans
-        if: ${{ always() }}
+      - name: Reject unreviewed root Gitleaks configuration
+        id: config-guard
         shell: bash
         run: |
           for config in gitleaks.toml .gitleaks.toml; do
@@ -146,13 +137,36 @@ jobs:
               exit 1
             fi
           done
-
-          tree_status=0
-          history_status=0
-          gitleaks dir --redact --exit-code=2 . || tree_status=$?
-          gitleaks git --redact --exit-code=2 --log-opts='--all' || history_status=$?
-
-          if [ "$tree_status" -ne 0 ] || [ "$history_status" -ne 0 ] || [ "${{ steps.event-range.outcome }}" != "success" ]; then
+      - name: Scan repository and Git history
+        id: event-range
+        if: ${{ steps.config-guard.outcome == 'success' }}
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+      - name: Run current-tree scan
+        id: tree-scan
+        if: ${{ steps.config-guard.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: gitleaks dir --redact --exit-code=2 .
+      - name: Run full-history scan
+        id: history-scan
+        if: ${{ steps.config-guard.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: gitleaks git --redact --exit-code=2 --log-opts='--all'
+      - name: Aggregate secret scanning results
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ "${{ steps.config-guard.outcome }}" != "success" ] || \
+            [ "${{ steps.event-range.outcome }}" != "success" ] || \
+            [ "${{ steps.tree-scan.outcome }}" != "success" ] || \
+            [ "${{ steps.history-scan.outcome }}" != "success" ]; then
             echo "Secret scanning failed; review the redacted findings and rotate any exposed credentials."
             exit 1
           fi

@@ -52,7 +52,7 @@ gh api --method PATCH repos/dzlab/kestrel --input - <<'JSON'
 JSON
 ```
 
-Then rerun the verification command and confirm `secret_scanning` is `enabled`. The authenticated identity used for this change read back `admin=false` and `push=false` for `dzlab/kestrel`; its enablement `PATCH` returned HTTP 404. Native Secret Scanning therefore remains pending and is not claimed to be enabled by this commit. A repository administrator with the required GitHub Secret Protection or Advanced Security entitlement must run and verify the commands. A 404 can also indicate that the authenticated identity cannot access the repository or that the repository plan does not expose the setting.
+Then rerun the verification command and confirm the returned `secret_scanning` value. Native Secret Scanning is repository state, not represented in this repository's source, so this project does not claim that it is enabled. A repository administrator with the required admin permission and GitHub Secret Protection or Advanced Security entitlement must run and verify the commands. If the setting is unavailable, the authenticated identity may lack access or the repository plan may not expose it.
 
 Push protection is intentionally outside this change. This workflow detects findings in pull requests, `main` pushes, and full history, but it does not intercept a developer's local `git push`. Do not describe Kestrel as having push protection until an administrator separately enables and verifies `secret_scanning_push_protection`.
 

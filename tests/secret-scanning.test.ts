@@ -300,7 +300,9 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
     "Reject unreviewed root Gitleaks configuration",
   );
   const scanStep = namedStep(job, "Scan repository and Git history");
-  const explicitScanStep = namedStep(job, "Run explicit tree and full-history scans");
+  const treeScanStep = namedStep(job, "Run current-tree scan");
+  const historyScanStep = namedStep(job, "Run full-history scan");
+  const aggregateStep = namedStep(job, "Aggregate secret scanning results");
   const checkoutWith = namedChildMapping(checkoutStep, "with");
   const scanEnv = namedChildMapping(scanStep, "env");
   const checkoutChildIndent = directChildIndent(checkoutStep);
@@ -338,6 +340,9 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
   expect(
     job.text.indexOf("- name: Reject unreviewed root Gitleaks configuration"),
   ).toBeLessThan(job.text.indexOf("- name: Scan repository and Git history"));
+  expect(configGuardStep.text).toMatch(
+    lineAt(directChildIndent(configGuardStep), `id:[ \\t]+config-guard`),
+  );
   expect(configGuardStep.text).toContain("gitleaks.toml");
   expect(configGuardStep.text).toContain(".gitleaks.toml");
   expect(scanStep.text).toMatch(
@@ -355,12 +360,40 @@ test("secret scanning checks complete history with a pinned Gitleaks action", ()
       `continue-on-error:[ \\t]*(?:true|"true"|'true')`,
     ),
   );
-  expect(explicitScanStep.text).toContain("gitleaks dir --redact --exit-code=2 .");
-  expect(explicitScanStep.text).toContain(
+  expect(scanStep.text).toMatch(
+    lineAt(
+      scanChildIndent,
+      `if:[ \\t]+\\$\\{\\{[ \\t]+steps\\.config-guard\\.outcome[ \\t]+==[ \\t]+'success'[ \\t]+\\}\\}`,
+    ),
+  );
+  expect(treeScanStep.text).toContain("gitleaks dir --redact --exit-code=2 .");
+  expect(historyScanStep.text).toContain(
     "gitleaks git --redact --exit-code=2 --log-opts='--all'",
   );
-  expect(explicitScanStep.text).toContain("steps.event-range.outcome");
-  expect(explicitScanStep.text).toContain("always()");
+  for (const directScanStep of [treeScanStep, historyScanStep]) {
+    expect(directScanStep.text).toMatch(
+      lineAt(
+        directChildIndent(directScanStep),
+        `if:[ \\t]+\\$\\{\\{[ \\t]+steps\\.config-guard\\.outcome[ \\t]+==[ \\t]+'success'[ \\t]+\\}\\}`,
+      ),
+    );
+    expect(directScanStep.text).toMatch(
+      lineAt(
+        directChildIndent(directScanStep),
+        `continue-on-error:[ \\t]*(?:true|"true"|'true')`,
+      ),
+    );
+    expect(directScanStep.text).not.toContain("always()");
+  }
+  expect(aggregateStep.text).toMatch(
+    lineAt(
+      directChildIndent(aggregateStep),
+      `if:[ \\t]+\\$\\{\\{[ \\t]+always\\(\\)[ \\t]+\\}\\}`,
+    ),
+  );
+  for (const stepId of ["config-guard", "event-range", "tree-scan", "history-scan"]) {
+    expect(aggregateStep.text).toContain(`steps.${stepId}.outcome`);
+  }
   expect(scanEnv.text).toMatch(
     lineAt(
       scanEnvChildIndent,
@@ -513,9 +546,16 @@ test("security documentation explains alert locations and remediation", () => {
   expect(documentation).toMatch(/revoke|rotate/i);
   expect(documentation).toMatch(/push protection/i);
   expect(documentation).toMatch(/fails closed/i);
-  expect(security).toContain("gh api repos/dzlab/kestrel");
-  expect(security).toContain("security_and_analysis");
-  expect(security).toMatch(/PATCH/);
-  expect(security).toMatch(/admin=false/);
-  expect(security).toMatch(/404/);
+  expect(security).toContain(
+    "gh api repos/dzlab/kestrel --jq '{admin: (.permissions.admin // false), push: (.permissions.push // false), secret_scanning: (.security_and_analysis.secret_scanning.status // \"unavailable\"), push_protection: (.security_and_analysis.secret_scanning_push_protection.status // \"unavailable\")}'",
+  );
+  expect(security).toContain(
+    "gh api --method PATCH repos/dzlab/kestrel --input - <<'JSON'",
+  );
+  expect(security).toContain('"status": "enabled"');
+  expect(security).toMatch(/repository administrators?/i);
+  expect(security).toMatch(/admin(?:istrator)? permission|permission.*admin/i);
+  expect(security).toMatch(/repository state|not represented in this repository/i);
+  expect(security).not.toMatch(/native Secret Scanning (?:is|remains) enabled/i);
+  expect(security).not.toMatch(/PATCH returned HTTP \d{3}/i);
 });
