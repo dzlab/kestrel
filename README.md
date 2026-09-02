@@ -49,6 +49,14 @@ Run a task from the configured workspace:
 mise exec -- bun run src/cli/main.ts run "Read README.md and summarize it"
 ```
 
+### Recorded CLI session
+
+The repository includes a reproducible [asciinema recording](docs/assets/kestrel-cli.cast) showing `--help` followed by a real read-and-summarize task through the local OpenAI-compatible proxy. Replay it with:
+
+```sh
+uvx --from asciinema asciinema play docs/assets/kestrel-cli.cast
+```
+
 The CLI prints durable results as JSON. If a tool crosses an approval boundary, `run` returns `blocked_on_approval` and includes the approval/call ID. `approve` and `deny` display the exact stored tool name and canonical arguments before recording the decision. Approval is tied to that call ID and argument hash; changing the arguments requires a new decision. A denied call is persisted as a failed run and is not retried automatically.
 
 Use `history` and `status` after restarting the CLI to inspect the same SQLite-backed state. `tick` claims at most one due schedule and runs it through the same kernel and policy path as `run`. The daemon polls on a one-second interval, uses SQLite leases and fencing tokens to prevent duplicate workers, renews long jobs, retries failures with bounded backoff, and pauses jobs that need approval.
