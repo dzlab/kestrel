@@ -51,7 +51,11 @@ mise exec -- bun run src/cli/main.ts run "Read README.md and summarize it"
 
 ### Recorded CLI session
 
-The repository includes a reproducible [asciinema recording](docs/assets/kestrel-cli.cast) showing `--help` followed by a real read-and-summarize task through the local OpenAI-compatible proxy. Replay it with:
+Here is a real Kestrel CLI session running through the local OpenAI-compatible proxy:
+
+![Kestrel CLI session](docs/assets/kestrel-cli.gif)
+
+The [asciinema source recording](docs/assets/kestrel-cli.cast) is also included for interactive replay:
 
 ```sh
 uvx --from asciinema asciinema play docs/assets/kestrel-cli.cast
