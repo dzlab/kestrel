@@ -51,7 +51,7 @@ mise exec -- bun run src/cli/main.ts run "Read README.md and summarize it"
 
 ### Recorded CLI session
 
-Here is a real Kestrel CLI session running through the local OpenAI-compatible proxy:
+Here is a real Kestrel CLI session running through the local OpenAI-compatible proxy. It covers every command and subcommand shown by `kestrel --help`, including the model-backed `run`; playback is slowed to `0.8×` for readability:
 
 ![Kestrel CLI session](docs/assets/kestrel-cli.gif)
 
