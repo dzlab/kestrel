@@ -2,7 +2,13 @@
 
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { createKestrel, loadConfig, openConfiguredDatabase } from "../index";
+import {
+  ConversationService,
+  createKestrel,
+  loadConfig,
+  openConfiguredDatabase,
+  startKestrelHttpServer,
+} from "../index";
 import { SchedulerDaemon } from "../scheduler/daemon";
 import { StoreRepository } from "../store/repository";
 import { MemoryStore } from "../memory/store";
@@ -14,6 +20,7 @@ const usage = `Kestrel local agent
 
 Usage:
   kestrel run <prompt>             Run a task in the configured workspace
+  kestrel ui                       Serve the local browser UI and API
   kestrel approve <call-id>        Approve the exact pending tool call and resume
   kestrel deny <call-id>           Deny the exact pending tool call
   kestrel history                  Show recent durable tasks
@@ -245,6 +252,77 @@ async function tickCommand(write: (message: string) => void, runtime?: CliRuntim
   }
 }
 
+async function uiCommand(write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
+  const selected = getRuntime(runtime);
+  let serverPromise: ReturnType<typeof startKestrelHttpServer> | undefined;
+  let server: Awaited<ReturnType<typeof startKestrelHttpServer>> | undefined;
+  let conversations: ConversationService | undefined;
+  let shutdownPromise: Promise<void> | undefined;
+  let shutdownRequested = false;
+  let resolveSignal: () => void = () => undefined;
+  const signalReceived = new Promise<void>((resolve) => {
+    resolveSignal = resolve;
+  });
+  const shutdown = (): Promise<void> => {
+    shutdownRequested = true;
+    shutdownPromise ??= (async () => {
+      try {
+        const serverClose = server !== undefined
+          ? server.close()
+          : serverPromise === undefined
+            ? Promise.resolve()
+            : serverPromise.then((started) => started.close());
+        const serviceClose = conversations?.shutdown() ?? Promise.resolve();
+        const [serverResult, serviceResult] = await Promise.allSettled([serverClose, serviceClose]);
+        if (serverResult.status === "rejected") throw serverResult.reason;
+        if (serviceResult.status === "rejected") throw serviceResult.reason;
+      } finally {
+        if (selected.owned) {
+          selected.runtime.close?.();
+        }
+      }
+    })();
+    return shutdownPromise;
+  };
+  const onSignal = (): void => {
+    resolveSignal();
+    void shutdown().catch(() => undefined);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    const workspace = selected.runtime.config?.workspace ?? process.env.KESTREL_WORKSPACE ?? process.cwd();
+    conversations = new ConversationService({
+      repository: selected.runtime.repository,
+      kernel: requireKernel(selected.runtime),
+      approvals: selected.runtime.approvals,
+      defaults: selected.runtime.defaults,
+    });
+    serverPromise = startKestrelHttpServer({
+      repository: selected.runtime.repository,
+      conversations,
+      workspace,
+    });
+    server = await serverPromise;
+    if (!shutdownRequested) {
+      write(`Kestrel UI listening at ${server.url}`);
+      void conversations.recoverAllAtStartup().catch((error: unknown) => {
+        write(`Kestrel conversation recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    await signalReceived;
+    await shutdown();
+    return 0;
+  } finally {
+    try {
+      await shutdown();
+    } finally {
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+    }
+  }
+}
+
 async function daemonCommand(args: readonly string[], write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
   const action = args[1];
   const path = pidPath();
@@ -305,6 +383,10 @@ export function runCli(
     return 0;
   }
   const command = args[0];
+  if (command === "ui") return uiCommand(write, runtime).catch((error) => {
+    write(error instanceof Error ? error.message : String(error));
+    return 1;
+  });
   if (command === "run") return runCommand(args, write, runtime).catch((error) => {
     write(error instanceof Error ? error.message : String(error));
     return 1;

@@ -1,12 +1,50 @@
 import type { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type {
+  ConversationMessageRecord,
+  ConversationRecord,
+  ConversationRole,
+} from "../conversations/types";
 import { PersistenceError, ValidationError } from "../errors";
 import { parseMessage } from "../protocol/validation";
 import type { Message, RunStatus, ToolCall } from "../protocol/types";
 import { immediateTransaction } from "./transaction";
 import { redactUnknown } from "../tools/redaction";
+import { truncateUtf8 } from "../tools/types";
 
 type Row = Record<string, unknown>;
+
+const MAX_CONVERSATION_LIST_LIMIT = 100;
+const MAX_CONVERSATION_MESSAGE_LIMIT = 1_000;
+const MAX_CONVERSATION_TASK_LIMIT = 1_000;
+const MAX_EVENT_PAGE_LIMIT = 1_000;
+const MAX_TOOL_EVENT_NAME_BYTES = 128;
+const CALL_ID_HASH = /^[0-9a-f]{64}$/u;
+
+function callIdHash(callId: string): string {
+  return createHash("sha256").update(callId).digest("hex");
+}
+
+function withCallIdHash(payload: unknown): unknown {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.callId !== "string") return payload;
+  if (typeof record.callIdHash === "string" && CALL_ID_HASH.test(record.callIdHash)) return payload;
+  return { ...record, callIdHash: callIdHash(record.callId) };
+}
+
+function durableEventPayload(payload: unknown): unknown {
+  return redactUnknown(withCallIdHash(payload));
+}
+
+function boundedToolStartedPayload(call: ToolCall): Record<string, unknown> {
+  const name = truncateUtf8(call.name, MAX_TOOL_EVENT_NAME_BYTES);
+  return redactUnknown({
+    callIdHash: callIdHash(call.id),
+    name,
+    nameTruncated: name !== call.name,
+  }) as Record<string, unknown>;
+}
 
 export type TaskRecord = {
   id: string;
@@ -78,6 +116,7 @@ export type ApprovalRecord = {
   resolvedAt?: number | null;
   consumedAt?: number | null;
   expiredAt?: number | null;
+  cancelledAt?: number | null;
   version?: number;
 };
 
@@ -192,7 +231,7 @@ function eventFromRow(row: Row): EventRecord {
       runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
       taskId: row.task_id === null || row.task_id === undefined ? null : String(row.task_id),
       type: String(row.type),
-      payload: parseJson<unknown>(row.payload),
+      payload: redactUnknown(parseJson<unknown>(row.payload)),
       createdAt: Number(row.created_at),
     };
   } catch (error) {
@@ -238,6 +277,56 @@ function taskFromRow(row: Row): TaskRecord {
   };
 }
 
+function conversationFromRow(row: Row): ConversationRecord {
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    workspace: String(row.workspace),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+const conversationRoles: readonly ConversationRole[] = ["user", "assistant"];
+
+function parseConversationRole(value: unknown): ConversationRole {
+  if (typeof value !== "string" || !conversationRoles.includes(value as ConversationRole)) {
+    throw new PersistenceError(`invalid persisted conversation role: ${String(value)}`);
+  }
+  return value as ConversationRole;
+}
+
+function conversationMessageFromRow(row: Row): ConversationMessageRecord {
+  return {
+    conversationId: String(row.conversation_id),
+    sequenceNumber: Number(row.sequence_number),
+    role: parseConversationRole(row.role),
+    content: String(row.content),
+    runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
+    createdAt: Number(row.created_at),
+  };
+}
+
+function requireNonEmptyText(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ValidationError(`${name} must be non-empty text`);
+  }
+  return value;
+}
+
+function requireLimit(value: number, name: string, maximum: number): void {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new ValidationError(`${name} must be between 1 and ${maximum}`);
+  }
+}
+
+function requireConversationRole(value: unknown): ConversationRole {
+  if (typeof value !== "string" || !conversationRoles.includes(value as ConversationRole)) {
+    throw new ValidationError("conversation message role must be user or assistant");
+  }
+  return value as ConversationRole;
+}
+
 function runFromRow(row: Row): RunRecord {
   let options: RunOptionsSnapshot = {};
   if (row.options !== null && row.options !== undefined) {
@@ -274,6 +363,7 @@ function approvalFromRow(row: Row): ApprovalRecord {
     resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? null : Number(row.resolved_at),
     consumedAt: row.consumed_at === null || row.consumed_at === undefined ? null : Number(row.consumed_at),
     expiredAt: row.expired_at === null || row.expired_at === undefined ? null : Number(row.expired_at),
+    cancelledAt: row.cancelled_at === null || row.cancelled_at === undefined ? null : Number(row.cancelled_at),
     version: Number(row.version),
   };
 }
@@ -362,6 +452,273 @@ function scheduleFromRow(row: Row): ScheduleRecord {
 export class StoreRepository {
   constructor(private readonly database: Database) {}
 
+  createConversation(input: { title: string; workspace: string }): ConversationRecord {
+    const title = requireNonEmptyText(input.title, "conversation title");
+    const workspace = requireNonEmptyText(input.workspace, "conversation workspace");
+    const id = randomUUID();
+    const timestamp = Date.now();
+    this.database
+      .query(
+        `INSERT INTO conversations (id, title, workspace, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(id, title, workspace, timestamp, timestamp);
+    return conversationFromRow(this.database.query("SELECT * FROM conversations WHERE id = ?").get(id) as Row);
+  }
+
+  listConversations(limit = 50): ConversationRecord[] {
+    requireLimit(limit, "conversation history limit", MAX_CONVERSATION_LIST_LIMIT);
+    const rows = this.database
+      .query("SELECT * FROM conversations ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?")
+      .all(limit) as Row[];
+    return rows.map(conversationFromRow);
+  }
+
+  listRecoverableConversationIds(
+    afterConversationId: string | null = null,
+    limit = MAX_CONVERSATION_LIST_LIMIT,
+  ): string[] {
+    requireLimit(limit, "recoverable conversation limit", MAX_CONVERSATION_LIST_LIMIT);
+    if (afterConversationId !== null && afterConversationId.length === 0) {
+      throw new ValidationError("recoverable conversation cursor must be non-empty");
+    }
+    const rows = this.database
+      .query(
+        `SELECT DISTINCT conversation_tasks.conversation_id
+         FROM conversation_tasks
+         INNER JOIN tasks ON tasks.id = conversation_tasks.task_id
+         LEFT JOIN runs AS latest_run ON latest_run.id = (
+           SELECT candidate.id
+           FROM runs AS candidate
+           WHERE candidate.task_id = tasks.id
+           ORDER BY candidate.started_at DESC, candidate.rowid DESC
+           LIMIT 1
+         )
+         WHERE (? IS NULL OR conversation_tasks.conversation_id > ?)
+           AND conversation_tasks.task_id = (
+             SELECT latest_task.task_id
+             FROM conversation_tasks AS latest_task
+             WHERE latest_task.conversation_id = conversation_tasks.conversation_id
+             ORDER BY latest_task.created_at DESC, latest_task.task_id DESC
+             LIMIT 1
+           )
+           AND (
+             tasks.status IN ('pending', 'running', 'blocked_on_approval')
+             OR (
+               latest_run.status = 'completed'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM conversation_messages
+                 WHERE conversation_messages.conversation_id = conversation_tasks.conversation_id
+                   AND conversation_messages.role = 'assistant'
+                   AND conversation_messages.run_id = latest_run.id
+               )
+             )
+           )
+         ORDER BY conversation_tasks.conversation_id ASC
+         LIMIT ?`,
+      )
+      .all(afterConversationId, afterConversationId, limit) as { conversation_id: string }[];
+    return rows.map((row) => String(row.conversation_id));
+  }
+
+  getConversation(conversationId: string): ConversationRecord | null {
+    const row = this.database.query("SELECT * FROM conversations WHERE id = ?").get(conversationId) as Row | null;
+    return row === null ? null : conversationFromRow(row);
+  }
+
+  getConversationForRun(runId: string): ConversationRecord | null {
+    const row = this.database
+      .query(
+        `SELECT conversations.* FROM runs
+         INNER JOIN conversation_tasks ON conversation_tasks.task_id = runs.task_id
+         INNER JOIN conversations ON conversations.id = conversation_tasks.conversation_id
+         WHERE runs.id = ?
+         LIMIT 1`,
+      )
+      .get(runId) as Row | null;
+    return row === null ? null : conversationFromRow(row);
+  }
+
+  createConversationTurn(
+    conversationId: string,
+    input: { title: string; content: string; maxSteps: number },
+  ): { conversationMessage: ConversationMessageRecord; task: TaskRecord } {
+    const title = requireNonEmptyText(input.title, "task title");
+    const content = requireNonEmptyText(input.content, "conversation message content");
+    if (!Number.isSafeInteger(input.maxSteps) || input.maxSteps <= 0) {
+      throw new ValidationError("task max steps must be a positive integer");
+    }
+
+    return immediateTransaction(this.database, () => {
+      const conversationRow = this.database
+        .query("SELECT * FROM conversations WHERE id = ?")
+        .get(conversationId) as Row | null;
+      if (conversationRow === null) throw new PersistenceError(`conversation ${conversationId} was not found`);
+      const conversation = conversationFromRow(conversationRow);
+      const taskId = randomUUID();
+      const timestamp = Date.now();
+
+      this.database
+        .query(
+          `INSERT INTO tasks (id, title, prompt, workspace, max_steps, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(taskId, title, content, conversation.workspace, input.maxSteps, "pending", timestamp, timestamp);
+      this.database
+        .query("INSERT INTO events (task_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(
+          taskId,
+          "created",
+          json(redactUnknown({ title, prompt: content, workspace: conversation.workspace, maxSteps: input.maxSteps })),
+          timestamp,
+        );
+      this.database
+        .query("INSERT INTO conversation_tasks (task_id, conversation_id, created_at) VALUES (?, ?, ?)")
+        .run(taskId, conversationId, timestamp);
+
+      const sequence = this.database
+        .query(
+          `SELECT COALESCE(MAX(sequence_number), -1) + 1 AS sequence_number
+           FROM conversation_messages WHERE conversation_id = ?`,
+        )
+        .get(conversationId) as { sequence_number: number };
+      this.database
+        .query(
+          `INSERT INTO conversation_messages
+             (conversation_id, sequence_number, role, content, run_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(conversationId, sequence.sequence_number, "user", content, null, timestamp);
+      this.database
+        .query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .run(timestamp, conversationId);
+
+      const messageRow = this.database
+        .query("SELECT * FROM conversation_messages WHERE conversation_id = ? AND sequence_number = ?")
+        .get(conversationId, sequence.sequence_number) as Row;
+      const taskRow = this.database.query("SELECT * FROM tasks WHERE id = ?").get(taskId) as Row;
+      return { conversationMessage: conversationMessageFromRow(messageRow), task: taskFromRow(taskRow) };
+    });
+  }
+
+  appendConversationMessage(
+    conversationId: string,
+    input: { role: ConversationRole; content: string; runId?: string | null },
+  ): ConversationMessageRecord {
+    const role = requireConversationRole(input.role);
+    const content = requireNonEmptyText(input.content, "conversation message content");
+    if (input.runId !== undefined && input.runId !== null) {
+      requireNonEmptyText(input.runId, "conversation message run ID");
+    }
+
+    return immediateTransaction(this.database, () => {
+      if (this.database.query("SELECT 1 FROM conversations WHERE id = ?").get(conversationId) === null) {
+        throw new PersistenceError(`conversation ${conversationId} was not found`);
+      }
+      if (
+        input.runId !== undefined &&
+        input.runId !== null &&
+        this.database
+          .query(
+            `SELECT 1 FROM runs
+             INNER JOIN conversation_tasks ON conversation_tasks.task_id = runs.task_id
+             WHERE runs.id = ? AND conversation_tasks.conversation_id = ?`,
+          )
+          .get(input.runId, conversationId) === null
+      ) {
+        throw new PersistenceError(`run ${input.runId} does not belong to conversation ${conversationId}`);
+      }
+      const sequence = this.database
+        .query(
+          `SELECT COALESCE(MAX(sequence_number), -1) + 1 AS sequence_number
+           FROM conversation_messages WHERE conversation_id = ?`,
+        )
+        .get(conversationId) as { sequence_number: number };
+      const timestamp = Date.now();
+      this.database
+        .query(
+          `INSERT INTO conversation_messages
+             (conversation_id, sequence_number, role, content, run_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(conversationId, sequence.sequence_number, role, content, input.runId ?? null, timestamp);
+      this.database
+        .query("UPDATE conversations SET updated_at = ? WHERE id = ?")
+        .run(timestamp, conversationId);
+      const row = this.database
+        .query("SELECT * FROM conversation_messages WHERE conversation_id = ? AND sequence_number = ?")
+        .get(conversationId, sequence.sequence_number) as Row;
+      return conversationMessageFromRow(row);
+    });
+  }
+
+  listConversationMessages(conversationId: string, limit = 100): ConversationMessageRecord[] {
+    requireLimit(limit, "conversation message limit", MAX_CONVERSATION_MESSAGE_LIMIT);
+    const rows = this.database
+      .query(
+        `SELECT * FROM (
+           SELECT * FROM conversation_messages
+           WHERE conversation_id = ?
+           ORDER BY sequence_number DESC
+           LIMIT ?
+         ) ORDER BY sequence_number ASC`,
+      )
+      .all(conversationId, limit) as Row[];
+    return rows.map(conversationMessageFromRow);
+  }
+
+  listConversationMessagesBefore(
+    conversationId: string,
+    beforeSequence: number | null,
+    limit = 100,
+  ): { messages: ConversationMessageRecord[]; hasMore: boolean } {
+    requireLimit(limit, "conversation message page limit", MAX_CONVERSATION_MESSAGE_LIMIT);
+    if (beforeSequence !== null && (!Number.isSafeInteger(beforeSequence) || beforeSequence < 0)) {
+      throw new ValidationError("conversation message cursor must be a non-negative integer");
+    }
+    const queryLimit = limit + 1;
+    const rows = (beforeSequence === null
+      ? this.database
+        .query(
+          `SELECT * FROM conversation_messages
+           WHERE conversation_id = ?
+           ORDER BY sequence_number DESC
+           LIMIT ?`,
+        )
+        .all(conversationId, queryLimit)
+      : this.database
+        .query(
+          `SELECT * FROM conversation_messages
+           WHERE conversation_id = ? AND sequence_number < ?
+           ORDER BY sequence_number DESC
+           LIMIT ?`,
+        )
+        .all(conversationId, beforeSequence, queryLimit)) as Row[];
+    const hasMore = rows.length > limit;
+    return {
+      messages: rows.slice(0, limit).reverse().map(conversationMessageFromRow),
+      hasMore,
+    };
+  }
+
+  listConversationTasks(conversationId: string, limit = 100): TaskRecord[] {
+    requireLimit(limit, "conversation task limit", MAX_CONVERSATION_TASK_LIMIT);
+    const rows = this.database
+      .query(
+        `SELECT tasks.* FROM (
+           SELECT task_id, created_at FROM conversation_tasks
+           WHERE conversation_id = ?
+           ORDER BY created_at DESC, task_id DESC
+           LIMIT ?
+         ) AS recent
+         INNER JOIN tasks ON tasks.id = recent.task_id
+         ORDER BY recent.created_at ASC, recent.task_id ASC`,
+      )
+      .all(conversationId, limit) as Row[];
+    return rows.map(taskFromRow);
+  }
+
   listTasks(limit = 50): TaskRecord[] {
     if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
       throw new ValidationError("task history limit must be between 1 and 100");
@@ -425,6 +782,13 @@ export class StoreRepository {
     return row === null ? null : runFromRow(row);
   }
 
+  getLatestRunForTask(taskId: string): RunRecord | null {
+    const row = this.database
+      .query("SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1")
+      .get(taskId) as Row | null;
+    return row === null ? null : runFromRow(row);
+  }
+
   getMessages(runId: string): Message[] {
     const rows = this.database
       .query("SELECT * FROM messages WHERE run_id = ? ORDER BY sequence_number")
@@ -439,6 +803,34 @@ export class StoreRepository {
     return rows.map(eventFromRow);
   }
 
+  getEventsAfter(runId: string, eventId: number, limit = 100): EventRecord[] {
+    if (!Number.isSafeInteger(eventId) || eventId < 0) {
+      throw new ValidationError("event cursor must be a non-negative integer");
+    }
+    requireLimit(limit, "event page limit", MAX_EVENT_PAGE_LIMIT);
+    const rows = this.database
+      .query("SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT ?")
+      .all(runId, eventId, limit) as Row[];
+    return rows.map(eventFromRow);
+  }
+
+  getRecentEvents(runId: string, limit = 100): { events: EventRecord[]; hasMore: boolean } {
+    requireLimit(limit, "recent event limit", MAX_EVENT_PAGE_LIMIT);
+    const rows = this.database
+      .query("SELECT * FROM events WHERE run_id = ? ORDER BY id DESC LIMIT ?")
+      .all(runId, limit + 1) as Row[];
+    return {
+      events: rows.slice(0, limit).reverse().map(eventFromRow),
+      hasMore: rows.length > limit,
+    };
+  }
+
+  hasRunEvent(runId: string, type: string): boolean {
+    return this.database
+      .query("SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1")
+      .get(runId, type) !== null;
+  }
+
   appendMessage(runId: string, message: Message): void {
     immediateTransaction(this.database, () => {
       const row = this.database
@@ -447,6 +839,29 @@ export class StoreRepository {
       this.database
         .query("INSERT INTO messages (run_id, sequence_number, payload, created_at) VALUES (?, ?, ?, ?)")
         .run(runId, row.sequence_number, json(message), Date.now());
+    });
+  }
+
+  initializeRunMessages(runId: string, messages: readonly Message[]): boolean {
+    return immediateTransaction(this.database, () => {
+      const run = this.database.query("SELECT task_id FROM runs WHERE id = ?").get(runId) as { task_id: string } | null;
+      if (run === null) throw new PersistenceError(`run ${runId} was not found`);
+      const existingMessage = this.database.query("SELECT 1 FROM messages WHERE run_id = ? LIMIT 1").get(runId);
+      const startedEvent = this.database
+        .query("SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1")
+        .get(runId, "run.started");
+      if (existingMessage !== null || startedEvent !== null) return false;
+
+      const timestamp = Date.now();
+      for (let sequenceNumber = 0; sequenceNumber < messages.length; sequenceNumber += 1) {
+        this.database
+          .query("INSERT INTO messages (run_id, sequence_number, payload, created_at) VALUES (?, ?, ?, ?)")
+          .run(runId, sequenceNumber, json(messages[sequenceNumber]!), timestamp);
+      }
+      this.database
+        .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(runId, "run.started", json({ taskId: run.task_id }), timestamp);
+      return true;
     });
   }
 
@@ -490,11 +905,116 @@ export class StoreRepository {
     });
   }
 
+  cancelBlockedConversationRun(conversationId: string, runId: string): RunRecord {
+    return immediateTransaction(this.database, () => {
+      const runRow = this.database
+        .query(
+          `SELECT runs.* FROM runs
+           INNER JOIN conversation_tasks ON conversation_tasks.task_id = runs.task_id
+           WHERE runs.id = ? AND conversation_tasks.conversation_id = ?`,
+        )
+        .get(runId, conversationId) as Row | null;
+      if (runRow === null) throw new ValidationError(`run ${runId} does not belong to conversation ${conversationId}`);
+      const run = runFromRow(runRow);
+      if (run.status !== "blocked_on_approval") {
+        throw new ValidationError(`run ${runId} is not blocked on approval`);
+      }
+
+      const callRow = this.database
+        .query(
+          `SELECT * FROM tool_calls
+           WHERE run_id = ? AND state = 'awaiting_approval' AND finished_at IS NULL
+           ORDER BY created_at, id
+           LIMIT 1`,
+        )
+        .get(runId) as Row | null;
+      if (callRow === null) throw new ValidationError(`run ${runId} has no awaiting approval call`);
+      const call = toolCallFromRow(callRow);
+      const now = Date.now();
+      const cancelledResult = redactUnknown({ ok: false, content: "tool execution cancelled" });
+
+      const approvalRow = this.database
+        .query(
+          `SELECT * FROM approvals
+           WHERE call_id = ? AND run_id = ?
+           ORDER BY requested_at DESC
+           LIMIT 1`,
+        )
+        .get(call.callId, runId) as Row | null;
+      if (approvalRow !== null) {
+        const approval = approvalFromRow(approvalRow);
+        if (approval.consumedAt !== null) {
+          throw new ValidationError(`approval for run ${runId} was already consumed`);
+        }
+        if (approval.cancelledAt === null || approval.cancelledAt === undefined) {
+          const update = this.database
+            .query(
+              `UPDATE approvals
+               SET cancelled_at = ?, resolved_at = ?, version = version + 1
+               WHERE call_id = ? AND arguments_hash = ? AND version = ?
+                 AND consumed_at IS NULL AND cancelled_at IS NULL`,
+            )
+            .run(now, now, approval.callId, approval.argumentsHash, approval.version ?? 0);
+          if (update.changes !== 1) throw new PersistenceError(`approval for run ${runId} could not be cancelled`);
+          this.database
+            .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+            .run(run.taskId, runId, "approval.cancelled", json(boundedToolStartedPayload({
+              id: call.callId,
+              name: call.name,
+              arguments: call.arguments,
+            })), now);
+        }
+      }
+
+      const toolUpdate = this.database
+        .query(
+          `UPDATE tool_calls
+           SET result = ?, state = 'cancelled', finished_at = ?
+           WHERE run_id = ? AND call_id = ? AND state = 'awaiting_approval' AND finished_at IS NULL`,
+        )
+        .run(json(cancelledResult), now, runId, call.callId);
+      if (toolUpdate.changes !== 1) throw new PersistenceError(`awaiting tool call for run ${runId} could not be cancelled`);
+
+      const runUpdate = this.database
+        .query("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'blocked_on_approval'")
+        .run(now, runId);
+      if (runUpdate.changes !== 1) throw new PersistenceError(`run ${runId} could not be cancelled`);
+      this.database
+        .query("UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ?")
+        .run(now, run.taskId);
+      this.database
+        .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(runId, "tool.cancelled", json(boundedToolStartedPayload({
+          id: call.callId,
+          name: call.name,
+          arguments: call.arguments,
+        })), now);
+      this.database
+        .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(runId, "run.cancelled", json(redactUnknown({ error: "run was cancelled" })), now);
+      return runFromRow(this.database.query("SELECT * FROM runs WHERE id = ?").get(runId) as Row);
+    });
+  }
+
   appendEvent(runId: string, type: string, payload: unknown): void {
+    let eventPayload = withCallIdHash(payload);
+    if (
+      type === "tool.cancelled" &&
+      eventPayload !== null &&
+      typeof eventPayload === "object" &&
+      !Array.isArray(eventPayload) &&
+      typeof (eventPayload as Record<string, unknown>).callId === "string"
+    ) {
+      const { callId, ...rest } = eventPayload as Record<string, unknown> & { callId: string };
+      const call = this.getToolCall(callId);
+      eventPayload = call === null
+        ? rest
+        : { ...rest, ...boundedToolStartedPayload({ id: call.callId, name: call.name, arguments: call.arguments }) };
+    }
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-        .run(runId, type, json(redactUnknown(payload)), Date.now());
+        .run(runId, type, json(durableEventPayload(eventPayload)), Date.now());
     });
   }
 
@@ -510,6 +1030,14 @@ export class StoreRepository {
         .run(runId, call.id, call.name, argumentsJson, state, Date.now());
 
       if (result.changes === 1) {
+        this.database
+          .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+          .run(
+            runId,
+            "tool.started",
+            json(boundedToolStartedPayload(call)),
+            Date.now(),
+          );
         return true;
       }
 
@@ -564,8 +1092,8 @@ export class StoreRepository {
       const inserted = this.database
         .query(
           `INSERT INTO approvals
-            (call_id, arguments_hash, tool, task_id, run_id, capability, risk_level, decision, requested_at, expires_at, resolved_at, consumed_at, expired_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (call_id, arguments_hash, tool, task_id, run_id, capability, risk_level, decision, requested_at, expires_at, resolved_at, consumed_at, expired_at, version, cancelled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (call_id, arguments_hash) DO NOTHING`,
         )
         .run(
@@ -583,6 +1111,7 @@ export class StoreRepository {
           input.consumedAt ?? null,
           input.expiredAt ?? null,
           input.version ?? 0,
+          input.cancelledAt ?? null,
         );
       const stored = approvalFromRow(this.database
         .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
@@ -590,7 +1119,13 @@ export class StoreRepository {
       if (inserted.changes === 1) {
         this.database
           .query("INSERT INTO events (task_id, run_id, type, payload, created_at) SELECT task_id, run_id, ?, ?, ? FROM approvals WHERE call_id = ? AND arguments_hash = ?")
-          .run("approval.requested", json({ callId: input.callId, argumentsHash: input.argumentsHash }), input.resolvedAt ?? Date.now(), input.callId, input.argumentsHash);
+          .run(
+            "approval.requested",
+            json(durableEventPayload({ callId: input.callId, argumentsHash: input.argumentsHash })),
+            input.resolvedAt ?? Date.now(),
+            input.callId,
+            input.argumentsHash,
+          );
       }
       return stored;
     });
@@ -623,7 +1158,7 @@ export class StoreRepository {
         .query(
           `UPDATE approvals SET decision = ?, resolved_at = ?, version = version + 1
            WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision = ?
-             AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
+             AND consumed_at IS NULL AND expired_at IS NULL AND cancelled_at IS NULL AND expires_at > ?`,
         )
         .run(decision, now, callId, argumentsHash, expectedVersion, expectedDecision, now);
       if (updated.changes !== 1) return null;
@@ -642,6 +1177,7 @@ export class StoreRepository {
       const record = approvalFromRow(current);
       if (record.consumedAt !== null && record.consumedAt !== undefined) return null;
       if (record.expiredAt !== null && record.expiredAt !== undefined) return null;
+      if (record.cancelledAt !== null && record.cancelledAt !== undefined) return null;
       if (record.decision !== "approved" || record.version !== expectedVersion) return null;
       if (record.expiresAt === undefined || now >= record.expiresAt) {
         this.expireApprovalInTransaction(record, now, expectedVersion, "approved");
@@ -651,7 +1187,7 @@ export class StoreRepository {
         .query(
           `UPDATE approvals SET consumed_at = ?, resolved_at = ?, version = version + 1
            WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision = 'approved'
-             AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
+             AND consumed_at IS NULL AND expired_at IS NULL AND cancelled_at IS NULL AND expires_at > ?`,
         )
         .run(now, now, callId, argumentsHash, expectedVersion, now);
       if (updated.changes !== 1) return null;
@@ -674,12 +1210,14 @@ export class StoreRepository {
 
   private expireApprovalInTransaction(record: ApprovalRecord, now: number, expectedVersion: number, expectedDecision?: "pending" | "approved"): ApprovalRecord | null {
     if (record.expiredAt !== null && record.expiredAt !== undefined) return record;
+    if (record.cancelledAt !== null && record.cancelledAt !== undefined) return record;
     if (record.expiresAt === undefined || now < record.expiresAt) return record;
     const updated = this.database
       .query(
         `UPDATE approvals SET expired_at = ?, resolved_at = ?, version = version + 1
          WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision IN ('pending', 'approved')
-           AND (? IS NULL OR decision = ?) AND consumed_at IS NULL AND expired_at IS NULL`,
+           AND (? IS NULL OR decision = ?) AND consumed_at IS NULL AND expired_at IS NULL
+           AND cancelled_at IS NULL`,
       )
       .run(now, now, record.callId, record.argumentsHash, expectedVersion, expectedDecision ?? null, expectedDecision ?? null);
     if (updated.changes !== 1) return approvalFromRow(this.database.query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?").get(record.callId, record.argumentsHash) as Row);
@@ -691,7 +1229,13 @@ export class StoreRepository {
   private appendApprovalEvent(record: ApprovalRecord, type: string, createdAt: number): void {
     this.database
       .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(record.taskId ?? null, record.runId ?? null, type, json({ callId: record.callId, argumentsHash: record.argumentsHash }), createdAt);
+      .run(
+        record.taskId ?? null,
+        record.runId ?? null,
+        type,
+        json(durableEventPayload({ callId: record.callId, argumentsHash: record.argumentsHash })),
+        createdAt,
+      );
   }
 
   saveMemory(input: MemoryRecord): void {
@@ -1008,7 +1552,13 @@ export class StoreRepository {
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(taskId ?? null, runId ?? null, type, json({ scheduleId, ...((payload !== null && typeof payload === "object") ? payload : { value: payload }) }), Date.now());
+        .run(
+          taskId ?? null,
+          runId ?? null,
+          type,
+          json(durableEventPayload({ scheduleId, ...((payload !== null && typeof payload === "object") ? payload : { value: payload }) })),
+          Date.now(),
+        );
     });
   }
 

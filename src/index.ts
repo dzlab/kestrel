@@ -110,6 +110,23 @@ export type {
   RunSummary,
   RunTask,
 } from "./kernel";
+export { ConversationService } from "./conversations/service";
+export type { ConversationServiceDependencies } from "./conversations/service";
+export type {
+  ConversationApprovalDetails,
+  ConversationApprovalDecision,
+  ConversationMessageRecord,
+  ConversationMessageRole,
+  ConversationRecord,
+  ConversationRole,
+  ConversationRunOptions,
+  ConversationState,
+  ConversationTurnInput,
+  ConversationTurnResult,
+  ResolveApprovalDecision,
+  SubmitTurnInput,
+  SubmitTurnResult,
+} from "./conversations/types";
 export {
   MemoryStore,
   assertSafeMemory,
@@ -125,6 +142,8 @@ export type {
 export { FakeModel } from "./model/fake";
 export { OpenAICompatibleClient } from "./model/openai-compatible";
 export type { ModelClient } from "./model/client";
+export { startKestrelHttpServer } from "./http/server";
+export type { KestrelHttpServer, StartKestrelHttpServerOptions } from "./http/server";
 export { openDatabase } from "./store/database";
 export { StoreRepository, Repository } from "./store/repository";
 export type {

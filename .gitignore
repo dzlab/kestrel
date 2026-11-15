@@ -1,5 +1,7 @@
 node_modules/
+ui/dist/
 .kestrel-data/
+.worktrees/
 .env
 .env.*
 !.env.example

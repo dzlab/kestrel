@@ -19,6 +19,7 @@ function isRisk(value: string): value is Risk {
 }
 
 function statusOf(record: ApprovalStoreRecord): ApprovalStatus {
+  if (record.cancelledAt !== null && record.cancelledAt !== undefined) return "cancelled";
   if (record.consumedAt !== null && record.consumedAt !== undefined) return "consumed";
   if (record.expiredAt !== null && record.expiredAt !== undefined) return "expired";
   return record.decision;
@@ -227,6 +228,7 @@ export class ApprovalManager {
       version: record.version ?? 0,
       ...(record.consumedAt === null || record.consumedAt === undefined ? {} : { consumedAt: record.consumedAt }),
       ...(record.expiredAt === null || record.expiredAt === undefined ? {} : { expiredAt: record.expiredAt }),
+      ...(record.cancelledAt === null || record.cancelledAt === undefined ? {} : { cancelledAt: record.cancelledAt }),
     };
   }
 
@@ -279,7 +281,7 @@ export class ApprovalManager {
   }
 
   private expireIfNeeded(request: ApprovalRequest, now: number): boolean {
-    if (request.status === "consumed" || request.status === "expired") return true;
+    if (request.status === "consumed" || request.status === "expired" || request.status === "cancelled") return true;
     if (now < request.expiresAt) return false;
     if (this.store !== undefined) {
       const expired = this.store.expireApproval(request.id, request.argumentsHash, now, request.version);
@@ -316,6 +318,7 @@ export class ApprovalManager {
       resolvedAt,
       consumedAt: request.consumedAt,
       expiredAt: request.status === "expired" ? request.expiredAt : null,
+      cancelledAt: request.status === "cancelled" ? request.cancelledAt : null,
       version: request.version,
     });
   }
@@ -338,6 +341,7 @@ export class ApprovalManager {
     request.version = record.version ?? request.version;
     request.consumedAt = record.consumedAt;
     request.expiredAt = record.expiredAt;
+    request.cancelledAt = record.cancelledAt;
   }
 }
 

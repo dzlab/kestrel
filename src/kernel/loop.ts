@@ -37,6 +37,7 @@ export type RunTask = {
 export type RunOptions = {
   runId?: string;
   idempotencyKey?: string;
+  initialMessages?: readonly Message[];
   modelName?: string;
   maxTurns?: number;
   maxToolCalls?: number;
@@ -220,20 +221,22 @@ export class RunKernel {
     if (options.signal?.aborted) return this.cancel(run, "run was cancelled");
     let messages = this.repository.getMessages(run.id);
     if (messages.length === 0) {
-      const memories = options.memoryContext === undefined
-        ? []
-        : new MemoryStore(this.repository).search({
-            query: options.memoryContext.query,
-            scope: options.memoryContext.scope,
-            userId: options.userId ?? "local",
-            taskId: task.id,
-            maxResults: options.memoryContext.maxResults,
-            maxBytes: options.memoryContext.maxBytes,
-          });
-      for (const message of buildInitialMessages(task, limits.contextBytes, memories)) this.repository.appendMessage(run.id, message);
-      this.repository.appendEvent(run.id, "run.started", { taskId: task.id });
+      const initialMessages = options.initialMessages ?? (() => {
+        const memories = options.memoryContext === undefined
+          ? []
+          : new MemoryStore(this.repository).search({
+              query: options.memoryContext.query,
+              scope: options.memoryContext.scope,
+              userId: options.userId ?? "local",
+              taskId: task.id,
+              maxResults: options.memoryContext.maxResults,
+              maxBytes: options.memoryContext.maxBytes,
+            });
+        return buildInitialMessages(task, limits.contextBytes, memories);
+      })();
+      const initialized = this.repository.initializeRunMessages(run.id, initialMessages);
       messages = this.repository.getMessages(run.id);
-      this.repository.updateRunStatus(run.id, "running");
+      if (initialized) this.repository.updateRunStatus(run.id, "running");
     }
 
     const pending = this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null && !isSyntheticUpgradeApprovalCall(call));
@@ -456,6 +459,11 @@ export class RunKernel {
     if (approval.status !== "approved") {
       const result = { ok: false, content: `approval ${approval.status}` } satisfies ToolResult;
       this.repository.finishToolCall(run.id, call.callId, result, "denied");
+      this.repository.appendEvent(run.id, "tool.denied", {
+        callId: call.callId,
+        outcome: approval.status,
+        result,
+      });
       this.repository.appendMessage(run.id, buildToolMessage(call.callId, result));
       return this.fail(run, `approval ${approval.status} for ${call.name}`);
     }
@@ -508,7 +516,13 @@ export class RunKernel {
 
   private summary(run: RunRecord): RunSummary {
     const messages = this.repository.getMessages(run.id);
-    const answer = [...messages].reverse().find((message) => message.role === "assistant" && message.toolCalls === undefined)?.content;
+    const answer = [...messages]
+      .reverse()
+      .find((message) => (
+        message.role === "assistant" &&
+        (message.toolCalls === undefined || message.toolCalls.length === 0)
+      ))
+      ?.content;
     const approval = this.repository.getToolCalls(run.id).find((call) => call.state === "awaiting_approval" && !isSyntheticUpgradeApprovalCall(call));
     return {
       taskId: run.taskId,

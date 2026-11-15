@@ -84,7 +84,20 @@ test("runs multiple tool turns, persists messages/events, and returns the final 
     const runId = result.runId;
     expect(state.database.query("SELECT COUNT(*) AS count FROM messages WHERE run_id = ?").get(runId)).toEqual({ count: 7 });
     expect(state.database.query("SELECT COUNT(*) AS count FROM tool_calls WHERE run_id = ?").get(runId)).toEqual({ count: 2 });
-    expect(state.database.query("SELECT COUNT(*) AS count FROM events WHERE run_id = ?").get(runId)).toEqual({ count: 10 });
+    expect(state.repository.getEvents(runId).map((event) => event.type)).toEqual([
+      "run.started",
+      "model.requested",
+      "model.responded",
+      "tool.started",
+      "tool.completed",
+      "model.requested",
+      "model.responded",
+      "tool.started",
+      "tool.completed",
+      "model.requested",
+      "model.responded",
+      "run.completed",
+    ]);
   } finally {
     state.cleanup();
   }

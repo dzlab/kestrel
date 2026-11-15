@@ -1,4 +1,5 @@
 import type { ApprovalManager } from "../policy/approvals";
+import type { ApprovalStatus } from "../policy/types";
 import type { StoreRepository } from "../store/repository";
 
 export const SYNTHETIC_UPGRADE_APPROVAL_PREFIX = "approval-upgrade-";
@@ -33,7 +34,7 @@ export type UpgradeProposalStatus = "proposed" | "applying" | "applied" | "faile
 export type UpgradeApproval = {
   id: string;
   argumentsHash: string;
-  status: "pending" | "approved" | "denied" | "expired" | "consumed";
+  status: ApprovalStatus;
 };
 
 export type UpgradeProposal = {

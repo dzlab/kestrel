@@ -320,6 +320,71 @@ const versionTenSql = `
       ALTER TABLE runs ADD COLUMN options TEXT NOT NULL DEFAULT '{}';
     `;
 
+const versionElevenSql = `
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE conversation_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        sequence_number INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        run_id TEXT REFERENCES runs(id),
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE conversation_tasks (
+        task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_conversations_recent
+        ON conversations(updated_at DESC, created_at DESC, id DESC);
+      CREATE UNIQUE INDEX idx_conversation_messages_sequence
+        ON conversation_messages(conversation_id, sequence_number);
+      CREATE INDEX idx_conversation_tasks_conversation
+        ON conversation_tasks(conversation_id, created_at, task_id);
+      CREATE INDEX idx_events_run_id
+        ON events(run_id, id);
+    `;
+
+const versionTwelveSql = `
+      CREATE TABLE approvals_v12 (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        tool TEXT NOT NULL DEFAULT '',
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        consumed_at INTEGER,
+        expired_at INTEGER,
+        version INTEGER NOT NULL DEFAULT 0,
+        cancelled_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      );
+      INSERT INTO approvals_v12
+        (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision,
+         requested_at, resolved_at, tool, expires_at, consumed_at, expired_at, version, cancelled_at)
+      SELECT call_id, arguments_hash, task_id, run_id, capability, risk_level, decision,
+             requested_at, resolved_at, tool, expires_at, consumed_at, expired_at, version, NULL
+      FROM approvals;
+      DROP TABLE approvals;
+      ALTER TABLE approvals_v12 RENAME TO approvals;
+      CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -337,6 +402,8 @@ export const migrations: readonly Migration[] = [
   { version: 8, sql: versionEightSql },
   { version: 9, sql: versionNineSql, prepare: prepareVersionNine },
   { version: 10, sql: versionTenSql },
+  { version: 11, sql: versionElevenSql },
+  { version: 12, sql: versionTwelveSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -448,6 +515,28 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "consumed_at", type: "INTEGER" },
     { name: "expired_at", type: "INTEGER" },
     { name: "version", type: "INTEGER" },
+    { name: "cancelled_at", type: "INTEGER" },
+  ],
+  conversations: [
+    { name: "id", type: "TEXT" },
+    { name: "title", type: "TEXT" },
+    { name: "workspace", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+    { name: "updated_at", type: "INTEGER" },
+  ],
+  conversation_messages: [
+    { name: "id", type: "INTEGER" },
+    { name: "conversation_id", type: "TEXT" },
+    { name: "sequence_number", type: "INTEGER" },
+    { name: "role", type: "TEXT" },
+    { name: "content", type: "TEXT" },
+    { name: "run_id", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
+  ],
+  conversation_tasks: [
+    { name: "task_id", type: "TEXT" },
+    { name: "conversation_id", type: "TEXT" },
+    { name: "created_at", type: "INTEGER" },
   ],
 };
 
@@ -461,6 +550,9 @@ const requiredPrimaryKeys: Readonly<Record<string, Readonly<Record<string, numbe
   memories: { id: 1 },
   schedules: { id: 1 },
   approvals: { call_id: 1, arguments_hash: 2 },
+  conversations: { id: 1 },
+  conversation_messages: { id: 1 },
+  conversation_tasks: { task_id: 1 },
 };
 
 const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
@@ -473,6 +565,9 @@ const requiredNotNullColumns: Readonly<Record<string, readonly string[]>> = {
   memories: ["kind", "content", "metadata", "created_at", "updated_at", "scope", "user_id", "tags", "source", "source_task_id"],
   schedules: ["prompt", "enabled", "created_at", "name", "workspace", "time_zone", "attempts"],
   approvals: ["call_id", "arguments_hash", "tool", "capability", "risk_level", "decision", "requested_at", "expires_at", "version"],
+  conversations: ["title", "workspace", "created_at", "updated_at"],
+  conversation_messages: ["conversation_id", "sequence_number", "role", "content", "created_at"],
+  conversation_tasks: ["task_id", "conversation_id", "created_at"],
 };
 
 const legacyMemoryColumns: readonly ColumnDefinition[] = [
@@ -553,6 +648,15 @@ const requiredForeignKeys: Readonly<Record<string, readonly ForeignKeyDefinition
     foreignKey("tasks", "task_id", "id"),
     foreignKey("runs", "run_id", "id"),
   ],
+  conversations: [],
+  conversation_messages: [
+    foreignKey("conversations", "conversation_id", "id"),
+    foreignKey("runs", "run_id", "id"),
+  ],
+  conversation_tasks: [
+    foreignKey("tasks", "task_id", "id"),
+    foreignKey("conversations", "conversation_id", "id"),
+  ],
 };
 
 const requiredTableUniqueConstraints = [
@@ -560,7 +664,7 @@ const requiredTableUniqueConstraints = [
   { table: "messages", columns: ["run_id", "sequence_number"] },
 ] as const;
 
-const requiredIndexes = [
+const historicalRequiredIndexes = [
   {
     name: "idx_tool_calls_call_id",
     table: "tool_calls",
@@ -616,6 +720,38 @@ const requiredIndexes = [
     unique: false,
     columns: ["call_id", "arguments_hash"],
     sql: "create index idx_approvals_call_hash on approvals(call_id, arguments_hash)",
+  },
+] as const;
+
+const requiredIndexes = [
+  ...historicalRequiredIndexes,
+  {
+    name: "idx_conversations_recent",
+    table: "conversations",
+    unique: false,
+    columns: ["updated_at", "created_at", "id"],
+    sql: "create index idx_conversations_recent on conversations(updated_at desc, created_at desc, id desc)",
+  },
+  {
+    name: "idx_conversation_messages_sequence",
+    table: "conversation_messages",
+    unique: true,
+    columns: ["conversation_id", "sequence_number"],
+    sql: "create unique index idx_conversation_messages_sequence on conversation_messages(conversation_id, sequence_number)",
+  },
+  {
+    name: "idx_conversation_tasks_conversation",
+    table: "conversation_tasks",
+    unique: false,
+    columns: ["conversation_id", "created_at", "task_id"],
+    sql: "create index idx_conversation_tasks_conversation on conversation_tasks(conversation_id, created_at, task_id)",
+  },
+  {
+    name: "idx_events_run_id",
+    table: "events",
+    unique: false,
+    columns: ["run_id", "id"],
+    sql: "create index idx_events_run_id on events(run_id, id)",
   },
 ] as const;
 
@@ -970,7 +1106,7 @@ function prepareVersionNine(database: Database): void {
   for (const table of backupTables) {
     database.exec(`INSERT INTO ${table} SELECT * FROM _kestrel_v9_${table}`);
   }
-  for (const index of requiredIndexes) {
+  for (const index of historicalRequiredIndexes) {
     database.exec(index.sql);
   }
   database.exec(`
@@ -1405,10 +1541,10 @@ function assertLineageSchema(database: Database, lineage: SchemaLineage, checkIn
     .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'")
     .all() as Array<{ name: string }>;
   if (lineage.hasIndexes) {
-    if (actualIndexes.length !== requiredIndexes.length) {
+    if (actualIndexes.length !== historicalRequiredIndexes.length) {
       fail("migration 1 checksum does not match the schema lineage indexes");
     }
-    for (const index of requiredIndexes) {
+    for (const index of historicalRequiredIndexes) {
       const actual = database
         .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
         .get(index.name) as { sql: string | null } | null;
@@ -1538,6 +1674,7 @@ const currentApprovalTableDefinition = {
       consumed_at INTEGER,
       expired_at INTEGER,
       version INTEGER NOT NULL DEFAULT 0,
+      cancelled_at INTEGER,
       PRIMARY KEY (call_id, arguments_hash)
     )
   `),
@@ -1555,6 +1692,42 @@ function assertCurrentRebuildSources(database: Database): void {
 }
 
 const requiredCurrentTableDefinitions = [
+  {
+    table: "conversations",
+    sql: normalizedSql(`
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `),
+  },
+  {
+    table: "conversation_messages",
+    sql: normalizedSql(`
+      CREATE TABLE conversation_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        sequence_number INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        run_id TEXT REFERENCES runs(id),
+        created_at INTEGER NOT NULL
+      )
+    `),
+  },
+  {
+    table: "conversation_tasks",
+    sql: normalizedSql(`
+      CREATE TABLE conversation_tasks (
+        task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),
+        conversation_id TEXT NOT NULL REFERENCES conversations(id),
+        created_at INTEGER NOT NULL
+      )
+    `),
+  },
   {
     table: "messages",
     sql: normalizedSql(`

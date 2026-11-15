@@ -323,6 +323,18 @@ export function readWorkspaceText(workspace: string, path: string): { content: s
   }
 }
 
+/** Opens a regular file by walking every path component with openat(O_NOFOLLOW). */
+export function openSecureFileRead(workspace: string, path: string): number {
+  const fd = openFileAt(workspace, path, READ_FLAGS);
+  try {
+    requireRegular(fd, "read");
+    return fd;
+  } catch (error) {
+    closeFd(fd);
+    throw error;
+  }
+}
+
 export function readSecureFileText(fd: number): { content: string; truncated: boolean } {
   requireRegular(fd, "read");
   const buffer = Buffer.alloc(MAX_READ_BYTES + 1);
