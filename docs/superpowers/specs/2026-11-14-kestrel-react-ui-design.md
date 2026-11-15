@@ -42,7 +42,7 @@ Kestrel RunKernel, PolicyEngine, ApprovalManager, StoreRepository
 Configured model endpoint, workspace, and SQLite state
 ```
 
-The Bun server binds to loopback and serves the production frontend and API from one origin. Development can use Vite with a proxy to the Bun API. The API facade constructs and owns the existing Kestrel runtime; browser code receives no model credentials and cannot call tools directly.
+The Bun server is embedded in the Kestrel process: one `kestrel ui` command starts the runtime and serves the production frontend and local API from one origin. Users do not install, configure, or manage a separate backend service. Development can use Vite with a proxy to the same API. The API facade constructs and owns the existing Kestrel runtime; browser code receives no model credentials and cannot call tools directly. Closing the foreground UI command stops this web server and its runtime; the existing optional scheduler daemon remains a separate feature with its own lifecycle.
 
 ### Conversation persistence
 
