@@ -131,6 +131,8 @@ mise exec -- bun run smoke
 
 Frontend source development uses `ui:dev` as described above. `ui:build` is reserved for packaging/release preparation; generated `ui/dist/` assets are not committed.
 
+The package allowlist explicitly includes generated `ui/dist/` assets even though that directory remains ignored by Git. The exact dependency-license review and the disposition of the build-only CC-BY-4.0 data dependency are recorded in [docs/dependency-licenses.md](docs/dependency-licenses.md).
+
 GitHub Actions runs the same `check` and `smoke` commands on macOS and Linux for both Bun 1.4.0 and the latest Bun release on pull requests and pushes to `main`. Unsupported operating systems fail closed. The repository also runs actionlint, scheduled CodeQL analysis, and pull-request dependency review. CI installs the committed npm lockfile with `npm ci --ignore-scripts`; local Bun development remains supported through `bun install`.
 
 ## Secret scanning

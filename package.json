@@ -9,6 +9,14 @@
   "bin": {
     "kestrel": "src/cli/main.ts"
   },
+  "files": [
+    "src/",
+    "ui/dist/",
+    "README.md",
+    "docs/architecture.md",
+    "docs/security.md",
+    "docs/dependency-licenses.md"
+  ],
   "scripts": {
     "test": "bun test",
     "test:watch": "bun test --watch",

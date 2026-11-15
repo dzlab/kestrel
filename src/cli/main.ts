@@ -252,31 +252,35 @@ async function tickCommand(write: (message: string) => void, runtime?: CliRuntim
   }
 }
 
-function waitForShutdownSignal(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const stop = (): void => {
-      process.removeListener("SIGINT", stop);
-      process.removeListener("SIGTERM", stop);
-      resolve();
-    };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-  });
-}
-
 async function uiCommand(write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
   const selected = getRuntime(runtime);
-  let server: Awaited<ReturnType<typeof startKestrelHttpServer>> | undefined;
-  let closed = false;
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    try {
-      await server?.close();
-    } finally {
-      if (selected.owned) selected.runtime.close?.();
-    }
+  let serverPromise: ReturnType<typeof startKestrelHttpServer> | undefined;
+  let shutdownPromise: Promise<void> | undefined;
+  let shutdownRequested = false;
+  let resolveSignal: () => void = () => undefined;
+  const signalReceived = new Promise<void>((resolve) => {
+    resolveSignal = resolve;
+  });
+  const shutdown = (): Promise<void> => {
+    shutdownRequested = true;
+    shutdownPromise ??= (async () => {
+      try {
+        if (serverPromise !== undefined) {
+          const server = await serverPromise;
+          await server.close();
+        }
+      } finally {
+        if (selected.owned) selected.runtime.close?.();
+      }
+    })();
+    return shutdownPromise;
   };
+  const onSignal = (): void => {
+    resolveSignal();
+    void shutdown().catch(() => undefined);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   try {
     const workspace = selected.runtime.config?.workspace ?? process.env.KESTREL_WORKSPACE ?? process.cwd();
     const conversations = new ConversationService({
@@ -285,16 +289,23 @@ async function uiCommand(write: (message: string) => void, runtime?: CliRuntime)
       approvals: selected.runtime.approvals,
       defaults: selected.runtime.defaults,
     });
-    server = await startKestrelHttpServer({
+    serverPromise = startKestrelHttpServer({
       repository: selected.runtime.repository,
       conversations,
       workspace,
     });
-    write(`Kestrel UI listening at ${server.url}`);
-    await waitForShutdownSignal();
+    const server = await serverPromise;
+    if (!shutdownRequested) write(`Kestrel UI listening at ${server.url}`);
+    await signalReceived;
+    await shutdown();
     return 0;
   } finally {
-    await close();
+    try {
+      await shutdown();
+    } finally {
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+    }
   }
 }
 
