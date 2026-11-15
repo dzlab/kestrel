@@ -372,6 +372,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const submit = useCallback(async (message: AppendMessage) => {
     const conversationId = selectedRef.current;
     if (conversationId === null) throw new ApiError(400, "NO_CONVERSATION", "select a conversation first");
+    const ownerVersion = loadVersion.current;
     if (state === "running" || state === "blocked_on_approval") {
       throw new ApiError(409, "CONVERSATION_BUSY", "finish the active turn before sending another message");
     }
@@ -379,16 +380,17 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     setState("running");
     try {
       const started = await api.submitTurn(conversationId, textFromAppend(message));
+      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
       openEventStream(conversationId, started.runId);
       const next = await api.getConversation(conversationId);
-      if (selectedRef.current !== conversationId) return;
+      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
       setDetail(next);
       detailRef.current = next;
       setState(stateFromDetail(next));
       void refreshList();
     } catch (cause) {
       const nextError = asApiError(cause);
-      if (selectedRef.current === conversationId) {
+      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) {
         setError(nextError);
         setState(detailRef.current === null ? "ready" : stateFromDetail(detailRef.current));
       }
@@ -416,6 +418,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     const conversationId = selectedRef.current;
     const approval = current?.pendingApproval;
     if (current?.activeRun === undefined || approval === undefined || conversationId === null) return;
+    const ownerVersion = loadVersion.current;
     if (decision === "approve" && approvalArguments === null) {
       setError(new ApiError(409, "ARGUMENTS_NOT_READY", "wait for the exact approval arguments to load"));
       return;
@@ -424,15 +427,16 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     setError(null);
     try {
       await api.resolveApproval(conversationId, current.activeRun.id, approval, decision);
+      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
       setState("running");
       const next = await api.getConversation(conversationId);
-      if (selectedRef.current === conversationId) {
+      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) {
         setDetail(next);
         detailRef.current = next;
         setState(stateFromDetail(next));
       }
     } catch (cause) {
-      if (selectedRef.current === conversationId) setError(asApiError(cause));
+      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) setError(asApiError(cause));
     } finally {
       setActionPending(false);
     }
