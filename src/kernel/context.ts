@@ -78,28 +78,37 @@ export function boundMessages(messages: readonly Message[], contextBytes = DEFAU
   const budget = Math.max(MIN_CONTEXT_BYTES, contextBytes);
   if (messages.length === 0) return [];
   const first = messages[0]!;
-  const second = messages.length > 1 && messages[1]!.role === "user" ? messages[1]! : undefined;
-  const result: Message[] = [];
-  if (second !== undefined) {
+  let currentUserIndex: number | undefined;
+  for (let index = messages.length - 1; index >= 1; index -= 1) {
+    if (messages[index]!.role === "user") {
+      currentUserIndex = index;
+      break;
+    }
+  }
+  const selected: { index: number; message: Message }[] = [];
+  if (currentUserIndex !== undefined) {
     const firstBudget = Math.max(1, Math.floor((budget - 1) / 2));
-    const secondBudget = Math.max(1, budget - firstBudget - 1);
-    result.push(compactMessage(first, firstBudget));
-    result.push(compactMessage(second, secondBudget));
+    const userBudget = Math.max(1, budget - firstBudget - 1);
+    selected.push({ index: 0, message: compactMessage(first, firstBudget) });
+    selected.push({ index: currentUserIndex, message: compactMessage(messages[currentUserIndex]!, userBudget) });
   } else {
-    result.push(compactMessage(first, budget));
+    selected.push({ index: 0, message: compactMessage(first, budget) });
   }
 
-  let used = jsonBytes(result);
-  for (let index = messages.length - 1; index >= 2; index -= 1) {
+  let used = jsonBytes(selected.map((entry) => entry.message));
+  for (let index = messages.length - 1; index >= 1; index -= 1) {
+    if (index === currentUserIndex) continue;
     const message = messages[index]!;
-    const available = budget - used - (result.length > 0 ? 1 : 0);
+    const available = budget - used - (selected.length > 0 ? 1 : 0);
     if (available <= 0) break;
     const bounded = compactMessage(message, available);
     if (jsonBytes(bounded) > available) continue;
-    result.splice(second === undefined ? 1 : 2, 0, bounded);
+    selected.push({ index, message: bounded });
     used += jsonBytes(bounded) + 1;
   }
-  return result;
+  return selected
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.message);
 }
 
 export function buildToolMessage(callId: string, result: ToolResult): Message {
