@@ -255,6 +255,8 @@ async function tickCommand(write: (message: string) => void, runtime?: CliRuntim
 async function uiCommand(write: (message: string) => void, runtime?: CliRuntime): Promise<number> {
   const selected = getRuntime(runtime);
   let serverPromise: ReturnType<typeof startKestrelHttpServer> | undefined;
+  let server: Awaited<ReturnType<typeof startKestrelHttpServer>> | undefined;
+  let conversations: ConversationService | undefined;
   let shutdownPromise: Promise<void> | undefined;
   let shutdownRequested = false;
   let resolveSignal: () => void = () => undefined;
@@ -265,12 +267,19 @@ async function uiCommand(write: (message: string) => void, runtime?: CliRuntime)
     shutdownRequested = true;
     shutdownPromise ??= (async () => {
       try {
-        if (serverPromise !== undefined) {
-          const server = await serverPromise;
-          await server.close();
-        }
+        const serverClose = server !== undefined
+          ? server.close()
+          : serverPromise === undefined
+            ? Promise.resolve()
+            : serverPromise.then((started) => started.close());
+        const serviceClose = conversations?.shutdown() ?? Promise.resolve();
+        const [serverResult, serviceResult] = await Promise.allSettled([serverClose, serviceClose]);
+        if (serverResult.status === "rejected") throw serverResult.reason;
+        if (serviceResult.status === "rejected") throw serviceResult.reason;
       } finally {
-        if (selected.owned) selected.runtime.close?.();
+        if (selected.owned) {
+          selected.runtime.close?.();
+        }
       }
     })();
     return shutdownPromise;
@@ -283,7 +292,7 @@ async function uiCommand(write: (message: string) => void, runtime?: CliRuntime)
   process.on("SIGTERM", onSignal);
   try {
     const workspace = selected.runtime.config?.workspace ?? process.env.KESTREL_WORKSPACE ?? process.cwd();
-    const conversations = new ConversationService({
+    conversations = new ConversationService({
       repository: selected.runtime.repository,
       kernel: requireKernel(selected.runtime),
       approvals: selected.runtime.approvals,
@@ -294,7 +303,7 @@ async function uiCommand(write: (message: string) => void, runtime?: CliRuntime)
       conversations,
       workspace,
     });
-    const server = await serverPromise;
+    server = await serverPromise;
     if (!shutdownRequested) write(`Kestrel UI listening at ${server.url}`);
     await signalReceived;
     await shutdown();

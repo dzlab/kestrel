@@ -52,6 +52,8 @@ export class ConversationService {
   private readonly defaults: ConversationRunOptions;
   private readonly activeRuns = new Map<string, ActiveExecution>();
   private readonly activeConversations = new Map<string, string>();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | undefined;
 
   constructor(dependencies: ConversationServiceDependencies) {
     this.repository = dependencies.repository;
@@ -83,6 +85,7 @@ export class ConversationService {
     conversationId: string,
     input: ConversationTurnInput | string,
   ): Promise<ConversationTurnResult> {
+    this.assertAcceptingWork();
     const conversation = this.repository.getConversation(conversationId);
     if (conversation === null) throw new ValidationError(`conversation was not found: ${conversationId}`);
     this.assertConversationAvailable(conversationId);
@@ -105,6 +108,7 @@ export class ConversationService {
     approvalId: string,
     decision: ConversationApprovalDecision,
   ): Promise<ConversationTurnResult> {
+    this.assertAcceptingWork();
     const state = this.getConversationState(conversationId);
     const run = state.activeRun;
     if (run === undefined || run.status !== "blocked_on_approval") {
@@ -168,6 +172,7 @@ export class ConversationService {
   }
 
   async recoverConversation(conversationId: string): Promise<ConversationTurnResult | null> {
+    this.assertAcceptingWork();
     const activeRunId = this.activeConversations.get(conversationId);
     if (activeRunId !== undefined) return this.activeRuns.get(activeRunId)?.promise ?? null;
 
@@ -210,9 +215,26 @@ export class ConversationService {
   }
 
   async recoverAll(limit = 100): Promise<(ConversationTurnResult | null)[]> {
+    this.assertAcceptingWork();
     return Promise.all(
       this.repository.listConversations(limit).map((conversation) => this.recoverConversation(conversation.id)),
     );
+  }
+
+  shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.shutdownPromise ??= (() => {
+      const active = [...this.activeRuns.values()];
+      for (const execution of active) {
+        execution.controller.abort(new Error("conversation service is shutting down"));
+      }
+      return Promise.allSettled(active.map((execution) => execution.promise)).then(() => undefined);
+    })();
+    return this.shutdownPromise;
+  }
+
+  private assertAcceptingWork(): void {
+    if (this.shuttingDown) throw new ValidationError("conversation service is shutting down");
   }
 
   private assertConversationAvailable(conversationId: string): void {
@@ -270,6 +292,7 @@ export class ConversationService {
     options: ConversationRunOptions,
     initialMessages?: readonly Message[],
   ): Promise<ConversationTurnResult> {
+    this.assertAcceptingWork();
     if (this.activeConversations.has(conversationId)) {
       throw new ValidationError(`conversation ${conversationId} already has a running turn`);
     }

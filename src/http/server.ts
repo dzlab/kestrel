@@ -45,8 +45,10 @@ export async function startKestrelHttpServer(
     auth,
   });
   const serveStatic = createStaticHandler(options.uiBuildDirectory ?? DEFAULT_UI_BUILD);
+  const requests = new Set<Promise<void>>();
   const server = createServer((request, response) => {
-    void (async () => {
+    let requestPromise: Promise<void>;
+    requestPromise = (async () => {
       const requestTarget = request.url ?? "/";
       if (!requestTarget.startsWith("/") || requestTarget.startsWith("//")) {
         sendApiError(response, new TypeError("invalid request target"));
@@ -68,7 +70,10 @@ export async function startKestrelHttpServer(
         return;
       }
       serveStatic(request, response, requestTarget.split("?", 1)[0]!);
-    })().catch((error: unknown) => sendApiError(response, error));
+    })()
+      .catch((error: unknown) => sendApiError(response, error))
+      .finally(() => requests.delete(requestPromise));
+    requests.add(requestPromise);
   });
   server.on("clientError", (_error, socket) => {
     if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -99,13 +104,16 @@ export async function startKestrelHttpServer(
     listen: Object.freeze({ host: LOOPBACK_HOST, port: address.port }),
     url: `http://${LOOPBACK_HOST}:${address.port}`,
     close() {
-      closePromise ??= new Promise<void>((resolveClose, rejectClose) => {
-        server.close((error) => {
-          if (error === undefined) resolveClose();
-          else rejectClose(error);
+      closePromise ??= (async () => {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((error) => {
+            if (error === undefined) resolveClose();
+            else rejectClose(error);
+          });
+          for (const socket of sockets) socket.destroy();
         });
-        for (const socket of sockets) socket.destroy();
-      });
+        await Promise.allSettled([...requests]);
+      })();
       return closePromise;
     },
   };
