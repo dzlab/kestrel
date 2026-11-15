@@ -268,7 +268,7 @@ export class KestrelApi {
   private sessionPromise?: Promise<void>;
   private sessionRefresh?: Promise<void>;
 
-  constructor(private readonly fetcher: FetchLike = fetch) {}
+  constructor(private readonly fetcher: FetchLike = (input, init) => globalThis.fetch(input, init)) {}
 
   bootstrapSession(): Promise<void> {
     this.sessionPromise ??= this.request("/api/session", undefined, (value) => {
