@@ -117,7 +117,6 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const [approvalArgumentsLoading, setApprovalArgumentsLoading] = useState(false);
   const streamRef = useRef<RunEventStream | null>(null);
   const streamRecoveryRef = useRef<Promise<void> | null>(null);
-  const openEventStreamRef = useRef<(conversationId: string, runId: string) => void>(() => undefined);
   const loadVersion = useRef(0);
   const selectedRef = useRef<string | null>(null);
   const detailRef = useRef<ConversationDetail | null>(null);
@@ -146,13 +145,6 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
               setDetail(recovered);
               detailRef.current = recovered;
               setState(stateFromDetail(recovered));
-              setConnection("connected");
-              streamRef.current?.close();
-              streamRef.current = null;
-              const active = recovered.activeRun;
-              if (active !== undefined && (active.status === "running" || active.status === "blocked_on_approval")) {
-                openEventStreamRef.current(conversationId, active.id);
-              }
             })();
             streamRecoveryRef.current = recovery;
             void recovery.catch((cause: unknown) => {
@@ -186,6 +178,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
         }
       },
       onReconnect() {
+        if (streamRecoveryRef.current !== null) return streamRecoveryRef.current;
         return api.getConversation(conversationId).then((next) => {
           if (selectedRef.current !== conversationId) return;
           setDetail(next);
@@ -198,10 +191,10 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     streamRef.current = stream;
     stream.connect();
   }, [api, refreshList]);
-  openEventStreamRef.current = openEventStream;
 
   const loadConversation = useCallback(async (conversationId: string, updateHistory: boolean) => {
     const version = ++loadVersion.current;
+    streamRecoveryRef.current = null;
     streamRef.current?.close();
     streamRef.current = null;
     setSelectedConversationId(conversationId);
@@ -236,7 +229,8 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   }, [api, openEventStream]);
 
   const selectConversation = useCallback(async (conversationId: string) => {
-    await loadConversation(conversationId, selectedRef.current !== conversationId);
+    if (selectedRef.current === conversationId) return;
+    await loadConversation(conversationId, true);
   }, [loadConversation]);
 
   const createConversation = useCallback(async () => {

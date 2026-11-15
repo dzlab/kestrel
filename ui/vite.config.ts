@@ -14,17 +14,12 @@ export default defineConfig(({ command, mode }) => {
   }
   let proxyTarget: string | undefined;
   if (apiOrigin !== undefined && apiOrigin.length > 0) {
-    const parsedApiOrigin = new URL(apiOrigin);
-    if (
-      parsedApiOrigin.protocol !== "http:" ||
-      (parsedApiOrigin.hostname !== "127.0.0.1" && parsedApiOrigin.hostname !== "localhost") ||
-      parsedApiOrigin.pathname !== "/" ||
-      parsedApiOrigin.search.length > 0 ||
-      parsedApiOrigin.hash.length > 0
-    ) {
-      throw new Error("KESTREL_API_ORIGIN must be an http://127.0.0.1:<port> loopback origin");
+    const match = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})$/u.exec(apiOrigin);
+    const port = match === null ? Number.NaN : Number(match[1]);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+      throw new Error("KESTREL_API_ORIGIN must match the printed http://127.0.0.1:<port> server origin");
     }
-    proxyTarget = parsedApiOrigin.origin;
+    proxyTarget = apiOrigin;
   }
 
   return {
