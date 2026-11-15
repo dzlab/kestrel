@@ -380,10 +380,18 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     setState("running");
     try {
       const started = await api.submitTurn(conversationId, textFromAppend(message));
-      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
+      if (selectedRef.current !== conversationId) return;
+      if (loadVersion.current !== ownerVersion) {
+        await loadConversation(conversationId, false);
+        return;
+      }
       openEventStream(conversationId, started.runId);
       const next = await api.getConversation(conversationId);
-      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
+      if (selectedRef.current !== conversationId) return;
+      if (loadVersion.current !== ownerVersion) {
+        await loadConversation(conversationId, false);
+        return;
+      }
       setDetail(next);
       detailRef.current = next;
       setState(stateFromDetail(next));
@@ -396,7 +404,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       }
       throw nextError;
     }
-  }, [api, openEventStream, refreshList, state]);
+  }, [api, loadConversation, openEventStream, refreshList, state]);
 
   const stop = useCallback(async () => {
     const current = detailRef.current;
@@ -427,20 +435,27 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     setError(null);
     try {
       await api.resolveApproval(conversationId, current.activeRun.id, approval, decision);
-      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
+      if (selectedRef.current !== conversationId) return;
+      if (loadVersion.current !== ownerVersion) {
+        await loadConversation(conversationId, false);
+        return;
+      }
       setState("running");
       const next = await api.getConversation(conversationId);
-      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) {
-        setDetail(next);
-        detailRef.current = next;
-        setState(stateFromDetail(next));
+      if (selectedRef.current !== conversationId) return;
+      if (loadVersion.current !== ownerVersion) {
+        await loadConversation(conversationId, false);
+        return;
       }
+      setDetail(next);
+      detailRef.current = next;
+      setState(stateFromDetail(next));
     } catch (cause) {
       if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) setError(asApiError(cause));
     } finally {
       setActionPending(false);
     }
-  }, [api, approvalArguments]);
+  }, [api, approvalArguments, loadConversation]);
 
   const refreshConversation = useCallback(async () => {
     const conversationId = selectedRef.current;
