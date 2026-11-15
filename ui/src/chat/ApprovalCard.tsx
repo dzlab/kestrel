@@ -1,0 +1,75 @@
+import { AlertTriangle, LoaderCircle, ShieldCheck } from "lucide-react";
+import { useKestrelRuntime } from "./KestrelRuntime";
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+export function ApprovalCard() {
+  const runtime = useKestrelRuntime();
+  const pending = runtime.detail?.pendingApproval;
+  if (runtime.state !== "blocked_on_approval" || pending === undefined) return null;
+
+  const workdir = typeof runtime.approvalArguments?.cwd === "string"
+    ? runtime.approvalArguments.cwd
+    : pending.tool === "shell.exec" || pending.tool === "bun.run"
+      ? ". (workspace root default)"
+      : "Not applicable";
+
+  return (
+    <section className="approval-notice" aria-labelledby="approval-title">
+      <div className="approval-heading">
+        <ShieldCheck size={20} aria-hidden="true" />
+        <div>
+          <p className="eyebrow">Action required</p>
+          <h3 id="approval-title">Review {pending.tool}</h3>
+        </div>
+        <span className={`risk-pill ${pending.risk}`}>{pending.risk} risk</span>
+      </div>
+      <p>{pending.reason}</p>
+      <dl className="approval-meta">
+        <dt>Tool</dt><dd>{pending.tool}</dd>
+        <dt>Capability</dt><dd>{pending.capability}</dd>
+        <dt>Working directory</dt><dd>{workdir}</dd>
+        <dt>Run ID</dt><dd><code>{pending.runId}</code></dd>
+        <dt>Approval handle</dt><dd><code>{pending.approvalHandle}</code></dd>
+        <dt>Argument hash</dt><dd><code>{pending.argumentsHash}</code></dd>
+      </dl>
+      <div className="arguments-block">
+        <div className="arguments-heading"><span>Exact canonical stored arguments</span><span>{pending.argumentsBytes.toLocaleString()} bytes</span></div>
+        {runtime.approvalArgumentsLoading ? (
+          <p className="arguments-loading"><LoaderCircle className="spin" size={15} /> Loading exact arguments…</p>
+        ) : runtime.approvalArguments === null ? (
+          <div className="arguments-retry">
+            <p className="arguments-loading"><AlertTriangle size={15} /> Arguments unavailable; approval is disabled.</p>
+            <button type="button" disabled={runtime.actionPending} onClick={runtime.retryApprovalArguments}>
+              Retry loading arguments
+            </button>
+          </div>
+        ) : (
+          <pre>{canonicalJson(runtime.approvalArguments)}</pre>
+        )}
+      </div>
+      <div className="approval-actions">
+        <button type="button" className="deny-action" disabled={runtime.actionPending} onClick={() => void runtime.resolveApproval("deny")}>
+          {runtime.actionPending ? "Resolving…" : "Deny"}
+        </button>
+        <button
+          type="button"
+          className="approve-action"
+          disabled={runtime.actionPending || runtime.approvalArguments === null}
+          onClick={() => void runtime.resolveApproval("approve")}
+        >
+          {runtime.actionPending ? "Resolving…" : "Approve exact action"}
+        </button>
+      </div>
+    </section>
+  );
+}

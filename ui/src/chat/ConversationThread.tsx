@@ -1,31 +1,28 @@
 import {
-  AuiIf,
-  MessagePartPrimitive,
-  MessagePrimitive,
   ThreadPrimitive,
 } from "@assistant-ui/react";
-import { AlertTriangle, LoaderCircle, RefreshCw, ShieldCheck } from "lucide-react";
+import { AlertTriangle, LoaderCircle, RefreshCw } from "lucide-react";
+import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
-import { approvalSummary, formatState, useKestrelRuntime } from "./KestrelRuntime";
+import { formatState, useKestrelRuntime } from "./KestrelRuntime";
+import { MessageContent } from "./MessageContent";
+import { RunActivityFeed } from "./ToolActivityCard";
 
-function MessageText() {
-  return <MessagePartPrimitive.Text />;
-}
-
-function ThreadMessage({ role }: { role: "user" | "assistant" }) {
+function ThreadMessage({ role, content, truncated }: { role: "user" | "assistant"; content: string; truncated: boolean }) {
   return (
-    <MessagePrimitive.Root className={`message-row ${role}`} data-role={role}>
+    <article className={`message-row ${role}`} data-role={role}>
       {role === "assistant" && <div className="assistant-avatar" aria-hidden="true">K</div>}
       <div className="message-bubble">
-        <MessagePrimitive.Parts components={{ Text: MessageText }} />
+        <MessageContent content={content} />
+        {truncated && <p className="message-truncated">Message truncated by the bounded conversation response.</p>}
       </div>
-    </MessagePrimitive.Root>
+    </article>
   );
 }
 
 export function ConversationThread() {
   const runtime = useKestrelRuntime();
-  const pending = runtime.detail?.pendingApproval;
+  const messages = runtime.detail?.messages ?? [];
 
   return (
     <ThreadPrimitive.Root className="thread-root">
@@ -41,70 +38,33 @@ export function ConversationThread() {
               Load earlier messages
             </button>
           )}
-          <AuiIf condition={(value) => value.thread.isEmpty}>
+          {messages.length === 0 && (
             <div className="empty-thread">
               <div className="empty-orbit" aria-hidden="true"><span>K</span></div>
               <p className="eyebrow">A quiet workspace</p>
               <h2>What should we make today?</h2>
               <p>Kestrel can reason through a task, work in your configured workspace, and pause before sensitive actions.</p>
             </div>
-          </AuiIf>
-          <ThreadPrimitive.Messages>
-            {({ message }) => message.role === "user"
-              ? <ThreadMessage role="user" />
-              : <ThreadMessage role="assistant" />}
-          </ThreadPrimitive.Messages>
+          )}
+          {messages.map((message) => (
+            <ThreadMessage
+              key={`${message.conversationId}:${message.sequenceNumber}`}
+              role={message.role}
+              content={message.content}
+              truncated={message.contentTruncated}
+            />
+          ))}
+
+          <RunActivityFeed events={runtime.events} />
 
           {runtime.state === "running" && (
             <div className="run-notice running" role="status">
               <LoaderCircle size={17} className="spin" aria-hidden="true" />
-              <div><strong>Kestrel is working</strong><span>Tool and run activity will appear in details.</span></div>
+              <div><strong>Kestrel is working</strong><span>Durable tool activity appears above as it arrives.</span></div>
             </div>
           )}
 
-          {runtime.state === "blocked_on_approval" && pending !== undefined && (
-            <section className="approval-notice" aria-labelledby="approval-title">
-              <div className="approval-heading">
-                <ShieldCheck size={20} aria-hidden="true" />
-                <div>
-                  <p className="eyebrow">Action required</p>
-                  <h3 id="approval-title">Review {pending.tool}</h3>
-                </div>
-                <span className={`risk-pill ${pending.risk}`}>{pending.risk}</span>
-              </div>
-              <p>{pending.reason}</p>
-              <div className="approval-meta">
-                <span>Capability</span><strong>{pending.capability}</strong>
-                <span>Request</span><strong>{approvalSummary(pending)}</strong>
-              </div>
-              <div className="arguments-block">
-                <div className="arguments-heading"><span>Exact stored arguments</span><span>{pending.argumentsBytes.toLocaleString()} bytes</span></div>
-                {runtime.approvalArgumentsLoading ? (
-                  <p className="arguments-loading"><LoaderCircle className="spin" size={15} /> Loading exact arguments…</p>
-                ) : runtime.approvalArguments === null ? (
-                  <div className="arguments-retry">
-                    <p className="arguments-loading"><AlertTriangle size={15} /> Arguments unavailable; approval is disabled.</p>
-                    <button type="button" disabled={runtime.actionPending} onClick={runtime.retryApprovalArguments}>
-                      Retry loading arguments
-                    </button>
-                  </div>
-                ) : (
-                  <pre>{JSON.stringify(runtime.approvalArguments, null, 2)}</pre>
-                )}
-              </div>
-              <div className="approval-actions">
-                <button type="button" className="deny-action" disabled={runtime.actionPending} onClick={() => void runtime.resolveApproval("deny")}>Deny</button>
-                <button
-                  type="button"
-                  className="approve-action"
-                  disabled={runtime.actionPending || runtime.approvalArguments === null}
-                  onClick={() => void runtime.resolveApproval("approve")}
-                >
-                  Approve exact action
-                </button>
-              </div>
-            </section>
-          )}
+          <ApprovalCard />
 
           {runtime.state !== "ready" && runtime.state !== "running" && runtime.state !== "blocked_on_approval" && runtime.state !== "connecting" && (
             <div className={`run-notice terminal ${runtime.state}`} role="status">
