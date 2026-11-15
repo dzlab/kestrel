@@ -76,7 +76,7 @@ export function createStaticHandler(buildDirectory: string) {
       descriptor = openSecureFileRead(root, candidate);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (assetRequest || code !== "ENOENT") {
+      if (request.method !== "GET" || assetRequest || code !== "ENOENT") {
         plain(response, 404, "Not Found");
         return;
       }

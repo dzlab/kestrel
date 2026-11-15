@@ -466,6 +466,19 @@ export class StoreRepository {
     return row === null ? null : conversationFromRow(row);
   }
 
+  getConversationForRun(runId: string): ConversationRecord | null {
+    const row = this.database
+      .query(
+        `SELECT conversations.* FROM runs
+         INNER JOIN conversation_tasks ON conversation_tasks.task_id = runs.task_id
+         INNER JOIN conversations ON conversations.id = conversation_tasks.conversation_id
+         WHERE runs.id = ?
+         LIMIT 1`,
+      )
+      .get(runId) as Row | null;
+    return row === null ? null : conversationFromRow(row);
+  }
+
   createConversationTurn(
     conversationId: string,
     input: { title: string; content: string; maxSteps: number },
