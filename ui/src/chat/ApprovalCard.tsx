@@ -19,9 +19,13 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
   const instanceId = useId().replaceAll(":", "");
   const headingId = `${idPrefix}-${instanceId}-title`;
   if (pending === undefined) return null;
+  const exactArguments = runtime.approvalArguments?.approvalHandle === pending.approvalHandle &&
+    runtime.approvalArguments.argumentsHash === pending.argumentsHash
+    ? runtime.approvalArguments.value
+    : null;
 
-  const workdir = typeof runtime.approvalArguments?.cwd === "string"
-    ? runtime.approvalArguments.cwd
+  const workdir = typeof exactArguments?.cwd === "string"
+    ? exactArguments.cwd
     : pending.tool === "shell.exec" || pending.tool === "bun.run"
       ? ". (workspace root default)"
       : "Not applicable";
@@ -49,7 +53,7 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
         <div className="arguments-heading"><span>Exact canonical stored arguments</span><span>{pending.argumentsBytes.toLocaleString()} bytes</span></div>
         {runtime.approvalArgumentsLoading ? (
           <p className="arguments-loading"><LoaderCircle className="spin" size={15} /> Loading exact arguments…</p>
-        ) : runtime.approvalArguments === null ? (
+        ) : exactArguments === null ? (
           <div className="arguments-retry">
             <p className="arguments-loading"><AlertTriangle size={15} /> Arguments unavailable; approval is disabled.</p>
             <button type="button" disabled={runtime.actionPending} onClick={runtime.retryApprovalArguments}>
@@ -57,7 +61,7 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
             </button>
           </div>
         ) : (
-          <pre>{canonicalJson(runtime.approvalArguments)}</pre>
+          <pre>{canonicalJson(exactArguments)}</pre>
         )}
       </div>
       <div className="approval-actions">
@@ -67,7 +71,7 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
         <button
           type="button"
           className="approve-action"
-          disabled={runtime.actionPending || runtime.approvalArguments === null}
+          disabled={runtime.actionPending || exactArguments === null}
           onClick={() => void runtime.resolveApproval("approve")}
         >
           {runtime.actionPending ? "Resolving…" : "Approve exact action"}

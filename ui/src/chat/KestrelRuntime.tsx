@@ -29,6 +29,12 @@ import { RunEventStream } from "../api/events";
 export type KestrelUiState = "connecting" | "ready" | RunStatus | "disconnected";
 export type ConnectionState = "connecting" | "connected" | "disconnected";
 
+type LoadedApprovalArguments = {
+  approvalHandle: string;
+  argumentsHash: string;
+  value: Record<string, unknown>;
+};
+
 type KestrelRuntimeValue = {
   api: KestrelApi;
   conversations: readonly Conversation[];
@@ -40,7 +46,7 @@ type KestrelRuntimeValue = {
   connection: ConnectionState;
   error: ApiError | null;
   actionPending: boolean;
-  approvalArguments: Record<string, unknown> | null;
+  approvalArguments: LoadedApprovalArguments | null;
   approvalArgumentsLoading: boolean;
   retryApprovalArguments(): void;
   selectConversation(conversationId: string): Promise<void>;
@@ -67,6 +73,18 @@ function stateFromDetail(value: ConversationDetail): KestrelUiState {
 function hasActiveRun(value: ConversationDetail, runId: string): boolean {
   return value.activeRun?.id === runId &&
     (value.activeRun.status === "running" || value.activeRun.status === "blocked_on_approval");
+}
+
+function hasTerminalRun(value: ConversationDetail, runId: string): boolean {
+  const run = value.activeRun?.id === runId
+    ? value.activeRun
+    : value.runs.find((candidate) => candidate.id === runId);
+  return run !== undefined && (
+    run.status === "completed" ||
+    run.status === "failed" ||
+    run.status === "cancelled" ||
+    run.status === "budget_exhausted"
+  );
 }
 
 function isTerminalRunEvent(type: string): boolean {
@@ -126,7 +144,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<ApiError | null>(null);
   const [actionPending, setActionPending] = useState(false);
-  const [approvalArguments, setApprovalArguments] = useState<Record<string, unknown> | null>(null);
+  const [approvalArguments, setApprovalArguments] = useState<LoadedApprovalArguments | null>(null);
   const [approvalArgumentsLoading, setApprovalArgumentsLoading] = useState(false);
   const [approvalLoadAttempt, setApprovalLoadAttempt] = useState(0);
   const streamRef = useRef<RunEventStream | null>(null);
@@ -142,6 +160,33 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     const list = await api.listConversations();
     setConversations(list);
     return list;
+  }, [api]);
+
+  const hydrateTerminalRun = useCallback(async (
+    conversationId: string,
+    runId: string,
+    ownerVersion: number,
+    mode: "replace" | "merge" = "replace",
+    ownsStream?: () => boolean,
+  ): Promise<boolean> => {
+    const ownsRoute = (): boolean => selectedRef.current === conversationId &&
+      loadVersion.current === ownerVersion &&
+      (ownsStream?.() ?? true);
+    try {
+      const history = await api.getRunEventHistory(runId);
+      if (!ownsRoute()) return false;
+      setEvents((current) => {
+        if (mode === "replace") return history.events;
+        const merged = new Map(current.map((event) => [event.id, event]));
+        for (const event of history.events) merged.set(event.id, event);
+        return [...merged.values()].sort((left, right) => left.id - right.id);
+      });
+      setEventsTruncated((current) => mode === "merge" ? current || history.truncated : history.truncated);
+      return true;
+    } catch (cause) {
+      if (ownsRoute()) setError(asApiError(cause));
+      return false;
+    }
   }, [api]);
 
   const openEventStream = useCallback((conversationId: string, runId: string) => {
@@ -164,6 +209,17 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
               detailRef.current = recovered;
               setState(stateFromDetail(recovered));
               if (!hasActiveRun(recovered, runId)) {
+                if (hasTerminalRun(recovered, runId)) {
+                  const hydrated = await hydrateTerminalRun(
+                    conversationId,
+                    runId,
+                    ownerVersion,
+                    "merge",
+                    () => streamRef.current === stream,
+                  );
+                  if (!hydrated) return;
+                }
+                if (selectedRef.current !== conversationId || streamRef.current !== stream || loadVersion.current !== ownerVersion) return;
                 setConnection("connected");
                 stream.close();
                 if (streamRef.current === stream) streamRef.current = null;
@@ -222,12 +278,23 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       onReconnect() {
         if (streamRef.current !== stream || selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
         if (streamRecoveryRef.current !== null) return streamRecoveryRef.current;
-        return api.getConversation(conversationId).then((next) => {
+        return api.getConversation(conversationId).then(async (next) => {
           if (selectedRef.current !== conversationId || streamRef.current !== stream || loadVersion.current !== ownerVersion) return;
           setDetail(next);
           detailRef.current = next;
           setState(stateFromDetail(next));
           if (!hasActiveRun(next, runId)) {
+            if (hasTerminalRun(next, runId)) {
+              const hydrated = await hydrateTerminalRun(
+                conversationId,
+                runId,
+                ownerVersion,
+                "merge",
+                () => streamRef.current === stream,
+              );
+              if (!hydrated) return;
+            }
+            if (selectedRef.current !== conversationId || streamRef.current !== stream || loadVersion.current !== ownerVersion) return;
             stream.close();
             if (streamRef.current === stream) streamRef.current = null;
           }
@@ -245,18 +312,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     });
     streamRef.current = stream;
     stream.connect();
-  }, [api, refreshList]);
-
-  const hydrateTerminalRun = useCallback(async (conversationId: string, runId: string, ownerVersion: number) => {
-    try {
-      const history = await api.getRunEventHistory(runId);
-      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
-      setEvents(history.events);
-      setEventsTruncated(history.truncated);
-    } catch (cause) {
-      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) setError(asApiError(cause));
-    }
-  }, [api]);
+  }, [api, hydrateTerminalRun, refreshList]);
 
   const loadConversation = useCallback(async (conversationId: string, updateHistory: boolean) => {
     const version = ++loadVersion.current;
@@ -372,14 +428,18 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     let active = true;
     setApprovalArgumentsLoading(true);
     void api.getApprovalArguments(selectedConversationId, pending).then((argumentsValue) => {
-      if (active) setApprovalArguments(argumentsValue);
+      if (active) setApprovalArguments({
+        approvalHandle: pending.approvalHandle,
+        argumentsHash: pending.argumentsHash,
+        value: argumentsValue,
+      });
     }).catch((cause: unknown) => {
       if (active) setError(asApiError(cause));
     }).finally(() => {
       if (active) setApprovalArgumentsLoading(false);
     });
     return () => { active = false; };
-  }, [api, approvalLoadAttempt, pending?.approvalHandle, selectedConversationId]);
+  }, [api, approvalLoadAttempt, pending?.approvalHandle, pending?.argumentsHash, selectedConversationId]);
 
   const retryApprovalArguments = useCallback(() => {
     setError(null);
@@ -446,7 +506,14 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     const approval = current?.pendingApproval;
     if (current?.activeRun === undefined || approval === undefined || conversationId === null) return;
     const ownerVersion = loadVersion.current;
-    if (decision === "approve" && approvalArguments === null) {
+    if (
+      decision === "approve" &&
+      (
+        approvalArguments === null ||
+        approvalArguments.approvalHandle !== approval.approvalHandle ||
+        approvalArguments.argumentsHash !== approval.argumentsHash
+      )
+    ) {
       setError(new ApiError(409, "ARGUMENTS_NOT_READY", "wait for the exact approval arguments to load"));
       return;
     }
