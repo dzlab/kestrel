@@ -18,6 +18,7 @@
     "smoke": "bun run src/cli/main.ts --help",
     "ui:dev": "vite --config ui/vite.config.ts",
     "ui:build": "vite build --config ui/vite.config.ts",
+    "ui:typecheck": "tsc -p ui/tsconfig.json --noEmit",
     "diff:check": "git diff --check",
     "check": "bun run typecheck && bun test && bun run diff:check"
   },

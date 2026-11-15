@@ -116,6 +116,8 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const [approvalArguments, setApprovalArguments] = useState<Record<string, unknown> | null>(null);
   const [approvalArgumentsLoading, setApprovalArgumentsLoading] = useState(false);
   const streamRef = useRef<RunEventStream | null>(null);
+  const streamRecoveryRef = useRef<Promise<void> | null>(null);
+  const openEventStreamRef = useRef<(conversationId: string, runId: string) => void>(() => undefined);
   const loadVersion = useRef(0);
   const selectedRef = useRef<string | null>(null);
   const detailRef = useRef<ConversationDetail | null>(null);
@@ -134,8 +136,34 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     const stream = new RunEventStream(runId, {
       onConnectionChange(next) {
         setConnection(next);
-        if (next === "disconnected") setState("disconnected");
-        else if (detailRef.current !== null) setState(stateFromDetail(detailRef.current));
+        if (next === "disconnected") {
+          setState("disconnected");
+          if (streamRecoveryRef.current === null) {
+            const recovery = (async () => {
+              await api.rebootstrapSession();
+              const recovered = await api.getConversation(conversationId);
+              if (selectedRef.current !== conversationId) return;
+              setDetail(recovered);
+              detailRef.current = recovered;
+              setState(stateFromDetail(recovered));
+              setConnection("connected");
+              streamRef.current?.close();
+              streamRef.current = null;
+              const active = recovered.activeRun;
+              if (active !== undefined && (active.status === "running" || active.status === "blocked_on_approval")) {
+                openEventStreamRef.current(conversationId, active.id);
+              }
+            })();
+            streamRecoveryRef.current = recovery;
+            void recovery.catch((cause: unknown) => {
+              if (selectedRef.current === conversationId) setError(asApiError(cause));
+            }).finally(() => {
+              if (streamRecoveryRef.current === recovery) streamRecoveryRef.current = null;
+            });
+          }
+        } else if (detailRef.current !== null) {
+          setState(stateFromDetail(detailRef.current));
+        }
       },
       onEvent(event) {
         setEvents((current) => current.some((candidate) => candidate.id === event.id)
@@ -170,6 +198,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     streamRef.current = stream;
     stream.connect();
   }, [api, refreshList]);
+  openEventStreamRef.current = openEventStream;
 
   const loadConversation = useCallback(async (conversationId: string, updateHistory: boolean) => {
     const version = ++loadVersion.current;
@@ -189,6 +218,9 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       if (loadVersion.current !== version) return;
       setDetail(next);
       detailRef.current = next;
+      setConversations((current) => current.some((item) => item.id === next.conversation.id)
+        ? current.map((item) => item.id === next.conversation.id ? next.conversation : item)
+        : [next.conversation, ...current]);
       setConnection("connected");
       setState(stateFromDetail(next));
       const active = next.activeRun;
@@ -231,8 +263,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
         const list = await refreshList();
         if (cancelled) return;
         setConnection("connected");
-        let requested = currentUrlConversation();
-        if (requested !== null && !list.some((item) => item.id === requested)) requested = null;
+        const requested = currentUrlConversation();
         if (requested !== null) {
           await loadConversation(requested, false);
         } else if (list[0] !== undefined) {

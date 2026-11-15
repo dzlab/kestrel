@@ -260,6 +260,7 @@ function decodeBase64(value: string): Uint8Array {
 
 export class KestrelApi {
   private sessionPromise?: Promise<void>;
+  private sessionRefresh?: Promise<void>;
 
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
@@ -274,6 +275,18 @@ export class KestrelApi {
       throw error;
     });
     return this.sessionPromise;
+  }
+
+  async rebootstrapSession(): Promise<void> {
+    if (this.sessionRefresh !== undefined) return this.sessionRefresh;
+    this.sessionPromise = undefined;
+    const refresh = this.bootstrapSession();
+    this.sessionRefresh = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.sessionRefresh === refresh) this.sessionRefresh = undefined;
+    }
   }
 
   async listConversations(limit = 50): Promise<Conversation[]> {
@@ -453,7 +466,12 @@ export class KestrelApi {
     return `/api/workspace/image?${query}`;
   }
 
-  private async request<T>(path: string, init: RequestInit | undefined, parse: (value: unknown) => T): Promise<T> {
+  private async request<T>(
+    path: string,
+    init: RequestInit | undefined,
+    parse: (value: unknown) => T,
+    retrySession = true,
+  ): Promise<T> {
     const response = await this.fetcher(path, {
       credentials: "same-origin",
       ...init,
@@ -462,6 +480,10 @@ export class KestrelApi {
         : { "Content-Type": "application/json", ...init.headers },
     });
     const body = await json(response);
+    if (response.status === 401 && path !== "/api/session" && retrySession) {
+      await this.rebootstrapSession();
+      return this.request(path, init, parse, false);
+    }
     if (!response.ok) throw parseError(body, response.status);
     return parse(body);
   }
