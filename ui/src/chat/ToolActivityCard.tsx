@@ -6,7 +6,7 @@ const MAX_RENDERED_OUTPUT = 12_000;
 const STACK_KEY = /^(?:stack|stacktrace|errorstack)$/iu;
 const STACK_LINE = /^(?:\s*at\s+(?:async\s+)?[^\s].*(?::\d+:\d+|\([^)]*:\d+:\d+\))\s*|\s*File "[^"]+", line \d+(?:, in .+)?\s*|\s*Traceback \(most recent call last\):\s*)$/u;
 
-type ToolStatus = "running" | "completed" | "failed" | "cancelled";
+type ToolStatus = "running" | "completed" | "failed" | "cancelled" | "denied" | "expired";
 
 export type ToolActivity = {
   key: string;
@@ -115,6 +115,10 @@ export function collectToolActivities(events: readonly RunEvent[]): ToolActivity
     } else if (event.type === "tool.cancelled") {
       activity.status = "cancelled";
       activity.finishedAt = event.createdAt;
+    } else if (event.type === "tool.denied") {
+      activity.status = payload?.outcome === "expired" ? "expired" : "denied";
+      activity.finishedAt = event.createdAt;
+      activity.result = payload?.result;
     }
     activities.set(key, activity);
   }

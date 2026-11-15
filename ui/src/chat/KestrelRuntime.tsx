@@ -16,7 +16,6 @@ import {
 } from "react";
 import {
   ApiError,
-  KestrelApi,
   type Conversation,
   type ConversationDetail,
   type ConversationMessage,
@@ -24,7 +23,11 @@ import {
   type RunEvent,
   type RunStatus,
 } from "../api/client";
-import { RunEventStream } from "../api/events";
+import {
+  LocalKestrelTransport,
+  type KestrelTransport,
+  type RunEventSubscription,
+} from "../api/transport";
 
 export type KestrelUiState = "connecting" | "ready" | RunStatus | "disconnected";
 export type ConnectionState = "connecting" | "connected" | "disconnected";
@@ -36,7 +39,6 @@ type LoadedApprovalArguments = {
 };
 
 type KestrelRuntimeValue = {
-  api: KestrelApi;
   conversations: readonly Conversation[];
   selectedConversationId: string | null;
   detail: ConversationDetail | null;
@@ -48,6 +50,7 @@ type KestrelRuntimeValue = {
   actionPending: boolean;
   approvalArguments: LoadedApprovalArguments | null;
   approvalArgumentsLoading: boolean;
+  workspaceImageUrl(path: string): string | null;
   retryApprovalArguments(): void;
   selectConversation(conversationId: string): Promise<void>;
   createConversation(): Promise<void>;
@@ -133,8 +136,12 @@ function currentUrlConversation(): string | null {
   return value === null || value.length === 0 ? null : value;
 }
 
-export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactNode }>) {
-  const api = useMemo(() => new KestrelApi(), []);
+export function KestrelRuntimeProvider({
+  children,
+  transport: injectedTransport,
+}: Readonly<{ children: ReactNode; transport?: KestrelTransport }>) {
+  const localTransport = useMemo(() => new LocalKestrelTransport(), []);
+  const api = injectedTransport ?? localTransport;
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
@@ -147,7 +154,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const [approvalArguments, setApprovalArguments] = useState<LoadedApprovalArguments | null>(null);
   const [approvalArgumentsLoading, setApprovalArgumentsLoading] = useState(false);
   const [approvalLoadAttempt, setApprovalLoadAttempt] = useState(0);
-  const streamRef = useRef<RunEventStream | null>(null);
+  const streamRef = useRef<RunEventSubscription | null>(null);
   const streamRecoveryRef = useRef<Promise<void> | null>(null);
   const loadVersion = useRef(0);
   const selectedRef = useRef<string | null>(null);
@@ -193,8 +200,8 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     streamRecoveryRef.current = null;
     streamRef.current?.close();
     const ownerVersion = loadVersion.current;
-    let stream: RunEventStream;
-    stream = new RunEventStream(runId, {
+    let stream: RunEventSubscription;
+    stream = api.createRunEventStream(runId, {
       onConnectionChange(next) {
         if (streamRef.current !== stream || selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
         setConnection(next);
@@ -248,7 +255,10 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
         if (event.type === "run.failed") setState("failed");
         if (event.type === "run.cancelled") setState("cancelled");
         if (event.type === "run.budget_exhausted") setState("budget_exhausted");
-        if (event.type.startsWith("run.") && event.type !== "run.started") {
+        if (
+          (event.type.startsWith("run.") && event.type !== "run.started") ||
+          event.type === "approval.expired"
+        ) {
           void api.getConversation(conversationId).then((next) => {
             if (
               selectedRef.current !== conversationId ||
@@ -636,7 +646,6 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   });
 
   const context = useMemo<KestrelRuntimeValue>(() => ({
-    api,
     conversations,
     selectedConversationId,
     detail,
@@ -648,6 +657,9 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     actionPending,
     approvalArguments,
     approvalArgumentsLoading,
+    workspaceImageUrl: (path) => selectedConversationId === null
+      ? null
+      : api.workspaceImageUrl(selectedConversationId, path),
     retryApprovalArguments,
     selectConversation,
     createConversation,

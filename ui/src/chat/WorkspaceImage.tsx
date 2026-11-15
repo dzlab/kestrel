@@ -33,7 +33,7 @@ export function WorkspaceImage({ path, alt, title }: Readonly<{ path: string; al
   return (
     <span className="workspace-image-frame">
       <img
-        src={runtime.api.workspaceImageUrl(conversationId, path)}
+        src={runtime.workspaceImageUrl(path) ?? undefined}
         alt={alt ?? ""}
         title={title}
         loading="lazy"

@@ -1,5 +1,5 @@
 import { ValidationError } from "../errors";
-import { buildSystemMessage } from "../kernel/context";
+import { boundMessages, buildSystemMessage } from "../kernel/context";
 import type { RunKernel, RunOptions } from "../kernel/loop";
 import type { ApprovalManager } from "../policy/approvals";
 import type { Message } from "../protocol/types";
@@ -41,7 +41,10 @@ function isRunActive(run: RunRecord): boolean {
 function finalAnswer(messages: readonly Message[]): string | undefined {
   return [...messages]
     .reverse()
-    .find((message) => message.role === "assistant" && message.toolCalls === undefined)
+    .find((message) => (
+      message.role === "assistant" &&
+      (message.toolCalls === undefined || message.toolCalls.length === 0)
+    ))
     ?.content;
 }
 
@@ -52,6 +55,7 @@ export class ConversationService {
   private readonly defaults: ConversationRunOptions;
   private readonly activeRuns = new Map<string, ActiveExecution>();
   private readonly activeConversations = new Map<string, string>();
+  private recoveryPromise: Promise<(ConversationTurnResult | null)[]> | undefined;
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | undefined;
 
@@ -98,7 +102,7 @@ export class ConversationService {
       content: turn.content,
       maxSteps,
     });
-    const initialMessages = this.buildInitialContext(conversationId);
+    const initialMessages = this.buildInitialContext(conversationId, runOptions.contextBytes);
     const run = this.repository.startRun(task.id, task.id, this.snapshotOptions(task, runOptions));
     return this.execute(conversationId, task, run, runOptions, initialMessages);
   }
@@ -141,6 +145,9 @@ export class ConversationService {
       if (decision !== "approved") {
         throw new ValidationError(`approval ${approvalId} is already approved and cannot be denied`);
       }
+    } else if (approval.status === "expired" && decision === "denied") {
+      // Expired approvals are already terminal and must never execute. Resuming
+      // lets the kernel durably finish the tool call and fail the blocked run.
     } else {
       throw new ValidationError(`approval ${approvalId} is ${approval.status} and cannot be resumed`);
     }
@@ -184,7 +191,7 @@ export class ConversationService {
     if (unfinished !== undefined) {
       let run = this.repository.getLatestRunForTask(unfinished.id);
       if (run === null) {
-        const initialMessages = this.buildInitialContext(conversationId);
+        const initialMessages = this.buildInitialContext(conversationId, this.defaults.contextBytes);
         run = this.repository.startRun(
           unfinished.id,
           unfinished.id,
@@ -200,7 +207,10 @@ export class ConversationService {
         }
       }
       const initialMessages = this.repository.getMessages(run.id).length === 0
-        ? this.buildInitialContext(conversationId)
+        ? this.buildInitialContext(
+            conversationId,
+            run.options.contextBytes ?? this.defaults.contextBytes,
+          )
         : undefined;
       return this.execute(conversationId, unfinished, run, this.defaults, initialMessages);
     }
@@ -216,9 +226,14 @@ export class ConversationService {
 
   async recoverAll(limit = 100): Promise<(ConversationTurnResult | null)[]> {
     this.assertAcceptingWork();
-    return Promise.all(
+    if (this.recoveryPromise !== undefined) return this.recoveryPromise;
+    const recovery = Promise.all(
       this.repository.listConversations(limit).map((conversation) => this.recoverConversation(conversation.id)),
-    );
+    ).finally(() => {
+      if (this.recoveryPromise === recovery) this.recoveryPromise = undefined;
+    });
+    this.recoveryPromise = recovery;
+    return recovery;
   }
 
   shutdown(): Promise<void> {
@@ -258,7 +273,7 @@ export class ConversationService {
     return undefined;
   }
 
-  private buildInitialContext(conversationId: string): Message[] {
+  private buildInitialContext(conversationId: string, contextBytes?: number): Message[] {
     const conversation = this.repository.getConversation(conversationId);
     if (conversation === null) throw new ValidationError(`conversation was not found: ${conversationId}`);
     const transcript = this.repository.listConversationMessages(conversationId, MAX_CONVERSATION_RECORDS);
@@ -269,7 +284,7 @@ export class ConversationService {
       }
       messages.push({ role: message.role, content: message.content });
     }
-    return messages;
+    return boundMessages(messages, contextBytes);
   }
 
   private snapshotOptions(task: TaskRecord, options: ConversationRunOptions): RunOptionsSnapshot {

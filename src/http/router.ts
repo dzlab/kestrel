@@ -126,7 +126,7 @@ function boundedRecentEvent(event: ReturnType<typeof browserEvent>) {
 
 function enrichedBrowserEvent(repository: StoreRepository, event: EventRecord) {
   if (
-    (event.type === "tool.completed" || event.type === "tool.cancelled") &&
+    (event.type === "tool.completed" || event.type === "tool.cancelled" || event.type === "tool.denied") &&
     event.payload !== null &&
     typeof event.payload === "object" &&
     !Array.isArray(event.payload)

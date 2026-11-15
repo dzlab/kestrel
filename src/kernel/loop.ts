@@ -459,6 +459,11 @@ export class RunKernel {
     if (approval.status !== "approved") {
       const result = { ok: false, content: `approval ${approval.status}` } satisfies ToolResult;
       this.repository.finishToolCall(run.id, call.callId, result, "denied");
+      this.repository.appendEvent(run.id, "tool.denied", {
+        callId: call.callId,
+        outcome: approval.status,
+        result,
+      });
       this.repository.appendMessage(run.id, buildToolMessage(call.callId, result));
       return this.fail(run, `approval ${approval.status} for ${call.name}`);
     }
@@ -511,7 +516,13 @@ export class RunKernel {
 
   private summary(run: RunRecord): RunSummary {
     const messages = this.repository.getMessages(run.id);
-    const answer = [...messages].reverse().find((message) => message.role === "assistant" && message.toolCalls === undefined)?.content;
+    const answer = [...messages]
+      .reverse()
+      .find((message) => (
+        message.role === "assistant" &&
+        (message.toolCalls === undefined || message.toolCalls.length === 0)
+      ))
+      ?.content;
     const approval = this.repository.getToolCalls(run.id).find((call) => call.state === "awaiting_approval" && !isSyntheticUpgradeApprovalCall(call));
     return {
       taskId: run.taskId,

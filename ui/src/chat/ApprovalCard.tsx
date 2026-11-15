@@ -23,6 +23,7 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
     runtime.approvalArguments.argumentsHash === pending.argumentsHash
     ? runtime.approvalArguments.value
     : null;
+  const expired = pending.status === "expired";
 
   const workdir = typeof exactArguments?.cwd === "string"
     ? exactArguments.cwd
@@ -66,12 +67,12 @@ export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonl
       </div>
       <div className="approval-actions">
         <button type="button" className="deny-action" disabled={runtime.actionPending} onClick={() => void runtime.resolveApproval("deny")}>
-          {runtime.actionPending ? "Resolving…" : "Deny"}
+          {runtime.actionPending ? "Resolving…" : expired ? "Finalize expired action" : "Deny"}
         </button>
         <button
           type="button"
           className="approve-action"
-          disabled={runtime.actionPending || exactArguments === null}
+          disabled={runtime.actionPending || exactArguments === null || expired}
           onClick={() => void runtime.resolveApproval("approve")}
         >
           {runtime.actionPending ? "Resolving…" : "Approve exact action"}

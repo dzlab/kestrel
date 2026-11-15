@@ -7,6 +7,7 @@ const RUN_EVENT_TYPES = [
   "tool.started",
   "tool.completed",
   "tool.cancelled",
+  "tool.denied",
   "approval.requested",
   "approval.approved",
   "approval.denied",
