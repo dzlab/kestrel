@@ -2,7 +2,6 @@ import { ValidationError } from "../errors";
 import { buildSystemMessage } from "../kernel/context";
 import type { RunKernel, RunOptions } from "../kernel/loop";
 import type { ApprovalManager } from "../policy/approvals";
-import type { ApprovalRequest } from "../policy/types";
 import type { Message } from "../protocol/types";
 import type {
   RunOptionsSnapshot,
@@ -11,6 +10,7 @@ import type {
   TaskRecord,
 } from "../store/repository";
 import type {
+  ConversationApprovalDetails,
   ConversationApprovalDecision,
   ConversationRunOptions,
   ConversationState,
@@ -69,7 +69,7 @@ export class ConversationService {
     const activeRun = active?.run;
     const pendingApproval = activeRun === null || activeRun === undefined
       ? undefined
-      : this.findApproval(activeRun);
+      : this.findApproval(conversationId, activeRun);
     return {
       conversation,
       messages,
@@ -133,6 +133,12 @@ export class ConversationService {
       if (decision === "approved") this.approvals.approve(approval);
       else if (decision === "denied") this.approvals.deny(approval);
       else throw new ValidationError(`invalid approval decision: ${String(decision)}`);
+    } else if (approval.status === "approved") {
+      if (decision !== "approved") {
+        throw new ValidationError(`approval ${approvalId} is already approved and cannot be denied`);
+      }
+    } else {
+      throw new ValidationError(`approval ${approvalId} is ${approval.status} and cannot be resumed`);
     }
     return this.execute(conversationId, task, run, this.defaults);
   }
@@ -176,7 +182,7 @@ export class ConversationService {
       }
 
       if (run.status === "blocked_on_approval") {
-        const approval = this.findApproval(run);
+        const approval = this.findApproval(conversationId, run);
         if (approval?.status === "pending") {
           return this.resultForRun(conversationId, run, approval);
         }
@@ -191,7 +197,7 @@ export class ConversationService {
     if (latestTask === undefined) return null;
     const latestRun = this.repository.getLatestRunForTask(latestTask.id);
     if (latestRun === null) return null;
-    const result = this.resultForRun(conversationId, latestRun, this.findApproval(latestRun));
+    const result = this.resultForRun(conversationId, latestRun, this.findApproval(conversationId, latestRun));
     if (result.status === "completed") this.persistAssistantMessage(conversationId, result);
     return result;
   }
@@ -283,9 +289,12 @@ export class ConversationService {
     options: RunOptions,
   ): Promise<ConversationTurnResult> {
     const summary = await this.kernel.run(task, options);
-    const approval = summary.status === "blocked_on_approval" && summary.approvalId !== undefined
-      ? this.approvals.get(summary.approvalId) ?? undefined
-      : undefined;
+    const blockedRun = summary.status === "blocked_on_approval"
+      ? this.repository.getRun(summary.runId)
+      : null;
+    const approval = blockedRun === null
+      ? undefined
+      : this.findApproval(conversationId, blockedRun, summary.approvalId);
     const result: ConversationTurnResult = {
       ...summary,
       conversationId,
@@ -311,17 +320,56 @@ export class ConversationService {
     });
   }
 
-  private findApproval(run: RunRecord): ApprovalRequest | undefined {
+  private findApproval(
+    conversationId: string,
+    run: RunRecord,
+    approvalId?: string,
+  ): ConversationApprovalDetails | undefined {
+    if (!this.runBelongsToConversation(conversationId, run)) return undefined;
     const call = this.repository
       .getToolCalls(run.id)
-      .find((candidate) => candidate.finishedAt === null && candidate.state === "awaiting_approval");
-    return call === undefined ? undefined : this.approvals.get(call.callId) ?? undefined;
+      .find((candidate) => (
+        candidate.finishedAt === null &&
+        candidate.state === "awaiting_approval" &&
+        (approvalId === undefined || candidate.callId === approvalId)
+      ));
+    if (call === undefined || call.runId !== run.id) return undefined;
+    const approval = this.approvals.get(call.callId);
+    if (approval === null || approval.runId !== run.id || approval.taskId !== run.taskId) return undefined;
+    const reason = [...this.repository.getEvents(run.id)]
+      .reverse()
+      .find((event) => {
+        if (event.type !== "run.blocked_on_approval") return false;
+        if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) return false;
+        return (event.payload as Record<string, unknown>).callId === call.callId;
+      });
+    const reasonPayload = reason?.payload as Record<string, unknown> | undefined;
+    return {
+      callId: call.callId,
+      runId: run.id,
+      taskId: run.taskId,
+      tool: call.name,
+      arguments: call.arguments,
+      argumentsHash: approval.argumentsHash,
+      capability: approval.capability,
+      risk: approval.risk,
+      status: approval.status,
+      reason: typeof reasonPayload?.reason === "string" ? reasonPayload.reason : approval.summary,
+      createdAt: approval.createdAt,
+      expiresAt: approval.expiresAt,
+    };
+  }
+
+  private runBelongsToConversation(conversationId: string, run: RunRecord): boolean {
+    return this.repository
+      .listConversationTasks(conversationId, MAX_CONVERSATION_RECORDS)
+      .some((task) => task.id === run.taskId);
   }
 
   private resultForRun(
     conversationId: string,
     run: RunRecord,
-    approval?: ApprovalRequest,
+    approval?: ConversationApprovalDetails,
   ): ConversationTurnResult {
     const answer = finalAnswer(this.repository.getMessages(run.id));
     return {
@@ -330,7 +378,7 @@ export class ConversationService {
       runId: run.id,
       status: run.status,
       ...(answer === undefined ? {} : { answer }),
-      ...(approval === undefined ? {} : { approvalId: approval.id, approval }),
+      ...(approval === undefined ? {} : { approvalId: approval.callId, approval }),
     };
   }
 }

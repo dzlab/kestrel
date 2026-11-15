@@ -234,10 +234,9 @@ export class RunKernel {
             });
         return buildInitialMessages(task, limits.contextBytes, memories);
       })();
-      for (const message of initialMessages) this.repository.appendMessage(run.id, message);
-      this.repository.appendEvent(run.id, "run.started", { taskId: task.id });
+      const initialized = this.repository.initializeRunMessages(run.id, initialMessages);
       messages = this.repository.getMessages(run.id);
-      this.repository.updateRunStatus(run.id, "running");
+      if (initialized) this.repository.updateRunStatus(run.id, "running");
     }
 
     const pending = this.repository.getToolCalls(run.id).filter((call) => call.finishedAt === null && !isSyntheticUpgradeApprovalCall(call));

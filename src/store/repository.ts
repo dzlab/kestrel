@@ -700,6 +700,29 @@ export class StoreRepository {
     });
   }
 
+  initializeRunMessages(runId: string, messages: readonly Message[]): boolean {
+    return immediateTransaction(this.database, () => {
+      const run = this.database.query("SELECT task_id FROM runs WHERE id = ?").get(runId) as { task_id: string } | null;
+      if (run === null) throw new PersistenceError(`run ${runId} was not found`);
+      const existingMessage = this.database.query("SELECT 1 FROM messages WHERE run_id = ? LIMIT 1").get(runId);
+      const startedEvent = this.database
+        .query("SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1")
+        .get(runId, "run.started");
+      if (existingMessage !== null || startedEvent !== null) return false;
+
+      const timestamp = Date.now();
+      for (let sequenceNumber = 0; sequenceNumber < messages.length; sequenceNumber += 1) {
+        this.database
+          .query("INSERT INTO messages (run_id, sequence_number, payload, created_at) VALUES (?, ?, ?, ?)")
+          .run(runId, sequenceNumber, json(messages[sequenceNumber]!), timestamp);
+      }
+      this.database
+        .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+        .run(runId, "run.started", json({ taskId: run.task_id }), timestamp);
+      return true;
+    });
+  }
+
   getToolCall(callId: string): ToolCallRecord | null {
     const row = this.database.query("SELECT * FROM tool_calls WHERE call_id = ?").get(callId) as Row | null;
     return row === null ? null : toolCallFromRow(row);

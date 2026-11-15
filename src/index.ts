@@ -113,6 +113,7 @@ export type {
 export { ConversationService } from "./conversations/service";
 export type { ConversationServiceDependencies } from "./conversations/service";
 export type {
+  ConversationApprovalDetails,
   ConversationApprovalDecision,
   ConversationMessageRecord,
   ConversationMessageRole,

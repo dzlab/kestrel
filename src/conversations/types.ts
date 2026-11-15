@@ -1,5 +1,5 @@
 import type { RunOptions, RunSummary } from "../kernel/loop";
-import type { ApprovalRequest } from "../policy/types";
+import type { ApprovalStatus, Risk } from "../policy/types";
 import type { RunRecord, TaskRecord } from "../store/repository";
 
 export type ConversationMessageRole = "user" | "assistant";
@@ -22,9 +22,16 @@ export type ConversationMessageRecord = {
   createdAt: number;
 };
 
-export type ConversationRunOptions = Omit<
+export type ConversationRunOptions = Pick<
   RunOptions,
-  "runId" | "idempotencyKey" | "initialMessages" | "signal"
+  | "modelName"
+  | "maxTurns"
+  | "maxToolCalls"
+  | "maxTokens"
+  | "timeoutMs"
+  | "toolTimeoutMs"
+  | "contextBytes"
+  | "userId"
 >;
 
 export type ConversationTurnInput = {
@@ -36,9 +43,24 @@ export type ConversationTurnInput = {
 
 export type ConversationApprovalDecision = "approved" | "denied";
 
+export type ConversationApprovalDetails = {
+  callId: string;
+  runId: string;
+  taskId: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  argumentsHash: string;
+  capability: string;
+  risk: Risk;
+  status: ApprovalStatus;
+  reason: string;
+  createdAt: number;
+  expiresAt: number;
+};
+
 export type ConversationTurnResult = RunSummary & {
   conversationId: string;
-  approval?: ApprovalRequest;
+  approval?: ConversationApprovalDetails;
 };
 
 export type SubmitTurnInput = ConversationTurnInput;
@@ -50,5 +72,5 @@ export type ConversationState = {
   messages: ConversationMessageRecord[];
   tasks: TaskRecord[];
   activeRun?: RunRecord;
-  pendingApproval?: ApprovalRequest;
+  pendingApproval?: ConversationApprovalDetails;
 };
