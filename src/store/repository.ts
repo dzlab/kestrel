@@ -19,11 +19,28 @@ const MAX_CONVERSATION_MESSAGE_LIMIT = 1_000;
 const MAX_CONVERSATION_TASK_LIMIT = 1_000;
 const MAX_EVENT_PAGE_LIMIT = 1_000;
 const MAX_TOOL_EVENT_NAME_BYTES = 128;
+const CALL_ID_HASH = /^[0-9a-f]{64}$/u;
+
+function callIdHash(callId: string): string {
+  return createHash("sha256").update(callId).digest("hex");
+}
+
+function withCallIdHash(payload: unknown): unknown {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.callId !== "string") return payload;
+  if (typeof record.callIdHash === "string" && CALL_ID_HASH.test(record.callIdHash)) return payload;
+  return { ...record, callIdHash: callIdHash(record.callId) };
+}
+
+function durableEventPayload(payload: unknown): unknown {
+  return redactUnknown(withCallIdHash(payload));
+}
 
 function boundedToolStartedPayload(call: ToolCall): Record<string, unknown> {
   const name = truncateUtf8(call.name, MAX_TOOL_EVENT_NAME_BYTES);
   return redactUnknown({
-    callIdHash: createHash("sha256").update(call.id).digest("hex"),
+    callIdHash: callIdHash(call.id),
     name,
     nameTruncated: name !== call.name,
   }) as Record<string, unknown>;
@@ -921,24 +938,24 @@ export class StoreRepository {
   }
 
   appendEvent(runId: string, type: string, payload: unknown): void {
-    let eventPayload = payload;
+    let eventPayload = withCallIdHash(payload);
     if (
       type === "tool.cancelled" &&
-      payload !== null &&
-      typeof payload === "object" &&
-      !Array.isArray(payload) &&
-      typeof (payload as Record<string, unknown>).callId === "string"
+      eventPayload !== null &&
+      typeof eventPayload === "object" &&
+      !Array.isArray(eventPayload) &&
+      typeof (eventPayload as Record<string, unknown>).callId === "string"
     ) {
-      const { callId, ...rest } = payload as Record<string, unknown> & { callId: string };
+      const { callId, ...rest } = eventPayload as Record<string, unknown> & { callId: string };
       const call = this.getToolCall(callId);
       eventPayload = call === null
-        ? { ...rest, callIdHash: createHash("sha256").update(callId).digest("hex") }
+        ? rest
         : { ...rest, ...boundedToolStartedPayload({ id: call.callId, name: call.name, arguments: call.arguments }) };
     }
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-        .run(runId, type, json(redactUnknown(eventPayload)), Date.now());
+        .run(runId, type, json(durableEventPayload(eventPayload)), Date.now());
     });
   }
 
@@ -1043,7 +1060,13 @@ export class StoreRepository {
       if (inserted.changes === 1) {
         this.database
           .query("INSERT INTO events (task_id, run_id, type, payload, created_at) SELECT task_id, run_id, ?, ?, ? FROM approvals WHERE call_id = ? AND arguments_hash = ?")
-          .run("approval.requested", json({ callId: input.callId, argumentsHash: input.argumentsHash }), input.resolvedAt ?? Date.now(), input.callId, input.argumentsHash);
+          .run(
+            "approval.requested",
+            json(durableEventPayload({ callId: input.callId, argumentsHash: input.argumentsHash })),
+            input.resolvedAt ?? Date.now(),
+            input.callId,
+            input.argumentsHash,
+          );
       }
       return stored;
     });
@@ -1147,7 +1170,13 @@ export class StoreRepository {
   private appendApprovalEvent(record: ApprovalRecord, type: string, createdAt: number): void {
     this.database
       .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(record.taskId ?? null, record.runId ?? null, type, json({ callId: record.callId, argumentsHash: record.argumentsHash }), createdAt);
+      .run(
+        record.taskId ?? null,
+        record.runId ?? null,
+        type,
+        json(durableEventPayload({ callId: record.callId, argumentsHash: record.argumentsHash })),
+        createdAt,
+      );
   }
 
   saveMemory(input: MemoryRecord): void {
@@ -1464,7 +1493,13 @@ export class StoreRepository {
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(taskId ?? null, runId ?? null, type, json({ scheduleId, ...((payload !== null && typeof payload === "object") ? payload : { value: payload }) }), Date.now());
+        .run(
+          taskId ?? null,
+          runId ?? null,
+          type,
+          json(durableEventPayload({ scheduleId, ...((payload !== null && typeof payload === "object") ? payload : { value: payload }) })),
+          Date.now(),
+        );
     });
   }
 

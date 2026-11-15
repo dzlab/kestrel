@@ -1,8 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHash } from "node:crypto";
 import { ValidationError } from "../errors";
 import type { EventRecord, StoreRepository } from "../store/repository";
-import { redactUnknown } from "../tools/redaction";
 
 const EVENT_PAGE_SIZE = 100;
 const POLL_INTERVAL_MS = 500;
@@ -44,18 +42,15 @@ async function writeEventChunk(response: ServerResponse, chunk: string): Promise
   });
 }
 
-function browserEvent(event: EventRecord, storedCallIds: ReadonlyMap<string, string>): EventRecord {
+function browserEvent(event: EventRecord): EventRecord {
   if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) return event;
   const payload = event.payload as Record<string, unknown>;
   if (typeof payload.callId !== "string") return event;
-  const { callId, ...rest } = payload;
-  const storedCallId = storedCallIds.get(callId);
+  const rest = { ...payload };
+  delete rest.callId;
   return {
     ...event,
-    payload: {
-      ...rest,
-      callIdHash: createHash("sha256").update(storedCallId ?? callId).digest("hex"),
-    },
+    payload: rest,
   };
 }
 
@@ -99,15 +94,9 @@ export async function streamRunEvents(
       let pageLength = 0;
       do {
         const events = repository.getEventsAfter(runId, cursor, EVENT_PAGE_SIZE);
-        const storedCallIds = new Map<string, string>();
-        for (const call of repository.getToolCalls(runId)) {
-          storedCallIds.set(call.callId, call.callId);
-          const redacted = redactUnknown(call.callId);
-          if (typeof redacted === "string") storedCallIds.set(redacted, call.callId);
-        }
         pageLength = events.length;
         for (const storedEvent of events) {
-          const event = browserEvent(storedEvent, storedCallIds);
+          const event = browserEvent(storedEvent);
           cursor = event.id;
           const eventName = event.type.replace(/[^A-Za-z0-9_.-]/gu, "_");
           await writeEventChunk(
