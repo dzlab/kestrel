@@ -766,6 +766,17 @@ export class StoreRepository {
     return rows.map(eventFromRow);
   }
 
+  getRecentEvents(runId: string, limit = 100): { events: EventRecord[]; hasMore: boolean } {
+    requireLimit(limit, "recent event limit", MAX_EVENT_PAGE_LIMIT);
+    const rows = this.database
+      .query("SELECT * FROM events WHERE run_id = ? ORDER BY id DESC LIMIT ?")
+      .all(runId, limit + 1) as Row[];
+    return {
+      events: rows.slice(0, limit).reverse().map(eventFromRow),
+      hasMore: rows.length > limit,
+    };
+  }
+
   hasRunEvent(runId: string, type: string): boolean {
     return this.database
       .query("SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1")

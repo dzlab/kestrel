@@ -140,6 +140,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .tool-output > div strong { color: var(--warning); font-size: 8px; }
 .tool-output pre { max-height: 260px; overflow: auto; margin: 0; padding: 9px; color: #c6d7cf; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .activity-empty { margin: 2px 0; color: var(--muted); font-size: 10px; }
+.activity-output-truncated { margin: 0; color: var(--warning); font-size: 9px; }
 .run-activity { grid-template-columns: 24px minmax(0,1fr) auto; }
 .run-activity .activity-icon { color: var(--accent); }
 .run-activity.run-failed .activity-icon, .run-activity.run-cancelled .activity-icon { color: var(--danger); }

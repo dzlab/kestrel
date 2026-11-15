@@ -42,7 +42,7 @@ async function writeEventChunk(response: ServerResponse, chunk: string): Promise
   });
 }
 
-function browserEvent(event: EventRecord): EventRecord {
+export function browserEvent(event: EventRecord): EventRecord {
   if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) return event;
   const payload = event.payload as Record<string, unknown>;
   if (typeof payload.callId !== "string") return event;

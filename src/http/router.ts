@@ -11,7 +11,7 @@ import { truncateUtf8 } from "../tools/types";
 import { canonicalJson } from "../policy/rules";
 import { approvalHandle, isApprovalHandle } from "./approval-handle";
 import type { HttpAuth } from "./auth";
-import { streamRunEvents } from "./events";
+import { browserEvent, streamRunEvents } from "./events";
 import { serveWorkspaceImage } from "./workspace-preview";
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
@@ -22,6 +22,9 @@ const MAX_MESSAGE_CONTENT_JSON_BYTES = 32 * 1024;
 const MAX_APPROVAL_ARGUMENTS_JSON_BYTES = 64 * 1024;
 const DEFAULT_APPROVAL_ARGUMENT_CHUNK_BYTES = 16 * 1024;
 const MAX_APPROVAL_ARGUMENT_CHUNK_BYTES = 32 * 1024;
+const MAX_RECENT_EVENT_COUNT = 500;
+const MAX_RECENT_EVENT_RESPONSE_BYTES = 512 * 1024;
+const MAX_RECENT_EVENT_PAYLOAD_BYTES = 192 * 1024;
 
 type ApiErrorBody = { error: { code: string; message: string } };
 
@@ -78,6 +81,61 @@ function boundedJsonString(value: string, maximumBytes: number): { value: string
     }
   }
   return { value: best, truncated: true };
+}
+
+function boundPayloadStrings(value: unknown, maximumStringBytes: number): unknown {
+  if (typeof value === "string") return boundedJsonString(value, maximumStringBytes).value;
+  if (Array.isArray(value)) return value.map((entry) => boundPayloadStrings(entry, maximumStringBytes));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, boundPayloadStrings(entry, maximumStringBytes)]),
+    );
+  }
+  return value;
+}
+
+function boundedRecentEvent(event: ReturnType<typeof browserEvent>) {
+  if (jsonBytes(event.payload) <= MAX_RECENT_EVENT_PAYLOAD_BYTES) {
+    return { ...event, payloadTruncated: false };
+  }
+  let maximumStringBytes = Math.floor(MAX_RECENT_EVENT_PAYLOAD_BYTES / 2);
+  while (maximumStringBytes >= 1_024) {
+    const payload = boundPayloadStrings(event.payload, maximumStringBytes);
+    if (jsonBytes(payload) <= MAX_RECENT_EVENT_PAYLOAD_BYTES) {
+      return { ...event, payload, payloadTruncated: true };
+    }
+    maximumStringBytes = Math.floor(maximumStringBytes / 2);
+  }
+  const original = event.payload !== null && typeof event.payload === "object" && !Array.isArray(event.payload)
+    ? event.payload as Record<string, unknown>
+    : {};
+  return {
+    ...event,
+    payload: {
+      ...(typeof original.callIdHash === "string" ? { callIdHash: original.callIdHash } : {}),
+      ...(typeof original.name === "string" ? { name: original.name } : {}),
+      ...(typeof original.ok === "boolean" ? { ok: original.ok } : {}),
+      output: "event payload omitted because it exceeded the display limit",
+    },
+    payloadTruncated: true,
+  };
+}
+
+function recentEventsResponse(repository: StoreRepository, runId: string, limit: number) {
+  const page = repository.getRecentEvents(runId, limit);
+  let events = page.events.map((event) => boundedRecentEvent(browserEvent(event)));
+  let truncated = page.hasMore;
+  while (events.length > 0 && jsonBytes({ events, truncated }) > MAX_RECENT_EVENT_RESPONSE_BYTES) {
+    events = events.slice(1);
+    truncated = true;
+  }
+  const response = { events, truncated };
+  if (jsonBytes(response) > MAX_RECENT_EVENT_RESPONSE_BYTES) {
+    throw new ApiError(500, "RESPONSE_TOO_LARGE", "recent run events exceed the response size limit");
+  }
+  return response;
 }
 
 function boundedConversation(conversation: ConversationRecord) {
@@ -372,6 +430,26 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
         workspace,
       });
       sendJson(response, 201, { conversation });
+      return;
+    }
+
+    const recentEventsMatch = /^\/api\/runs\/([^/]+)\/events\/tail$/u.exec(url.pathname);
+    if (recentEventsMatch !== null && request.method === "GET") {
+      const values = url.searchParams.getAll("limit");
+      if ([...url.searchParams.keys()].some((key) => key !== "limit") || values.length > 1) {
+        throw new ApiError(400, "INVALID_REQUEST", "invalid recent event query");
+      }
+      const limitValue = values[0] ?? String(MAX_RECENT_EVENT_COUNT);
+      if (!/^[1-9]\d*$/u.test(limitValue)) throw new ApiError(400, "INVALID_REQUEST", "limit must be a positive integer");
+      const limit = Number(limitValue);
+      if (!Number.isSafeInteger(limit) || limit > MAX_RECENT_EVENT_COUNT) {
+        throw new ApiError(400, "INVALID_REQUEST", `limit must be between 1 and ${String(MAX_RECENT_EVENT_COUNT)}`);
+      }
+      const runId = pathSegment(recentEventsMatch[1]!);
+      if (repository.getConversationForRun(runId) === null) {
+        throw new ApiError(404, "RUN_NOT_FOUND", "conversation run was not found");
+      }
+      sendJson(response, 200, recentEventsResponse(repository, runId, limit));
       return;
     }
 

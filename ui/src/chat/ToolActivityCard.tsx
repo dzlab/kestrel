@@ -16,6 +16,7 @@ export type ToolActivity = {
   startedAt: number;
   finishedAt: number | null;
   result: unknown;
+  payloadTruncated: boolean;
 };
 
 type TimelineEntry =
@@ -103,7 +104,9 @@ export function collectToolActivities(events: readonly RunEvent[]): ToolActivity
       startedAt: event.createdAt,
       finishedAt: null,
       result: null,
+      payloadTruncated: false,
     };
+    activity.payloadTruncated ||= event.payloadTruncated;
     if (typeof payload?.name === "string") activity.name = payload.name;
     if (event.type === "tool.completed") {
       activity.status = payload?.ok === false ? "failed" : "completed";
@@ -172,6 +175,7 @@ export function ToolActivityCard({ activity }: Readonly<{ activity: ToolActivity
         <ChevronRight className="activity-chevron" size={15} aria-hidden="true" />
       </summary>
       <div className="activity-body">
+        {activity.payloadTruncated && <p className="activity-output-truncated">The durable event payload was truncated by the server display bound.</p>}
         <Output label="Result" output={output.content} />
         <Output label="stdout" output={output.stdout} />
         <Output label="stderr" output={output.stderr} />
@@ -207,7 +211,11 @@ function RunActivityCard({ event }: Readonly<{ event: RunEvent }>) {
   return (
     <div className={`activity-card run-activity ${event.type.replaceAll(".", "-")}`}>
       <span className="activity-icon"><Terminal size={15} aria-hidden="true" /></span>
-      <span><strong>{runEventLabel(event.type)}</strong>{detail !== null && <small>{detail.text}</small>}</span>
+      <span>
+        <strong>{runEventLabel(event.type)}</strong>
+        {detail !== null && <small>{detail.text}</small>}
+        {event.payloadTruncated && <small>Event details were truncated by the server display bound.</small>}
+      </span>
       <time>{new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(event.createdAt)}</time>
     </div>
   );
