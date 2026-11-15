@@ -6,7 +6,7 @@ import type {
   ConversationRecord,
 } from "../conversations/types";
 import { KestrelError, ValidationError } from "../errors";
-import type { RunRecord, StoreRepository } from "../store/repository";
+import type { EventRecord, RunRecord, StoreRepository } from "../store/repository";
 import { truncateUtf8 } from "../tools/types";
 import { canonicalJson } from "../policy/rules";
 import { approvalHandle, isApprovalHandle } from "./approval-handle";
@@ -25,6 +25,7 @@ const MAX_APPROVAL_ARGUMENT_CHUNK_BYTES = 32 * 1024;
 const MAX_RECENT_EVENT_COUNT = 500;
 const MAX_RECENT_EVENT_RESPONSE_BYTES = 512 * 1024;
 const MAX_RECENT_EVENT_PAYLOAD_BYTES = 192 * 1024;
+const MAX_RECENT_TOOL_NAME_JSON_BYTES = 256;
 
 type ApiErrorBody = { error: { code: string; message: string } };
 
@@ -123,9 +124,35 @@ function boundedRecentEvent(event: ReturnType<typeof browserEvent>) {
   };
 }
 
+function enrichedBrowserEvent(repository: StoreRepository, event: EventRecord) {
+  if (
+    (event.type === "tool.completed" || event.type === "tool.cancelled") &&
+    event.payload !== null &&
+    typeof event.payload === "object" &&
+    !Array.isArray(event.payload)
+  ) {
+    const payload = event.payload as Record<string, unknown>;
+    if (typeof payload.callId === "string") {
+      const call = repository.getToolCall(payload.callId);
+      if (call !== null && call.runId === event.runId) {
+        const name = boundedJsonString(call.name, MAX_RECENT_TOOL_NAME_JSON_BYTES);
+        return browserEvent({
+          ...event,
+          payload: {
+            ...payload,
+            name: name.value,
+            ...(name.truncated ? { nameTruncated: true } : {}),
+          },
+        });
+      }
+    }
+  }
+  return browserEvent(event);
+}
+
 function recentEventsResponse(repository: StoreRepository, runId: string, limit: number) {
   const page = repository.getRecentEvents(runId, limit);
-  let events = page.events.map((event) => boundedRecentEvent(browserEvent(event)));
+  let events = page.events.map((event) => boundedRecentEvent(enrichedBrowserEvent(repository, event)));
   let truncated = page.hasMore;
   while (events.length > 0 && jsonBytes({ events, truncated }) > MAX_RECENT_EVENT_RESPONSE_BYTES) {
     events = events.slice(1);
