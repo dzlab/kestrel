@@ -657,6 +657,13 @@ export class StoreRepository {
     return row === null ? null : runFromRow(row);
   }
 
+  getLatestRunForTask(taskId: string): RunRecord | null {
+    const row = this.database
+      .query("SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1")
+      .get(taskId) as Row | null;
+    return row === null ? null : runFromRow(row);
+  }
+
   getMessages(runId: string): Message[] {
     const rows = this.database
       .query("SELECT * FROM messages WHERE run_id = ? ORDER BY sequence_number")

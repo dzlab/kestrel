@@ -37,6 +37,7 @@ export type RunTask = {
 export type RunOptions = {
   runId?: string;
   idempotencyKey?: string;
+  initialMessages?: readonly Message[];
   modelName?: string;
   maxTurns?: number;
   maxToolCalls?: number;
@@ -220,17 +221,20 @@ export class RunKernel {
     if (options.signal?.aborted) return this.cancel(run, "run was cancelled");
     let messages = this.repository.getMessages(run.id);
     if (messages.length === 0) {
-      const memories = options.memoryContext === undefined
-        ? []
-        : new MemoryStore(this.repository).search({
-            query: options.memoryContext.query,
-            scope: options.memoryContext.scope,
-            userId: options.userId ?? "local",
-            taskId: task.id,
-            maxResults: options.memoryContext.maxResults,
-            maxBytes: options.memoryContext.maxBytes,
-          });
-      for (const message of buildInitialMessages(task, limits.contextBytes, memories)) this.repository.appendMessage(run.id, message);
+      const initialMessages = options.initialMessages ?? (() => {
+        const memories = options.memoryContext === undefined
+          ? []
+          : new MemoryStore(this.repository).search({
+              query: options.memoryContext.query,
+              scope: options.memoryContext.scope,
+              userId: options.userId ?? "local",
+              taskId: task.id,
+              maxResults: options.memoryContext.maxResults,
+              maxBytes: options.memoryContext.maxBytes,
+            });
+        return buildInitialMessages(task, limits.contextBytes, memories);
+      })();
+      for (const message of initialMessages) this.repository.appendMessage(run.id, message);
       this.repository.appendEvent(run.id, "run.started", { taskId: task.id });
       messages = this.repository.getMessages(run.id);
       this.repository.updateRunStatus(run.id, "running");

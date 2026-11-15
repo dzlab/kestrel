@@ -110,6 +110,22 @@ export type {
   RunSummary,
   RunTask,
 } from "./kernel";
+export { ConversationService } from "./conversations/service";
+export type { ConversationServiceDependencies } from "./conversations/service";
+export type {
+  ConversationApprovalDecision,
+  ConversationMessageRecord,
+  ConversationMessageRole,
+  ConversationRecord,
+  ConversationRole,
+  ConversationRunOptions,
+  ConversationState,
+  ConversationTurnInput,
+  ConversationTurnResult,
+  ResolveApprovalDecision,
+  SubmitTurnInput,
+  SubmitTurnResult,
+} from "./conversations/types";
 export {
   MemoryStore,
   assertSafeMemory,
