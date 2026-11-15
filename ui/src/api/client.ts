@@ -70,6 +70,11 @@ export type RunEvent = {
   createdAt: number;
 };
 
+export type RunEventHistory = {
+  events: RunEvent[];
+  truncated: boolean;
+};
+
 export type StartedTurn = {
   conversationId: string;
   runId: string;
@@ -464,6 +469,83 @@ export class KestrelApi {
   workspaceImageUrl(conversationId: string, path: string): string {
     const query = new URLSearchParams({ conversationId, path });
     return `/api/workspace/image?${query}`;
+  }
+
+  async getRunEventHistory(runId: string, limit = 500): Promise<RunEventHistory> {
+    await this.bootstrapSession();
+    return this.fetchRunEventHistory(runId, limit, true);
+  }
+
+  private async fetchRunEventHistory(runId: string, limit: number, retrySession: boolean): Promise<RunEventHistory> {
+    const maximumBytes = 512 * 1024;
+    const response = await this.fetcher(`/api/runs/${encodeURIComponent(runId)}/events`, {
+      credentials: "same-origin",
+      headers: { Accept: "text/event-stream" },
+    });
+    if (response.status === 401 && retrySession) {
+      await this.rebootstrapSession();
+      return this.fetchRunEventHistory(runId, limit, false);
+    }
+    if (!response.ok) throw parseError(await json(response), response.status);
+    if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream")) {
+      throw new ApiError(502, "INVALID_RESPONSE", "run history was not an event stream");
+    }
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new ApiError(502, "INVALID_RESPONSE", "run history stream had no body");
+
+    const decoder = new TextDecoder();
+    const events: RunEvent[] = [];
+    let buffer = "";
+    let bytes = 0;
+    let truncated = false;
+    const consumeFrames = (): void => {
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = frame
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (data.length > 0) {
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(data);
+          } catch {
+            throw new ApiError(502, "INVALID_EVENT", "run history event contained invalid JSON");
+          }
+          const parsed = KestrelApi.parseEvent(parsedJson);
+          if (parsed.runId !== runId) throw new ApiError(502, "INVALID_EVENT", "run history contained an event for another run");
+          if (!events.some((event) => event.id === parsed.id)) events.push(parsed);
+          if (events.length >= limit) truncated = true;
+        }
+        if (truncated) return;
+        boundary = buffer.indexOf("\n\n");
+      }
+    };
+
+    try {
+      while (!truncated) {
+        const next = await reader.read();
+        if (next.done) break;
+        bytes += next.value.byteLength;
+        if (bytes > maximumBytes) {
+          truncated = true;
+          break;
+        }
+        buffer += decoder.decode(next.value, { stream: true });
+        consumeFrames();
+      }
+      if (!truncated) {
+        buffer += decoder.decode();
+        consumeFrames();
+      }
+    } finally {
+      if (truncated) await reader.cancel().catch(() => undefined);
+      else reader.releaseLock();
+    }
+    return { events: events.sort((left, right) => left.id - right.id), truncated };
   }
 
   private async request<T>(

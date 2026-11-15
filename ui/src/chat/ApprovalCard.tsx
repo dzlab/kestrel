@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { AlertTriangle, LoaderCircle, ShieldCheck } from "lucide-react";
 import { useKestrelRuntime } from "./KestrelRuntime";
 
@@ -12,10 +13,12 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-export function ApprovalCard() {
+export function ApprovalCard({ idPrefix = "approval", compact = false }: Readonly<{ idPrefix?: string; compact?: boolean }>) {
   const runtime = useKestrelRuntime();
   const pending = runtime.detail?.pendingApproval;
-  if (runtime.state !== "blocked_on_approval" || pending === undefined) return null;
+  const instanceId = useId().replaceAll(":", "");
+  const headingId = `${idPrefix}-${instanceId}-title`;
+  if (pending === undefined) return null;
 
   const workdir = typeof runtime.approvalArguments?.cwd === "string"
     ? runtime.approvalArguments.cwd
@@ -24,12 +27,12 @@ export function ApprovalCard() {
       : "Not applicable";
 
   return (
-    <section className="approval-notice" aria-labelledby="approval-title">
+    <section className={`approval-notice${compact ? " compact" : ""}`} aria-labelledby={headingId}>
       <div className="approval-heading">
         <ShieldCheck size={20} aria-hidden="true" />
         <div>
           <p className="eyebrow">Action required</p>
-          <h3 id="approval-title">Review {pending.tool}</h3>
+          <h3 id={headingId}>Review {pending.tool}</h3>
         </div>
         <span className={`risk-pill ${pending.risk}`}>{pending.risk} risk</span>
       </div>

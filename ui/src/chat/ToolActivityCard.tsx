@@ -213,12 +213,13 @@ function RunActivityCard({ event }: Readonly<{ event: RunEvent }>) {
   );
 }
 
-export function RunActivityFeed({ events }: Readonly<{ events: readonly RunEvent[] }>) {
+export function RunActivityFeed({ events, truncated = false }: Readonly<{ events: readonly RunEvent[]; truncated?: boolean }>) {
   const timeline = useMemo(() => collectTimeline(events), [events]);
   if (timeline.length === 0) return null;
   return (
     <section className="activity-feed" aria-label="Run activity">
       <div className="activity-feed-heading"><span>Run activity</span><small>{timeline.length} item{timeline.length === 1 ? "" : "s"}</small></div>
+      {truncated && <p className="activity-history-truncated">Earlier durable events were omitted from this bounded view.</p>}
       {timeline.map((entry) => entry.kind === "tool"
         ? <ToolActivityCard key={`tool:${entry.activity.key}`} activity={entry.activity} />
         : <RunActivityCard key={`run:${entry.event.id}`} event={entry.event} />)}

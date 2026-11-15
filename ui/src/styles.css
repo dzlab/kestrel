@@ -120,6 +120,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .activity-feed { display: grid; gap: 7px; margin: 2px 0; }
 .activity-feed-heading { display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 5px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .activity-feed-heading small { color: #63766e; font-size: 9px; letter-spacing: 0; text-transform: none; }
+.activity-history-truncated { margin: 0; border: 1px solid rgba(242,200,117,.16); border-radius: 8px; background: rgba(242,200,117,.05); color: var(--warning); padding: 7px 9px; font-size: 9px; }
 .activity-card { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: rgba(16,26,23,.74); color: var(--soft); }
 .tool-activity summary, .run-activity { min-height: 43px; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto 15px; gap: 8px; align-items: center; padding: 8px 10px; }
 .tool-activity summary { list-style: none; cursor: pointer; }
@@ -157,6 +158,13 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .approval-notice { border: 1px solid rgba(242,200,117,.28); border-radius: 14px; background: linear-gradient(140deg, rgba(76,62,34,.25), rgba(21,33,29,.9)); padding: 18px; }
+.approval-notice.compact { padding: 13px; }
+.approval-notice.compact .approval-heading { align-items: flex-start; }
+.approval-notice.compact .approval-heading .risk-pill { margin-left: 0; }
+.approval-notice.compact .approval-meta { grid-template-columns: 1fr; gap: 2px; }
+.approval-notice.compact .approval-meta dd { margin-bottom: 6px; }
+.approval-notice.compact .approval-actions { flex-direction: column-reverse; }
+.approval-notice.compact .approval-actions button { width: 100%; }
 .approval-heading { display: flex; align-items: center; gap: 11px; }
 .approval-heading > svg { color: var(--warning); }
 .approval-heading h3 { margin: 3px 0 0; font-size: 15px; }
@@ -215,6 +223,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .pending-summary { display: flex; gap: 10px; color: var(--warning); }
 .pending-summary strong, .pending-summary span { display: block; font-size: 11px; }
 .pending-summary span { color: var(--muted); margin-top: 3px; }
+.details-approval { padding-left: 0; padding-right: 0; }
 .details-note { margin: 11px 0 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
 .details-note code { color: var(--soft); }
 .changed-file-list { list-style: none; display: grid; gap: 7px; margin: 12px 0 0; padding: 0; }

@@ -55,7 +55,7 @@ export function ConversationThread() {
             />
           ))}
 
-          <RunActivityFeed events={runtime.events} />
+          <RunActivityFeed events={runtime.events} truncated={runtime.eventsTruncated} />
 
           {runtime.state === "running" && (
             <div className="run-notice running" role="status">
@@ -64,7 +64,7 @@ export function ConversationThread() {
             </div>
           )}
 
-          <ApprovalCard />
+          <ApprovalCard idPrefix="thread-approval" />
 
           {runtime.state !== "ready" && runtime.state !== "running" && runtime.state !== "blocked_on_approval" && runtime.state !== "connecting" && (
             <div className={`run-notice terminal ${runtime.state}`} role="status">

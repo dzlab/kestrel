@@ -35,6 +35,7 @@ type KestrelRuntimeValue = {
   selectedConversationId: string | null;
   detail: ConversationDetail | null;
   events: readonly RunEvent[];
+  eventsTruncated: boolean;
   state: KestrelUiState;
   connection: ConnectionState;
   error: ApiError | null;
@@ -120,6 +121,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [eventsTruncated, setEventsTruncated] = useState(false);
   const [state, setState] = useState<KestrelUiState>("connecting");
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<ApiError | null>(null);
@@ -245,6 +247,17 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     stream.connect();
   }, [api, refreshList]);
 
+  const hydrateTerminalRun = useCallback(async (conversationId: string, runId: string, ownerVersion: number) => {
+    try {
+      const history = await api.getRunEventHistory(runId);
+      if (selectedRef.current !== conversationId || loadVersion.current !== ownerVersion) return;
+      setEvents(history.events);
+      setEventsTruncated(history.truncated);
+    } catch (cause) {
+      if (selectedRef.current === conversationId && loadVersion.current === ownerVersion) setError(asApiError(cause));
+    }
+  }, [api]);
+
   const loadConversation = useCallback(async (conversationId: string, updateHistory: boolean) => {
     const version = ++loadVersion.current;
     streamRecoveryRef.current = null;
@@ -255,6 +268,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     setDetail(null);
     detailRef.current = null;
     setEvents([]);
+    setEventsTruncated(false);
     setApprovalArguments(null);
     setState("connecting");
     setError(null);
@@ -272,6 +286,9 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       const active = next.activeRun;
       if (active !== undefined && (active.status === "running" || active.status === "blocked_on_approval")) {
         openEventStream(conversationId, active.id);
+      } else {
+        const latest = next.runs.at(-1);
+        if (latest !== undefined) await hydrateTerminalRun(conversationId, latest.id, version);
       }
     } catch (cause) {
       if (loadVersion.current !== version) return;
@@ -279,7 +296,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       setConnection("disconnected");
       setState("disconnected");
     }
-  }, [api, openEventStream]);
+  }, [api, hydrateTerminalRun, openEventStream]);
 
   const selectConversation = useCallback(async (conversationId: string) => {
     if (selectedRef.current === conversationId) return;
@@ -377,6 +394,8 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       throw new ApiError(409, "CONVERSATION_BUSY", "finish the active turn before sending another message");
     }
     setError(null);
+    setEvents([]);
+    setEventsTruncated(false);
     setState("running");
     try {
       const started = await api.submitTurn(conversationId, textFromAppend(message));
@@ -502,6 +521,9 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       const active = next.activeRun;
       if (streamRef.current === null && active !== undefined && hasActiveRun(next, active.id)) {
         openEventStream(conversationId, active.id);
+      } else if (active === undefined) {
+        const latest = next.runs.at(-1);
+        if (latest !== undefined) await hydrateTerminalRun(conversationId, latest.id, version);
       }
     } catch (cause) {
       if (selectedRef.current !== conversationId || loadVersion.current !== version) return;
@@ -509,7 +531,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
       setConnection("disconnected");
       setState("disconnected");
     }
-  }, [api, loadConversation, openEventStream, refreshList]);
+  }, [api, hydrateTerminalRun, loadConversation, openEventStream, refreshList]);
 
   const loadEarlierMessages = useCallback(async () => {
     const current = detailRef.current;
@@ -552,6 +574,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     selectedConversationId,
     detail,
     events,
+    eventsTruncated,
     state,
     connection,
     error,
@@ -568,7 +591,7 @@ export function KestrelRuntimeProvider({ children }: Readonly<{ children: ReactN
     clearError: () => setError(null),
   }), [
     actionPending, api, approvalArguments, approvalArgumentsLoading, connection, conversations,
-    createConversation, detail, error, events, loadEarlierMessages, refreshConversation,
+    createConversation, detail, error, events, eventsTruncated, loadEarlierMessages, refreshConversation,
     resolveApproval, retryApprovalArguments, selectConversation, selectedConversationId, state, stop,
   ]);
 

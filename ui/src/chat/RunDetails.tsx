@@ -1,4 +1,5 @@
-import { Activity, Clock3, FileCheck2, ShieldAlert } from "lucide-react";
+import { Activity, Clock3, FileCheck2 } from "lucide-react";
+import { ApprovalCard } from "./ApprovalCard";
 import { formatState, useKestrelRuntime } from "./KestrelRuntime";
 import { collectObservedChangedFiles } from "./ToolActivityCard";
 
@@ -32,10 +33,7 @@ export function RunDetails() {
         </div>
       )}
       {runtime.detail?.pendingApproval !== undefined && (
-        <div className="details-section pending-summary">
-          <ShieldAlert size={17} aria-hidden="true" />
-          <div><strong>Approval pending</strong><span>{runtime.detail.pendingApproval.tool} · {runtime.detail.pendingApproval.risk} risk</span></div>
-        </div>
+        <div className="details-section details-approval"><ApprovalCard idPrefix="details-approval" compact /></div>
       )}
       <div className="details-section changed-files-section">
         <div className="details-heading"><span>Observed file changes</span><small>{changedFiles.length}</small></div>
@@ -51,7 +49,7 @@ export function RunDetails() {
         )}
       </div>
       <div className="details-section activity-section">
-        <div className="details-heading"><span>Recent durable events</span><small>{runtime.events.length}</small></div>
+        <div className="details-heading"><span>Recent durable events</span><small>{runtime.events.length}{runtime.eventsTruncated ? "+" : ""}</small></div>
         {recentEvents.length === 0 ? (
           <div className="quiet-activity"><Clock3 size={17} aria-hidden="true" /><span>Run activity will appear here.</span></div>
         ) : (
@@ -64,6 +62,7 @@ export function RunDetails() {
             ))}
           </ol>
         )}
+        {runtime.eventsTruncated && <p className="details-note">Earlier durable events were omitted from this bounded view.</p>}
       </div>
       <div className="details-footer">Details are bounded to durable Kestrel events; arbitrary shell side effects are not implied to be captured.</div>
     </div>

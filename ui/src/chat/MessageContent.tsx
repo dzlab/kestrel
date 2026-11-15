@@ -1,4 +1,3 @@
-import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import ReactMarkdown, { type UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlock } from "./CodeBlock";
@@ -21,18 +20,6 @@ function safeImagePath(value: string): string {
 
 const safeUrlTransform: UrlTransform = (url, key) => key === "src" ? safeImagePath(url) : safeLink(url);
 
-function MarkdownPre({ children }: Readonly<{ children?: ReactNode }>) {
-  const items = Children.toArray(children);
-  const child = items.length === 1 ? items[0] : null;
-  if (isValidElement(child) && child.type === "code") {
-    const element = child as ReactElement<{ className?: string; children?: ReactNode }>;
-    const match = /(?:^|\s)language-([^\s]+)/u.exec(element.props.className ?? "");
-    const code = String(element.props.children ?? "").replace(/\n$/u, "");
-    return <CodeBlock code={code} language={match?.[1]} />;
-  }
-  return <pre>{children}</pre>;
-}
-
 export function MessageContent({ content }: Readonly<{ content: string }>) {
   return (
     <div className="markdown-content">
@@ -41,8 +28,20 @@ export function MessageContent({ content }: Readonly<{ content: string }>) {
         skipHtml
         urlTransform={safeUrlTransform}
         components={{
-          pre: ({ node: _node, ...props }) => <MarkdownPre {...props} />,
-          code: ({ node: _node, ...props }) => <code {...props} />,
+          pre: ({ node, children }) => {
+            const codeNode = node.children[0];
+            if (codeNode?.type === "element" && codeNode.tagName === "code") {
+              const classNames = codeNode.properties.className;
+              const className = Array.isArray(classNames) ? classNames.join(" ") : String(classNames ?? "");
+              const match = /(?:^|\s)language-([^\s]+)/u.exec(className);
+              const code = codeNode.children
+                .map((child) => child.type === "text" ? child.value : "")
+                .join("")
+                .replace(/\n$/u, "");
+              return <CodeBlock code={code} language={match?.[1]} />;
+            }
+            return <pre>{children}</pre>;
+          },
           a: ({ node: _node, href, children, ...props }) => {
             const safeHref = href === undefined ? "" : safeLink(href);
             if (safeHref.length === 0) return <span className="unsafe-link">{children}</span>;
