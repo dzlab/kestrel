@@ -94,6 +94,7 @@ export class ConversationService {
     this.assertAcceptingWork();
     const conversation = this.repository.getConversation(conversationId);
     if (conversation === null) throw new ValidationError(`conversation was not found: ${conversationId}`);
+    this.reconcileLatestCompletedTranscript(conversationId);
     this.assertConversationAvailable(conversationId);
 
     const turn = typeof input === "string" ? { content: input } : input;
@@ -317,6 +318,17 @@ export class ConversationService {
       const status = active.run?.status ?? active.task.status;
       throw new ValidationError(`conversation ${conversationId} already has an active turn (${status})`);
     }
+  }
+
+  private reconcileLatestCompletedTranscript(conversationId: string): void {
+    const latestTask = this.repository.listConversationTasks(conversationId, 1)[0];
+    if (latestTask === undefined) return;
+    const latestRun = this.repository.getLatestRunForTask(latestTask.id);
+    if (latestRun === null || latestRun.status !== "completed") return;
+    this.persistAssistantMessage(
+      conversationId,
+      this.resultForRun(conversationId, latestRun),
+    );
   }
 
   private findActiveTask(tasks: readonly TaskRecord[]): { task: TaskRecord; run: RunRecord | null } | undefined {
