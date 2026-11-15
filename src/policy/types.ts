@@ -4,7 +4,7 @@ import type { ToolDefinition } from "../protocol/types";
 export type Risk = "low" | "standard" | "high";
 export type RiskLevel = Risk;
 
-export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "consumed";
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "consumed" | "cancelled";
 
 export type PolicyContext = {
   workspace?: string;
@@ -40,6 +40,7 @@ export type ApprovalRequest = {
   version: number;
   consumedAt?: number | null;
   expiredAt?: number | null;
+  cancelledAt?: number | null;
 };
 
 export type ApprovalRequestInput = {
@@ -77,6 +78,7 @@ export type ApprovalStoreRecord = {
   resolvedAt?: number | null;
   consumedAt?: number | null;
   expiredAt?: number | null;
+  cancelledAt?: number | null;
   version?: number;
 };
 

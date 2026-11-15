@@ -355,6 +355,36 @@ const versionElevenSql = `
         ON events(run_id, id);
     `;
 
+const versionTwelveSql = `
+      CREATE TABLE approvals_v12 (
+        call_id TEXT NOT NULL,
+        arguments_hash TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        run_id TEXT REFERENCES runs(id),
+        capability TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('pending', 'approved', 'denied')),
+        requested_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        tool TEXT NOT NULL DEFAULT '',
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        consumed_at INTEGER,
+        expired_at INTEGER,
+        version INTEGER NOT NULL DEFAULT 0,
+        cancelled_at INTEGER,
+        PRIMARY KEY (call_id, arguments_hash)
+      );
+      INSERT INTO approvals_v12
+        (call_id, arguments_hash, task_id, run_id, capability, risk_level, decision,
+         requested_at, resolved_at, tool, expires_at, consumed_at, expired_at, version, cancelled_at)
+      SELECT call_id, arguments_hash, task_id, run_id, capability, risk_level, decision,
+             requested_at, resolved_at, tool, expires_at, consumed_at, expired_at, version, NULL
+      FROM approvals;
+      DROP TABLE approvals;
+      ALTER TABLE approvals_v12 RENAME TO approvals;
+      CREATE INDEX idx_approvals_call_hash ON approvals(call_id, arguments_hash);
+    `;
+
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
 // below as a historical checksum because that release changed v1 in place.
 export const versionOneChecksum = migrationChecksum(versionOneSql);
@@ -373,6 +403,7 @@ export const migrations: readonly Migration[] = [
   { version: 9, sql: versionNineSql, prepare: prepareVersionNine },
   { version: 10, sql: versionTenSql },
   { version: 11, sql: versionElevenSql },
+  { version: 12, sql: versionTwelveSql },
 ];
 
 type ColumnDefinition = { name: string; type: string };
@@ -484,6 +515,7 @@ const requiredTableColumns: Readonly<Record<string, readonly ColumnDefinition[]>
     { name: "consumed_at", type: "INTEGER" },
     { name: "expired_at", type: "INTEGER" },
     { name: "version", type: "INTEGER" },
+    { name: "cancelled_at", type: "INTEGER" },
   ],
   conversations: [
     { name: "id", type: "TEXT" },
@@ -1642,6 +1674,7 @@ const currentApprovalTableDefinition = {
       consumed_at INTEGER,
       expired_at INTEGER,
       version INTEGER NOT NULL DEFAULT 0,
+      cancelled_at INTEGER,
       PRIMARY KEY (call_id, arguments_hash)
     )
   `),

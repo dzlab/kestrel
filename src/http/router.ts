@@ -8,17 +8,20 @@ import type {
 import { KestrelError, ValidationError } from "../errors";
 import type { RunRecord, StoreRepository } from "../store/repository";
 import { truncateUtf8 } from "../tools/types";
+import { canonicalJson } from "../policy/rules";
+import { approvalHandle, isApprovalHandle } from "./approval-handle";
 import type { HttpAuth } from "./auth";
 import { streamRunEvents } from "./events";
 import { serveWorkspaceImage } from "./workspace-preview";
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const MAX_CONVERSATION_RUNS = 50;
-const MAX_APPROVAL_CALL_ID_BYTES = 256;
 const MAX_CONVERSATION_DETAIL_BYTES = 256 * 1024;
 const MAX_CONVERSATION_MESSAGE_PAGE = 100;
 const MAX_MESSAGE_CONTENT_JSON_BYTES = 32 * 1024;
 const MAX_APPROVAL_ARGUMENTS_JSON_BYTES = 64 * 1024;
+const DEFAULT_APPROVAL_ARGUMENT_CHUNK_BYTES = 16 * 1024;
+const MAX_APPROVAL_ARGUMENT_CHUNK_BYTES = 32 * 1024;
 
 type ApiErrorBody = { error: { code: string; message: string } };
 
@@ -96,19 +99,25 @@ function boundedRun(run: RunRecord) {
   };
 }
 
-function boundedApproval(approval: ConversationApprovalDetails) {
-  const argumentsTruncated = jsonBytes(approval.arguments) > MAX_APPROVAL_ARGUMENTS_JSON_BYTES;
+function boundedApproval(conversationId: string, approval: ConversationApprovalDetails) {
+  const canonicalArguments = canonicalJson(approval.arguments);
+  const argumentsBytes = Buffer.byteLength(canonicalArguments, "utf8");
+  const argumentsTruncated = argumentsBytes > MAX_APPROVAL_ARGUMENTS_JSON_BYTES;
   return {
-    ...approval,
-    callId: boundedJsonString(approval.callId, 1_024).value,
+    approvalHandle: approvalHandle(conversationId, approval.runId, approval.callId),
     runId: boundedJsonString(approval.runId, 512).value,
     taskId: boundedJsonString(approval.taskId, 512).value,
     tool: boundedJsonString(approval.tool, 1_024).value,
-    arguments: argumentsTruncated ? {} : approval.arguments,
-    ...(argumentsTruncated ? { argumentsTruncated: true } : {}),
+    ...(argumentsTruncated ? {} : { arguments: approval.arguments }),
+    argumentsBytes,
+    argumentsTruncated,
     argumentsHash: boundedJsonString(approval.argumentsHash, 1_024).value,
     capability: boundedJsonString(approval.capability, 1_024).value,
+    risk: approval.risk,
+    status: approval.status,
     reason: boundedJsonString(approval.reason, 8_192).value,
+    createdAt: approval.createdAt,
+    expiresAt: approval.expiresAt,
   };
 }
 
@@ -209,22 +218,6 @@ function pathSegment(value: string): string {
   }
 }
 
-function approvalCallIdSegment(value: string): string {
-  try {
-    const decoded = decodeURIComponent(value);
-    if (
-      decoded.length === 0 ||
-      decoded.includes("\0") ||
-      Buffer.byteLength(decoded, "utf8") > MAX_APPROVAL_CALL_ID_BYTES
-    ) {
-      throw new Error("invalid");
-    }
-    return decoded;
-  } catch {
-    throw new ApiError(404, "NOT_FOUND", "API route was not found");
-  }
-}
-
 function requireConversation(repository: StoreRepository, conversationId: string) {
   const conversation = repository.getConversation(conversationId);
   if (conversation === null) throw new ApiError(404, "CONVERSATION_NOT_FOUND", "conversation was not found");
@@ -246,6 +239,25 @@ function requireOwnedRun(repository: StoreRepository, conversationId: string, ru
     throw new ApiError(404, "RUN_NOT_FOUND", "run was not found for this conversation");
   }
   return run;
+}
+
+function requirePendingApproval(
+  conversations: ConversationService,
+  conversationId: string,
+  runId: string,
+  handle: string,
+): ConversationApprovalDetails {
+  if (!isApprovalHandle(handle)) throw new ApiError(404, "APPROVAL_NOT_FOUND", "pending approval was not found");
+  const state = conversations.getConversationState(conversationId, 1);
+  const approval = state.pendingApproval;
+  if (
+    state.activeRun?.id !== runId ||
+    approval === undefined ||
+    approvalHandle(conversationId, runId, approval.callId) !== handle
+  ) {
+    throw new ApiError(404, "APPROVAL_NOT_FOUND", "pending approval was not found for this run");
+  }
+  return approval;
 }
 
 async function detachAfterStart(operation: Promise<unknown>): Promise<void> {
@@ -285,7 +297,7 @@ function conversationResponse(
     conversation: boundedConversation(state.conversation),
     runs,
     ...(state.activeRun === undefined ? {} : { activeRun: boundedRun(state.activeRun) }),
-    ...(state.pendingApproval === undefined ? {} : { pendingApproval: boundedApproval(state.pendingApproval) }),
+    ...(state.pendingApproval === undefined ? {} : { pendingApproval: boundedApproval(conversationId, state.pendingApproval) }),
   };
   let messages: ReturnType<typeof boundedConversationMessage>[] = [];
   for (let index = page.messages.length - 1; index >= 0; index -= 1) {
@@ -367,7 +379,8 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
     if (directEventsMatch !== null && request.method === "GET") {
       if (url.search.length > 0) throw new ApiError(400, "INVALID_REQUEST", "event stream does not accept query parameters");
       const runId = pathSegment(directEventsMatch[1]!);
-      if (repository.getConversationForRun(runId) === null) {
+      const conversation = repository.getConversationForRun(runId);
+      if (conversation === null) {
         throw new ApiError(404, "RUN_NOT_FOUND", "conversation run was not found");
       }
       await streamRunEvents(request, response, repository, runId);
@@ -438,29 +451,83 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
       return;
     }
 
+    const approvalArgumentsMatch = /^\/api\/conversations\/([^/]+)\/runs\/([^/]+)\/approvals\/([^/]+)\/arguments$/u.exec(url.pathname);
+    if (approvalArgumentsMatch !== null && request.method === "GET") {
+      const conversationId = pathSegment(approvalArgumentsMatch[1]!);
+      const runId = pathSegment(approvalArgumentsMatch[2]!);
+      const handle = approvalArgumentsMatch[3]!;
+      requireOwnedRun(repository, conversationId, runId);
+      const approval = requirePendingApproval(conversations, conversationId, runId, handle);
+      const allowedKeys = new Set(["offset", "limit"]);
+      if ([...url.searchParams.keys()].some((key) => !allowedKeys.has(key))) {
+        throw new ApiError(400, "INVALID_REQUEST", "invalid approval arguments query");
+      }
+      const offsetValues = url.searchParams.getAll("offset");
+      const limitValues = url.searchParams.getAll("limit");
+      if (offsetValues.length > 1 || limitValues.length > 1) {
+        throw new ApiError(400, "INVALID_REQUEST", "approval arguments query values must be unique");
+      }
+      const offsetText = offsetValues[0] ?? "0";
+      const limitText = limitValues[0] ?? String(DEFAULT_APPROVAL_ARGUMENT_CHUNK_BYTES);
+      if (!/^(?:0|[1-9]\d*)$/u.test(offsetText) || !/^[1-9]\d*$/u.test(limitText)) {
+        throw new ApiError(400, "INVALID_REQUEST", "approval argument offset and limit are invalid");
+      }
+      const offset = Number(offsetText);
+      const limit = Number(limitText);
+      if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(limit) || limit > MAX_APPROVAL_ARGUMENT_CHUNK_BYTES) {
+        throw new ApiError(400, "INVALID_REQUEST", "approval argument offset or limit is out of range");
+      }
+      const canonicalArguments = Buffer.from(canonicalJson(approval.arguments), "utf8");
+      if (offset > canonicalArguments.length) {
+        throw new ApiError(416, "ARGUMENT_OFFSET_OUT_OF_RANGE", "approval argument offset exceeds the payload length");
+      }
+      const end = Math.min(canonicalArguments.length, offset + limit);
+      sendJson(response, 200, {
+        approvalHandle: handle,
+        argumentsHash: approval.argumentsHash,
+        encoding: "base64",
+        offset,
+        total: canonicalArguments.length,
+        nextOffset: end < canonicalArguments.length ? end : null,
+        complete: end === canonicalArguments.length,
+        data: canonicalArguments.subarray(offset, end).toString("base64"),
+      });
+      return;
+    }
+
     const approvalMatch = /^\/api\/conversations\/([^/]+)\/runs\/([^/]+)\/approvals\/([^/]+)$/u.exec(url.pathname);
     if (approvalMatch !== null && request.method === "POST") {
       requireSameOrigin(auth, request);
       const conversationId = pathSegment(approvalMatch[1]!);
       const runId = pathSegment(approvalMatch[2]!);
-      const callId = approvalCallIdSegment(approvalMatch[3]!);
+      const handle = approvalMatch[3]!;
       requireOwnedRun(repository, conversationId, runId);
-      const state = conversations.getConversationState(conversationId);
-      if (state.activeRun?.id !== runId || state.pendingApproval?.callId !== callId) {
-        throw new ApiError(404, "APPROVAL_NOT_FOUND", "pending approval was not found for this run");
-      }
+      const approval = requirePendingApproval(conversations, conversationId, runId, handle);
       const body = await readJsonObject(request);
-      assertExactKeys(body, ["decision"]);
+      assertExactKeys(body, ["decision", "argumentsHash"]);
       if (body.decision !== "approve" && body.decision !== "deny") {
         throw new ApiError(400, "INVALID_REQUEST", "decision must be approve or deny");
       }
+      if (body.argumentsHash !== undefined && typeof body.argumentsHash !== "string") {
+        throw new ApiError(400, "INVALID_REQUEST", "argumentsHash must be a string");
+      }
+      if (
+        body.decision === "approve" &&
+        body.argumentsHash !== approval.argumentsHash
+      ) {
+        throw new ApiError(409, "APPROVAL_ARGUMENTS_MISMATCH", "approval arguments hash is missing or does not match");
+      }
       const operation = conversations.resolveApproval(
         conversationId,
-        callId,
+        approval.callId,
         body.decision === "approve" ? "approved" : "denied",
       );
-      await detachAfterStart(operation);
-      sendJson(response, 202, { conversationId, runId, callId, decision: body.decision, status: "running" });
+      try {
+        await detachAfterStart(operation);
+      } catch {
+        throw new ApiError(409, "APPROVAL_NOT_ACTIONABLE", "pending approval could not be resolved");
+      }
+      sendJson(response, 202, { conversationId, runId, approvalHandle: handle, decision: body.decision, status: "running" });
       return;
     }
 

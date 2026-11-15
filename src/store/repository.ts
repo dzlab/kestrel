@@ -18,16 +18,12 @@ const MAX_CONVERSATION_LIST_LIMIT = 100;
 const MAX_CONVERSATION_MESSAGE_LIMIT = 1_000;
 const MAX_CONVERSATION_TASK_LIMIT = 1_000;
 const MAX_EVENT_PAGE_LIMIT = 1_000;
-const MAX_TOOL_EVENT_CALL_ID_BYTES = 256;
 const MAX_TOOL_EVENT_NAME_BYTES = 128;
 
 function boundedToolStartedPayload(call: ToolCall): Record<string, unknown> {
-  const callId = truncateUtf8(call.id, MAX_TOOL_EVENT_CALL_ID_BYTES);
   const name = truncateUtf8(call.name, MAX_TOOL_EVENT_NAME_BYTES);
   return redactUnknown({
-    callId,
     callIdHash: createHash("sha256").update(call.id).digest("hex"),
-    callIdTruncated: callId !== call.id,
     name,
     nameTruncated: name !== call.name,
   }) as Record<string, unknown>;
@@ -103,6 +99,7 @@ export type ApprovalRecord = {
   resolvedAt?: number | null;
   consumedAt?: number | null;
   expiredAt?: number | null;
+  cancelledAt?: number | null;
   version?: number;
 };
 
@@ -349,6 +346,7 @@ function approvalFromRow(row: Row): ApprovalRecord {
     resolvedAt: row.resolved_at === null || row.resolved_at === undefined ? null : Number(row.resolved_at),
     consumedAt: row.consumed_at === null || row.consumed_at === undefined ? null : Number(row.consumed_at),
     expiredAt: row.expired_at === null || row.expired_at === undefined ? null : Number(row.expired_at),
+    cancelledAt: row.cancelled_at === null || row.cancelled_at === undefined ? null : Number(row.cancelled_at),
     version: Number(row.version),
   };
 }
@@ -872,32 +870,19 @@ export class StoreRepository {
         if (approval.consumedAt !== null) {
           throw new ValidationError(`approval for run ${runId} was already consumed`);
         }
-        let approvalEvent: string | null = null;
-        if (approval.consumedAt === null && approval.expiredAt === null && approval.decision === "pending") {
+        if (approval.cancelledAt === null || approval.cancelledAt === undefined) {
           const update = this.database
             .query(
               `UPDATE approvals
-               SET decision = 'denied', resolved_at = ?, version = version + 1
+               SET cancelled_at = ?, resolved_at = ?, version = version + 1
                WHERE call_id = ? AND arguments_hash = ? AND version = ?
-                 AND decision = 'pending' AND consumed_at IS NULL AND expired_at IS NULL`,
-            )
-            .run(now, approval.callId, approval.argumentsHash, approval.version ?? 0);
-          if (update.changes === 1) approvalEvent = "approval.denied";
-        } else if (approval.consumedAt === null && approval.expiredAt === null && approval.decision === "approved") {
-          const update = this.database
-            .query(
-              `UPDATE approvals
-               SET expired_at = ?, resolved_at = ?, version = version + 1
-               WHERE call_id = ? AND arguments_hash = ? AND version = ?
-                 AND decision = 'approved' AND consumed_at IS NULL AND expired_at IS NULL`,
+                 AND consumed_at IS NULL AND cancelled_at IS NULL`,
             )
             .run(now, now, approval.callId, approval.argumentsHash, approval.version ?? 0);
-          if (update.changes === 1) approvalEvent = "approval.expired";
-        }
-        if (approvalEvent !== null) {
+          if (update.changes !== 1) throw new PersistenceError(`approval for run ${runId} could not be cancelled`);
           this.database
             .query("INSERT INTO events (task_id, run_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)")
-            .run(run.taskId, runId, approvalEvent, json(boundedToolStartedPayload({
+            .run(run.taskId, runId, "approval.cancelled", json(boundedToolStartedPayload({
               id: call.callId,
               name: call.name,
               arguments: call.arguments,
@@ -912,7 +897,7 @@ export class StoreRepository {
            WHERE run_id = ? AND call_id = ? AND state = 'awaiting_approval' AND finished_at IS NULL`,
         )
         .run(json(cancelledResult), now, runId, call.callId);
-      if (toolUpdate.changes !== 1) throw new PersistenceError(`tool call ${call.callId} could not be cancelled`);
+      if (toolUpdate.changes !== 1) throw new PersistenceError(`awaiting tool call for run ${runId} could not be cancelled`);
 
       const runUpdate = this.database
         .query("UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'blocked_on_approval'")
@@ -936,10 +921,24 @@ export class StoreRepository {
   }
 
   appendEvent(runId: string, type: string, payload: unknown): void {
+    let eventPayload = payload;
+    if (
+      type === "tool.cancelled" &&
+      payload !== null &&
+      typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      typeof (payload as Record<string, unknown>).callId === "string"
+    ) {
+      const { callId, ...rest } = payload as Record<string, unknown> & { callId: string };
+      const call = this.getToolCall(callId);
+      eventPayload = call === null
+        ? { ...rest, callIdHash: createHash("sha256").update(callId).digest("hex") }
+        : { ...rest, ...boundedToolStartedPayload({ id: call.callId, name: call.name, arguments: call.arguments }) };
+    }
     immediateTransaction(this.database, () => {
       this.database
         .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
-        .run(runId, type, json(redactUnknown(payload)), Date.now());
+        .run(runId, type, json(redactUnknown(eventPayload)), Date.now());
     });
   }
 
@@ -1017,8 +1016,8 @@ export class StoreRepository {
       const inserted = this.database
         .query(
           `INSERT INTO approvals
-            (call_id, arguments_hash, tool, task_id, run_id, capability, risk_level, decision, requested_at, expires_at, resolved_at, consumed_at, expired_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (call_id, arguments_hash, tool, task_id, run_id, capability, risk_level, decision, requested_at, expires_at, resolved_at, consumed_at, expired_at, version, cancelled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (call_id, arguments_hash) DO NOTHING`,
         )
         .run(
@@ -1036,6 +1035,7 @@ export class StoreRepository {
           input.consumedAt ?? null,
           input.expiredAt ?? null,
           input.version ?? 0,
+          input.cancelledAt ?? null,
         );
       const stored = approvalFromRow(this.database
         .query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?")
@@ -1076,7 +1076,7 @@ export class StoreRepository {
         .query(
           `UPDATE approvals SET decision = ?, resolved_at = ?, version = version + 1
            WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision = ?
-             AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
+             AND consumed_at IS NULL AND expired_at IS NULL AND cancelled_at IS NULL AND expires_at > ?`,
         )
         .run(decision, now, callId, argumentsHash, expectedVersion, expectedDecision, now);
       if (updated.changes !== 1) return null;
@@ -1095,6 +1095,7 @@ export class StoreRepository {
       const record = approvalFromRow(current);
       if (record.consumedAt !== null && record.consumedAt !== undefined) return null;
       if (record.expiredAt !== null && record.expiredAt !== undefined) return null;
+      if (record.cancelledAt !== null && record.cancelledAt !== undefined) return null;
       if (record.decision !== "approved" || record.version !== expectedVersion) return null;
       if (record.expiresAt === undefined || now >= record.expiresAt) {
         this.expireApprovalInTransaction(record, now, expectedVersion, "approved");
@@ -1104,7 +1105,7 @@ export class StoreRepository {
         .query(
           `UPDATE approvals SET consumed_at = ?, resolved_at = ?, version = version + 1
            WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision = 'approved'
-             AND consumed_at IS NULL AND expired_at IS NULL AND expires_at > ?`,
+             AND consumed_at IS NULL AND expired_at IS NULL AND cancelled_at IS NULL AND expires_at > ?`,
         )
         .run(now, now, callId, argumentsHash, expectedVersion, now);
       if (updated.changes !== 1) return null;
@@ -1127,12 +1128,14 @@ export class StoreRepository {
 
   private expireApprovalInTransaction(record: ApprovalRecord, now: number, expectedVersion: number, expectedDecision?: "pending" | "approved"): ApprovalRecord | null {
     if (record.expiredAt !== null && record.expiredAt !== undefined) return record;
+    if (record.cancelledAt !== null && record.cancelledAt !== undefined) return record;
     if (record.expiresAt === undefined || now < record.expiresAt) return record;
     const updated = this.database
       .query(
         `UPDATE approvals SET expired_at = ?, resolved_at = ?, version = version + 1
          WHERE call_id = ? AND arguments_hash = ? AND version = ? AND decision IN ('pending', 'approved')
-           AND (? IS NULL OR decision = ?) AND consumed_at IS NULL AND expired_at IS NULL`,
+           AND (? IS NULL OR decision = ?) AND consumed_at IS NULL AND expired_at IS NULL
+           AND cancelled_at IS NULL`,
       )
       .run(now, now, record.callId, record.argumentsHash, expectedVersion, expectedDecision ?? null, expectedDecision ?? null);
     if (updated.changes !== 1) return approvalFromRow(this.database.query("SELECT * FROM approvals WHERE call_id = ? AND arguments_hash = ?").get(record.callId, record.argumentsHash) as Row);
