@@ -26,8 +26,7 @@ function isTrueTerminal(status: string): boolean {
 }
 
 function hasTerminalEvent(repository: StoreRepository, runId: string, status: string): boolean {
-  const expected = `run.${status}`;
-  return repository.getEvents(runId).some((event) => event.type === expected);
+  return repository.hasRunEvent(runId, `run.${status}`);
 }
 
 async function writeEventChunk(response: ServerResponse, chunk: string): Promise<void> {

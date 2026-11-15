@@ -1,13 +1,24 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ConversationService } from "../conversations/service";
+import type {
+  ConversationApprovalDetails,
+  ConversationMessageRecord,
+  ConversationRecord,
+} from "../conversations/types";
 import { KestrelError, ValidationError } from "../errors";
-import type { StoreRepository } from "../store/repository";
+import type { RunRecord, StoreRepository } from "../store/repository";
+import { truncateUtf8 } from "../tools/types";
 import type { HttpAuth } from "./auth";
 import { streamRunEvents } from "./events";
 import { serveWorkspaceImage } from "./workspace-preview";
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const MAX_CONVERSATION_RUNS = 50;
+const MAX_APPROVAL_CALL_ID_BYTES = 256;
+const MAX_CONVERSATION_DETAIL_BYTES = 256 * 1024;
+const MAX_CONVERSATION_MESSAGE_PAGE = 100;
+const MAX_MESSAGE_CONTENT_JSON_BYTES = 32 * 1024;
+const MAX_APPROVAL_ARGUMENTS_JSON_BYTES = 64 * 1024;
 
 type ApiErrorBody = { error: { code: string; message: string } };
 
@@ -42,6 +53,74 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 function safeMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "request failed";
   return message.replace(/[\r\n]+/gu, " ").slice(0, 1_024) || "request failed";
+}
+
+function jsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
+}
+
+function boundedJsonString(value: string, maximumBytes: number): { value: string; truncated: boolean } {
+  if (jsonBytes(value) <= maximumBytes) return { value, truncated: false };
+  let low = 0;
+  let high = Buffer.byteLength(value, "utf8");
+  let best = "";
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = truncateUtf8(value, middle);
+    if (jsonBytes(candidate) <= maximumBytes) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return { value: best, truncated: true };
+}
+
+function boundedConversation(conversation: ConversationRecord) {
+  return {
+    ...conversation,
+    id: boundedJsonString(conversation.id, 512).value,
+    title: boundedJsonString(conversation.title, 4_096).value,
+    workspace: boundedJsonString(conversation.workspace, 8_192).value,
+  };
+}
+
+function boundedRun(run: RunRecord) {
+  return {
+    id: boundedJsonString(run.id, 512).value,
+    taskId: boundedJsonString(run.taskId, 512).value,
+    status: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+  };
+}
+
+function boundedApproval(approval: ConversationApprovalDetails) {
+  const argumentsTruncated = jsonBytes(approval.arguments) > MAX_APPROVAL_ARGUMENTS_JSON_BYTES;
+  return {
+    ...approval,
+    callId: boundedJsonString(approval.callId, 1_024).value,
+    runId: boundedJsonString(approval.runId, 512).value,
+    taskId: boundedJsonString(approval.taskId, 512).value,
+    tool: boundedJsonString(approval.tool, 1_024).value,
+    arguments: argumentsTruncated ? {} : approval.arguments,
+    ...(argumentsTruncated ? { argumentsTruncated: true } : {}),
+    argumentsHash: boundedJsonString(approval.argumentsHash, 1_024).value,
+    capability: boundedJsonString(approval.capability, 1_024).value,
+    reason: boundedJsonString(approval.reason, 8_192).value,
+  };
+}
+
+function boundedConversationMessage(message: ConversationMessageRecord) {
+  const content = boundedJsonString(message.content, MAX_MESSAGE_CONTENT_JSON_BYTES);
+  return {
+    ...message,
+    conversationId: boundedJsonString(message.conversationId, 512).value,
+    content: content.value,
+    runId: message.runId === null ? null : boundedJsonString(message.runId, 512).value,
+    ...(content.truncated ? { contentTruncated: true } : {}),
+  };
 }
 
 export function sendApiError(response: ServerResponse, error: unknown): void {
@@ -130,6 +209,22 @@ function pathSegment(value: string): string {
   }
 }
 
+function approvalCallIdSegment(value: string): string {
+  try {
+    const decoded = decodeURIComponent(value);
+    if (
+      decoded.length === 0 ||
+      decoded.includes("\0") ||
+      Buffer.byteLength(decoded, "utf8") > MAX_APPROVAL_CALL_ID_BYTES
+    ) {
+      throw new Error("invalid");
+    }
+    return decoded;
+  } catch {
+    throw new ApiError(404, "NOT_FOUND", "API route was not found");
+  }
+}
+
 function requireConversation(repository: StoreRepository, conversationId: string) {
   const conversation = repository.getConversation(conversationId);
   if (conversation === null) throw new ApiError(404, "CONVERSATION_NOT_FOUND", "conversation was not found");
@@ -174,25 +269,52 @@ function conversationResponse(
   repository: StoreRepository,
   conversations: ConversationService,
   conversationId: string,
+  beforeSequence: number | null,
 ) {
-  const state = conversations.getConversationState(conversationId);
+  const state = conversations.getConversationState(conversationId, 1);
   const runs = state.tasks.slice(-MAX_CONVERSATION_RUNS).flatMap((task) => {
     const run = repository.getLatestRunForTask(task.id);
-    return run === null ? [] : [{
-      id: run.id,
-      taskId: run.taskId,
-      status: run.status,
-      startedAt: run.startedAt,
-      finishedAt: run.finishedAt,
-    }];
+    return run === null ? [] : [boundedRun(run)];
   });
-  return {
-    conversation: state.conversation,
-    messages: state.messages,
+  const page = repository.listConversationMessagesBefore(
+    conversationId,
+    beforeSequence,
+    MAX_CONVERSATION_MESSAGE_PAGE,
+  );
+  const base = {
+    conversation: boundedConversation(state.conversation),
     runs,
-    ...(state.activeRun === undefined ? {} : { activeRun: state.activeRun }),
-    ...(state.pendingApproval === undefined ? {} : { pendingApproval: state.pendingApproval }),
+    ...(state.activeRun === undefined ? {} : { activeRun: boundedRun(state.activeRun) }),
+    ...(state.pendingApproval === undefined ? {} : { pendingApproval: boundedApproval(state.pendingApproval) }),
   };
+  let messages: ReturnType<typeof boundedConversationMessage>[] = [];
+  for (let index = page.messages.length - 1; index >= 0; index -= 1) {
+    const candidate = [boundedConversationMessage(page.messages[index]!), ...messages];
+    const hasMore = page.hasMore || index > 0;
+    const response = {
+      ...base,
+      messages: candidate,
+      messagePage: {
+        hasMore,
+        nextCursor: hasMore ? candidate[0]!.sequenceNumber : null,
+      },
+    };
+    if (jsonBytes(response) > MAX_CONVERSATION_DETAIL_BYTES) break;
+    messages = candidate;
+  }
+  const hasMore = page.hasMore || messages.length < page.messages.length;
+  const response = {
+    ...base,
+    messages,
+    messagePage: {
+      hasMore,
+      nextCursor: hasMore && messages.length > 0 ? messages[0]!.sequenceNumber : null,
+    },
+  };
+  if (jsonBytes(response) > MAX_CONVERSATION_DETAIL_BYTES) {
+    throw new ApiError(500, "RESPONSE_TOO_LARGE", "conversation metadata exceeds the response size limit");
+  }
+  return response;
 }
 
 export function createApiRouter(dependencies: ApiRouterDependencies) {
@@ -271,10 +393,21 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
 
     const detailMatch = /^\/api\/conversations\/([^/]+)$/u.exec(url.pathname);
     if (detailMatch !== null && request.method === "GET") {
-      if (url.search.length > 0) throw new ApiError(400, "INVALID_REQUEST", "conversation detail does not accept query parameters");
+      const cursorValues = url.searchParams.getAll("cursor");
+      if ([...url.searchParams.keys()].some((key) => key !== "cursor") || cursorValues.length > 1) {
+        throw new ApiError(400, "INVALID_REQUEST", "invalid conversation detail query");
+      }
+      const cursorValue = cursorValues[0];
+      if (cursorValue !== undefined && !/^(?:0|[1-9]\d*)$/u.test(cursorValue)) {
+        throw new ApiError(400, "INVALID_REQUEST", "cursor must be a non-negative integer");
+      }
+      const cursor = cursorValue === undefined ? null : Number(cursorValue);
+      if (cursor !== null && !Number.isSafeInteger(cursor)) {
+        throw new ApiError(400, "INVALID_REQUEST", "cursor is too large");
+      }
       const conversationId = pathSegment(detailMatch[1]!);
       requireConversation(repository, conversationId);
-      sendJson(response, 200, conversationResponse(repository, conversations, conversationId));
+      sendJson(response, 200, conversationResponse(repository, conversations, conversationId, cursor));
       return;
     }
 
@@ -310,7 +443,7 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
       requireSameOrigin(auth, request);
       const conversationId = pathSegment(approvalMatch[1]!);
       const runId = pathSegment(approvalMatch[2]!);
-      const callId = pathSegment(approvalMatch[3]!);
+      const callId = approvalCallIdSegment(approvalMatch[3]!);
       requireOwnedRun(repository, conversationId, runId);
       const state = conversations.getConversationState(conversationId);
       if (state.activeRun?.id !== runId || state.pendingApproval?.callId !== callId) {

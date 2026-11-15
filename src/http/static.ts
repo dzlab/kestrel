@@ -108,11 +108,29 @@ export function createStaticHandler(buildDirectory: string) {
       });
       if (request.method === "HEAD") {
         response.end();
+      } else if (size === 0) {
+        response.end();
       } else {
-        const stream = createReadStream(candidate, { fd: descriptor, autoClose: true });
+        const stream = createReadStream(candidate, {
+          fd: descriptor,
+          autoClose: true,
+          start: 0,
+          end: size - 1,
+        });
         descriptor = undefined;
+        let sent = 0;
         response.once("close", () => stream.destroy());
-        stream.on("error", () => response.destroy()).pipe(response);
+        stream.on("data", (chunk: Buffer) => {
+          sent += chunk.length;
+          if (sent > size) {
+            stream.destroy(new Error("static asset changed while streaming"));
+          }
+        });
+        stream.once("end", () => {
+          if (sent === size) response.end();
+          else response.destroy();
+        });
+        stream.on("error", () => response.destroy()).pipe(response, { end: false });
       }
     } finally {
       if (descriptor !== undefined) closeSecureFile(descriptor);

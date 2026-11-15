@@ -60,10 +60,10 @@ export class ConversationService {
     this.defaults = dependencies.defaults ?? {};
   }
 
-  getConversationState(conversationId: string): ConversationState {
+  getConversationState(conversationId: string, messageLimit = MAX_CONVERSATION_RECORDS): ConversationState {
     const conversation = this.repository.getConversation(conversationId);
     if (conversation === null) throw new ValidationError(`conversation was not found: ${conversationId}`);
-    const messages = this.repository.listConversationMessages(conversationId, MAX_CONVERSATION_RECORDS);
+    const messages = this.repository.listConversationMessages(conversationId, messageLimit);
     const tasks = this.repository.listConversationTasks(conversationId, MAX_CONVERSATION_RECORDS);
     const active = this.findActiveTask(tasks);
     const activeRun = active?.run;
@@ -153,11 +153,18 @@ export class ConversationService {
     if (!ownsRun) throw new ValidationError(`run ${runId} does not belong to conversation ${conversationId}`);
 
     const active = this.activeRuns.get(runId);
-    if (active === undefined || active.conversationId !== conversationId) {
-      throw new ValidationError(`run ${runId} is not actively executing in this service`);
+    if (active !== undefined && active.conversationId === conversationId) {
+      active.controller.abort(new Error("run was cancelled"));
+      return active.promise;
     }
-    active.controller.abort(new Error("run was cancelled"));
-    return active.promise;
+    const cancelled = this.repository.cancelBlockedConversationRun(conversationId, runId);
+    return {
+      conversationId,
+      taskId: cancelled.taskId,
+      runId: cancelled.id,
+      status: cancelled.status,
+      error: "run was cancelled",
+    };
   }
 
   async recoverConversation(conversationId: string): Promise<ConversationTurnResult | null> {
