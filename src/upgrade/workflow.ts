@@ -284,6 +284,9 @@ export class SelfUpgrade {
     }
     const approvalArguments = { proposalId: proposal.id };
     const approvalRecord = this.approvals.get(proposal.approval.id);
+    if (proposal.approval.status === "cancelled" || approvalRecord?.status === "cancelled") {
+      throw new ToolExecutionError(`approval was cancelled for upgrade ${proposal.id}`);
+    }
     const callerApproval = this.callerApproval(input, approvalArguments);
     const approvalConsumedByCaller = callerApproval !== null;
     const syntheticCall = this.repository.getToolCall(proposal.approval.id);
