@@ -105,9 +105,12 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 .approval-meta { display: grid; grid-template-columns: max-content minmax(0,1fr); gap: 5px 14px; color: var(--muted); font-size: 11px; margin: 14px 0; }
 .approval-meta strong { color: var(--soft); overflow-wrap: anywhere; }
 .arguments-block { border: 1px solid var(--line); border-radius: 9px; background: rgba(4,10,8,.45); overflow: hidden; }
-.arguments-block > div { display: flex; justify-content: space-between; color: var(--muted); padding: 8px 10px; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--line); }
+.arguments-block > .arguments-heading { display: flex; justify-content: space-between; color: var(--muted); padding: 8px 10px; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--line); }
 .arguments-block pre { max-height: 220px; overflow: auto; margin: 0; padding: 11px; color: #c7d9d0; font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .arguments-loading { display: flex; gap: 7px; align-items: center; padding: 11px; color: var(--muted) !important; margin: 0 !important; }
+.arguments-retry { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-right: 9px; }
+.arguments-retry button { flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--soft); padding: 5px 8px; font-size: 10px; cursor: pointer; }
+.arguments-retry button:disabled { opacity: .45; cursor: not-allowed; }
 .approval-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 14px; }
 .approval-actions button { border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 12px; font-weight: 600; }
 .approval-actions button:disabled { opacity: .45; cursor: not-allowed; }

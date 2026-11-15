@@ -78,11 +78,16 @@ export function ConversationThread() {
                 <span>Request</span><strong>{approvalSummary(pending)}</strong>
               </div>
               <div className="arguments-block">
-                <div><span>Exact stored arguments</span><span>{pending.argumentsBytes.toLocaleString()} bytes</span></div>
+                <div className="arguments-heading"><span>Exact stored arguments</span><span>{pending.argumentsBytes.toLocaleString()} bytes</span></div>
                 {runtime.approvalArgumentsLoading ? (
                   <p className="arguments-loading"><LoaderCircle className="spin" size={15} /> Loading exact arguments…</p>
                 ) : runtime.approvalArguments === null ? (
-                  <p className="arguments-loading"><AlertTriangle size={15} /> Arguments unavailable; approval is disabled.</p>
+                  <div className="arguments-retry">
+                    <p className="arguments-loading"><AlertTriangle size={15} /> Arguments unavailable; approval is disabled.</p>
+                    <button type="button" disabled={runtime.actionPending} onClick={runtime.retryApprovalArguments}>
+                      Retry loading arguments
+                    </button>
+                  </div>
                 ) : (
                   <pre>{JSON.stringify(runtime.approvalArguments, null, 2)}</pre>
                 )}
