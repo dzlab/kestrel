@@ -487,8 +487,34 @@ export class StoreRepository {
         `SELECT DISTINCT conversation_tasks.conversation_id
          FROM conversation_tasks
          INNER JOIN tasks ON tasks.id = conversation_tasks.task_id
+         LEFT JOIN runs AS latest_run ON latest_run.id = (
+           SELECT candidate.id
+           FROM runs AS candidate
+           WHERE candidate.task_id = tasks.id
+           ORDER BY candidate.started_at DESC, candidate.rowid DESC
+           LIMIT 1
+         )
          WHERE (? IS NULL OR conversation_tasks.conversation_id > ?)
-           AND tasks.status IN ('pending', 'running', 'blocked_on_approval')
+           AND conversation_tasks.task_id = (
+             SELECT latest_task.task_id
+             FROM conversation_tasks AS latest_task
+             WHERE latest_task.conversation_id = conversation_tasks.conversation_id
+             ORDER BY latest_task.created_at DESC, latest_task.task_id DESC
+             LIMIT 1
+           )
+           AND (
+             tasks.status IN ('pending', 'running', 'blocked_on_approval')
+             OR (
+               latest_run.status = 'completed'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM conversation_messages
+                 WHERE conversation_messages.conversation_id = conversation_tasks.conversation_id
+                   AND conversation_messages.role = 'assistant'
+                   AND conversation_messages.run_id = latest_run.id
+               )
+             )
+           )
          ORDER BY conversation_tasks.conversation_id ASC
          LIMIT ?`,
       )

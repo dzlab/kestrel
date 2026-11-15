@@ -226,14 +226,16 @@ export class ConversationService {
     return result;
   }
 
-  async recoverAll(pageSize = RECOVERY_PAGE_SIZE): Promise<(ConversationTurnResult | null)[]> {
+  async recoverAll(limit = RECOVERY_PAGE_SIZE): Promise<(ConversationTurnResult | null)[]> {
     this.assertAcceptingWork();
-    if (this.recoveryPromise !== undefined) return this.recoveryPromise;
-    const recovery = this.recoverDurableConversations(pageSize).finally(() => {
-      if (this.recoveryPromise === recovery) this.recoveryPromise = undefined;
-    });
-    this.recoveryPromise = recovery;
-    return recovery;
+    return this.startRecovery(() => this.recoverConversationIds(
+      this.repository.listRecoverableConversationIds(null, limit),
+    ));
+  }
+
+  async recoverAllAtStartup(pageSize = RECOVERY_PAGE_SIZE): Promise<(ConversationTurnResult | null)[]> {
+    this.assertAcceptingWork();
+    return this.startRecovery(() => this.recoverDurableConversations(pageSize));
   }
 
   shutdown(): Promise<void> {
@@ -252,6 +254,17 @@ export class ConversationService {
     if (this.shuttingDown) throw new ValidationError("conversation service is shutting down");
   }
 
+  private startRecovery(
+    operation: () => Promise<(ConversationTurnResult | null)[]>,
+  ): Promise<(ConversationTurnResult | null)[]> {
+    if (this.recoveryPromise !== undefined) return this.recoveryPromise;
+    const recovery = operation().finally(() => {
+      if (this.recoveryPromise === recovery) this.recoveryPromise = undefined;
+    });
+    this.recoveryPromise = recovery;
+    return recovery;
+  }
+
   private async recoverDurableConversations(pageSize: number): Promise<(ConversationTurnResult | null)[]> {
     const conversationIds: string[] = [];
     let cursor: string | null = null;
@@ -262,6 +275,12 @@ export class ConversationService {
       cursor = page[page.length - 1]!;
     }
 
+    return this.recoverConversationIds(conversationIds);
+  }
+
+  private async recoverConversationIds(
+    conversationIds: readonly string[],
+  ): Promise<(ConversationTurnResult | null)[]> {
     const results = new Array<ConversationTurnResult | null>(conversationIds.length).fill(null);
     let nextIndex = 0;
     let firstError: unknown;

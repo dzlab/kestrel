@@ -306,7 +306,7 @@ async function uiCommand(write: (message: string) => void, runtime?: CliRuntime)
     server = await serverPromise;
     if (!shutdownRequested) {
       write(`Kestrel UI listening at ${server.url}`);
-      void conversations.recoverAll().catch((error: unknown) => {
+      void conversations.recoverAllAtStartup().catch((error: unknown) => {
         write(`Kestrel conversation recovery failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     }
