@@ -17,6 +17,11 @@ The initial release has no messaging, social-automation, or contact-facing integ
 - Self-upgrade cannot apply without exact approval. It rechecks Git revision and target hashes, refuses network/package-fetching verification, records output, and rolls back on verification failure.
 - SQLite events are append-only at the repository layer. Idempotency keys, tool-call records, and scheduler fencing tokens prevent safe retries from replaying completed work.
 - The default state directory and database permissions are private. Configuration rejects the CLI's in-memory database mode, directory targets, and symlink database files. Schema mismatches fail closed.
+- The browser server binds only to `127.0.0.1`. It validates a loopback `Host` on API traffic, requires a random per-process session token in an `HttpOnly`, `SameSite=Strict` cookie, and requires the `Origin` to match the request host for state-changing requests. It emits no permissive CORS headers. These checks reduce browser-origin attacks; they do not defend against a malicious process running as the same OS user.
+- Browser conversation rows and per-run audit rows are durable but separate. User/assistant transcript text is used to rebuild bounded context, while tool calls, tool results, approvals, and events remain attached to their run. Durable event IDs support reconnect without treating a disconnected browser as permission to repeat a side effect.
+- Workspace image previews accept only workspace-relative paths associated with the conversation. Resolution remains within the configured workspace, symlinks and special files are rejected, responses are capped at 5 MiB, and only PNG, JPEG, GIF, and WebP are served with `nosniff`. SVG, arbitrary local files, and `file://` access are not supported.
+
+The loopback listener, cookie, origin checks, policy engine, output bounds, and approval gates are application controls, not a hostile-code sandbox. Approved process execution still runs under the local user's OS account. Use containers, virtual machines, or another OS isolation boundary when running untrusted code.
 
 ## Secret scanning
 

@@ -33,6 +33,7 @@ The remaining settings are in `.env.example`. They bound model turns, tool calls
 
 ```text
 kestrel run <prompt>
+kestrel ui
 kestrel approve <call-id>
 kestrel deny <call-id>
 kestrel history
@@ -42,6 +43,32 @@ kestrel schedule cancel <id>
 kestrel tick
 kestrel daemon start|status|stop
 ```
+
+## Browser UI
+
+The browser UI uses the same Kestrel runtime, policy, approvals, tools, and SQLite database as the CLI. Configure a model before starting it: `KESTREL_MODEL_BASE_URL` is required, `KESTREL_MODEL_NAME` selects the provider model, and `KESTREL_MODEL_API_KEY` is required only when the provider requires a bearer token.
+
+From an installed or packaged Kestrel distribution, one foreground command serves both the bundled UI and its API:
+
+```sh
+kestrel ui
+```
+
+Kestrel prints a per-process URL such as `http://127.0.0.1:43127`. Open the exact printed URL in a local browser. The listener is loopback-only and the command remains in the foreground; press `Ctrl-C` to stop it. `SIGINT` and `SIGTERM` both close the HTTP listener and SQLite runtime. The UI command does not start or alter the scheduler daemon.
+
+For frontend development from this source checkout, start the Kestrel API process in one terminal:
+
+```sh
+mise exec -- bun run src/cli/main.ts ui
+```
+
+Leave that process running, copy its printed origin into a second terminal, and start Vite:
+
+```sh
+KESTREL_API_ORIGIN=http://127.0.0.1:43127 mise exec -- bun run ui:dev
+```
+
+Open the loopback URL printed by Vite while developing. Vite proxies `/api` to the Kestrel origin; it does not create a second Kestrel backend. Release/package creation runs `ui:build` through the package `prepack` hook so CLI smoke checks and ordinary backend development do not require prebuilt React assets.
 
 Run a task from the configured workspace:
 
@@ -101,6 +128,8 @@ npm run typecheck
 mise exec -- bun run diff:check
 mise exec -- bun run smoke
 ```
+
+Frontend source development uses `ui:dev` as described above. `ui:build` is reserved for packaging/release preparation; generated `ui/dist/` assets are not committed.
 
 GitHub Actions runs the same `check` and `smoke` commands on macOS and Linux for both Bun 1.4.0 and the latest Bun release on pull requests and pushes to `main`. Unsupported operating systems fail closed. The repository also runs actionlint, scheduled CodeQL analysis, and pull-request dependency review. CI installs the committed npm lockfile with `npm ci --ignore-scripts`; local Bun development remains supported through `bun install`.
 
