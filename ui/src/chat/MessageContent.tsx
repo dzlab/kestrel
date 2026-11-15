@@ -29,7 +29,7 @@ export function MessageContent({ content }: Readonly<{ content: string }>) {
         urlTransform={safeUrlTransform}
         components={{
           pre: ({ node, children }) => {
-            const codeNode = node.children[0];
+            const codeNode = node?.children[0];
             if (codeNode?.type === "element" && codeNode.tagName === "code") {
               const classNames = codeNode.properties.className;
               const className = Array.isArray(classNames) ? classNames.join(" ") : String(classNames ?? "");

@@ -112,6 +112,10 @@ function runtimeMessage(message: ConversationMessage): ThreadMessageLike {
   };
 }
 
+function convertRuntimeMessage(message: ThreadMessageLike): ThreadMessageLike {
+  return message;
+}
+
 function textFromAppend(message: AppendMessage): string {
   if (message.content.some((part) => part.type !== "text")) {
     throw new ApiError(400, "UNSUPPORTED_MESSAGE", "Kestrel currently accepts text messages only");
@@ -638,6 +642,7 @@ export function KestrelRuntimeProvider({
     state === "blocked_on_approval" || state === "disconnected";
   const runtime = useExternalStoreRuntime({
     messages: assistantMessages,
+    convertMessage: convertRuntimeMessage,
     isRunning,
     isSendDisabled: sendDisabled,
     activeRunId: detail?.activeRun?.id,

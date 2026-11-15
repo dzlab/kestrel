@@ -14,6 +14,19 @@ import {
 import { SCHEDULE_LEASE_TIMEOUT_MS, StoreRepository } from "../src/store/repository";
 import type { Message, ToolCall } from "../src/protocol/types";
 
+function expectedMigrationVersions(): Array<{ version: number }> {
+  return migrations.map(({ version }) => ({ version }));
+}
+
+function expectedMigrationHistory(
+  firstChecksum = versionOneChecksum,
+): Array<{ version: number; checksum: string }> {
+  return migrations.map((migration, index) => ({
+    version: migration.version,
+    checksum: index === 0 ? firstChecksum : migrationChecksum(migration.sql),
+  }));
+}
+
 function withDatabase<T>(callback: (path: string, open: () => Database) => T): T | Promise<T> {
   const directory = mkdtempSync(join(tmpdir(), "kestrel-store-"));
   const path = join(directory, "kestrel.sqlite");
@@ -1519,7 +1532,7 @@ test("version-four migration rejects an altered current schedule definition befo
     );
     database.exec("DROP TABLE schedules_original");
     database.exec("CREATE INDEX idx_schedules_due ON schedules(enabled, next_run_at, claimed_by)");
-    database.query("DELETE FROM schema_migrations WHERE version IN (4, 5, 6, 7, 8, 9, 10)").run();
+    database.query("DELETE FROM schema_migrations WHERE version >= 4").run();
     database.close();
 
     expect(() => openDatabase(path)).toThrow(/schedule|default|schema/i);
@@ -1552,18 +1565,7 @@ test("fresh databases apply the complete migration history", () => {
       .query("SELECT version, checksum FROM schema_migrations ORDER BY version")
       .all() as Array<{ version: number; checksum: string }>;
 
-    expect(versions).toEqual([
-      { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
-      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
-      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
-      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
-      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
-      { version: 6, checksum: migrationChecksum(migrations[5].sql) },
-      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
-      { version: 8, checksum: migrationChecksum(migrations[7].sql) },
-      { version: 9, checksum: migrationChecksum(migrations[8].sql) },
-      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
-    ]);
+    expect(versions).toEqual(expectedMigrationHistory());
     expect(database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'").get()).toEqual({
       name: "approvals",
     });
@@ -1611,30 +1613,12 @@ test("legacy version-1 databases upgrade without losing data", () => {
     expect(database.query("PRAGMA table_info('schema_migrations')").all()).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "checksum" })]),
     );
-    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
-      { version: 1 },
-      { version: 2 },
-      { version: 3 },
-      { version: 4 },
-      { version: 5 },
-      { version: 6 },
-      { version: 7 },
-      { version: 8 },
-      { version: 9 },
-      { version: 10 },
-    ]);
-    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
-      { version: 1, checksum: "5e89d34102619e0385648171289134a0eff1fc383e37c24d6f3298183a2710e0" },
-      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
-      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
-      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
-      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
-      { version: 6, checksum: migrationChecksum(migrations[5].sql) },
-      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
-      { version: 8, checksum: migrationChecksum(migrations[7].sql) },
-      { version: 9, checksum: migrationChecksum(migrations[8].sql) },
-      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
-    ]);
+    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(
+      expectedMigrationVersions(),
+    );
+    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual(
+      expectedMigrationHistory(),
+    );
     expectCurrentSchema(database);
   });
 });
@@ -1684,30 +1668,12 @@ test("hardened historical version-one databases upgrade without losing data", ()
 
     const database = open();
     expect(database.query("SELECT title FROM tasks WHERE id = ?").get("hardened-task")).toEqual({ title: "Hardened" });
-    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
-      { version: 1 },
-      { version: 2 },
-      { version: 3 },
-      { version: 4 },
-      { version: 5 },
-      { version: 6 },
-      { version: 7 },
-      { version: 8 },
-      { version: 9 },
-      { version: 10 },
-    ]);
-    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual([
-      { version: 1, checksum: "3553adbe9019bbe2e3868ad43e4d74ed0834f1465ada668514046e570686d8aa" },
-      { version: 2, checksum: "28020c0d96b13e8f0ac0394c299c19dc53d9c531a38dbb1187a544c9932ba47c" },
-      { version: 3, checksum: migrationChecksum(migrations[2].sql) },
-      { version: 4, checksum: migrationChecksum(migrations[3].sql) },
-      { version: 5, checksum: migrationChecksum(migrations[4].sql) },
-      { version: 6, checksum: migrationChecksum(migrations[5].sql) },
-      { version: 7, checksum: migrationChecksum(migrations[6].sql) },
-      { version: 8, checksum: migrationChecksum(migrations[7].sql) },
-      { version: 9, checksum: migrationChecksum(migrations[8].sql) },
-      { version: 10, checksum: migrationChecksum(migrations[9].sql) },
-    ]);
+    expect(database.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(
+      expectedMigrationVersions(),
+    );
+    expect(database.query("SELECT version, checksum FROM schema_migrations ORDER BY version").all()).toEqual(
+      expectedMigrationHistory(historicalVersionOneChecksum),
+    );
     expectCurrentSchema(database);
     database.query("UPDATE runs SET status = 'cancelled' WHERE id = 'hardened-run'").run();
     expect(database.query("SELECT status FROM runs WHERE id = 'hardened-run'").get()).toEqual({ status: "cancelled" });
@@ -1766,18 +1732,9 @@ test("version-two databases with a legacy nullable checksum upgrade to the harde
         expect.objectContaining({ name: "version", pk: 1 }),
       ]),
     );
-    expect(upgraded.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual([
-      { version: 1 },
-      { version: 2 },
-      { version: 3 },
-      { version: 4 },
-      { version: 5 },
-      { version: 6 },
-      { version: 7 },
-      { version: 8 },
-      { version: 9 },
-      { version: 10 },
-    ]);
+    expect(upgraded.query("SELECT version FROM schema_migrations ORDER BY version").all()).toEqual(
+      expectedMigrationVersions(),
+    );
   });
 });
 
