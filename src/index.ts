@@ -142,6 +142,8 @@ export type {
 export { FakeModel } from "./model/fake";
 export { OpenAICompatibleClient } from "./model/openai-compatible";
 export type { ModelClient } from "./model/client";
+export { startKestrelHttpServer } from "./http/server";
+export type { KestrelHttpServer, StartKestrelHttpServerOptions } from "./http/server";
 export { openDatabase } from "./store/database";
 export { StoreRepository, Repository } from "./store/repository";
 export type {

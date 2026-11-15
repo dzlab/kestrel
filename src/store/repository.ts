@@ -783,6 +783,14 @@ export class StoreRepository {
         .run(runId, call.id, call.name, argumentsJson, state, Date.now());
 
       if (result.changes === 1) {
+        this.database
+          .query("INSERT INTO events (run_id, type, payload, created_at) VALUES (?, ?, ?, ?)")
+          .run(
+            runId,
+            "tool.started",
+            json(redactUnknown({ callId: call.id, name: call.name })),
+            Date.now(),
+          );
         return true;
       }
 
