@@ -18,11 +18,11 @@ function eventCursor(request: IncomingMessage): number {
   return cursor;
 }
 
-function isStillExecuting(repository: StoreRepository, runId: string, status: string): boolean {
-  if (status === "running") return true;
-  return status === "blocked_on_approval" && repository
-    .getToolCalls(runId)
-    .some((call) => call.finishedAt === null && call.state === "executing");
+function isTrueTerminal(status: string): boolean {
+  return status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "budget_exhausted";
 }
 
 function hasTerminalEvent(repository: StoreRepository, runId: string, status: string): boolean {
@@ -97,7 +97,7 @@ export async function streamRunEvents(
 
       const run = repository.getRun(runId);
       if (run === null) break;
-      if (!isStillExecuting(repository, runId, run.status)) {
+      if (isTrueTerminal(run.status)) {
         if (hasTerminalEvent(repository, runId, run.status) || terminalEventPolls >= MAX_TERMINAL_EVENT_POLLS) break;
         terminalEventPolls += 1;
       } else {

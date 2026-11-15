@@ -9,6 +9,9 @@ const finishReasons: readonly ModelResponse["finishReason"][] = [
   "error",
 ];
 
+export const MAX_TOOL_CALL_ID_BYTES = 256;
+export const MAX_TOOL_CALL_NAME_BYTES = 128;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -19,6 +22,14 @@ function requiredString(value: unknown, field: string): string {
   }
 
   return value;
+}
+
+function requiredBoundedString(value: unknown, field: string, maximumBytes: number): string {
+  const parsed = requiredString(value, field);
+  if (Buffer.byteLength(parsed, "utf8") > maximumBytes) {
+    throw new ValidationError(`${field} must not exceed ${maximumBytes} bytes`);
+  }
+  return parsed;
 }
 
 function parseArguments(value: unknown): Record<string, unknown> {
@@ -45,8 +56,8 @@ export function parseToolCall(input: unknown): ToolCall {
   }
 
   return {
-    id: requiredString(input.id, "tool call id"),
-    name: requiredString(input.name, "tool call name"),
+    id: requiredBoundedString(input.id, "tool call id", MAX_TOOL_CALL_ID_BYTES),
+    name: requiredBoundedString(input.name, "tool call name", MAX_TOOL_CALL_NAME_BYTES),
     arguments: parseArguments(input.arguments),
   };
 }
@@ -75,7 +86,7 @@ export function parseMessage(input: unknown): Message {
 
   let toolCallId: string | undefined;
   if (input.toolCallId !== undefined) {
-    toolCallId = requiredString(input.toolCallId, "message tool call id");
+    toolCallId = requiredBoundedString(input.toolCallId, "message tool call id", MAX_TOOL_CALL_ID_BYTES);
   }
 
   if (

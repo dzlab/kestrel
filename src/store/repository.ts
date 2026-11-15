@@ -1,15 +1,20 @@
 import type { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ConversationMessageRecord,
   ConversationRecord,
   ConversationRole,
 } from "../conversations/types";
 import { PersistenceError, ValidationError } from "../errors";
-import { parseMessage } from "../protocol/validation";
+import {
+  MAX_TOOL_CALL_ID_BYTES,
+  MAX_TOOL_CALL_NAME_BYTES,
+  parseMessage,
+} from "../protocol/validation";
 import type { Message, RunStatus, ToolCall } from "../protocol/types";
 import { immediateTransaction } from "./transaction";
 import { redactUnknown } from "../tools/redaction";
+import { truncateUtf8 } from "../tools/types";
 
 type Row = Record<string, unknown>;
 
@@ -17,6 +22,18 @@ const MAX_CONVERSATION_LIST_LIMIT = 100;
 const MAX_CONVERSATION_MESSAGE_LIMIT = 1_000;
 const MAX_CONVERSATION_TASK_LIMIT = 1_000;
 const MAX_EVENT_PAGE_LIMIT = 1_000;
+
+function boundedToolStartedPayload(call: ToolCall): Record<string, unknown> {
+  const callId = truncateUtf8(call.id, MAX_TOOL_CALL_ID_BYTES);
+  const name = truncateUtf8(call.name, MAX_TOOL_CALL_NAME_BYTES);
+  return redactUnknown({
+    callId,
+    callIdHash: createHash("sha256").update(call.id).digest("hex"),
+    callIdTruncated: callId !== call.id,
+    name,
+    nameTruncated: name !== call.name,
+  }) as Record<string, unknown>;
+}
 
 export type TaskRecord = {
   id: string;
@@ -788,7 +805,7 @@ export class StoreRepository {
           .run(
             runId,
             "tool.started",
-            json(redactUnknown({ callId: call.id, name: call.name })),
+            json(boundedToolStartedPayload(call)),
             Date.now(),
           );
         return true;

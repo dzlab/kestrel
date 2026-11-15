@@ -1,6 +1,7 @@
-import { createReadStream, existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { createReadStream, fstatSync, realpathSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { closeSecureFile, openSecureFileRead } from "../tools/secure-fs";
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
@@ -44,12 +45,13 @@ export function createStaticHandler(buildDirectory: string) {
       plain(response, 405, "Method Not Allowed");
       return;
     }
-    if (!existsSync(requestedRoot) || lstatSync(requestedRoot).isSymbolicLink()) {
+    let root: string;
+    try {
+      root = realpathSync(requestedRoot);
+    } catch {
       plain(response, 404, "UI build not found");
       return;
     }
-
-    const root = realpathSync(requestedRoot);
     let decoded: string;
     try {
       decoded = decodeURIComponent(pathname);
@@ -69,35 +71,51 @@ export function createStaticHandler(buildDirectory: string) {
       return;
     }
     const assetRequest = extname(requestedPath).length > 0;
-    if (!existsSync(candidate) && !assetRequest) candidate = resolve(root, "index.html");
-    if (!existsSync(candidate)) {
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSecureFileRead(root, candidate);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (assetRequest || code !== "ENOENT") {
+        plain(response, 404, "Not Found");
+        return;
+      }
+      candidate = resolve(root, "index.html");
+      try {
+        descriptor = openSecureFileRead(root, candidate);
+      } catch {
+        plain(response, 404, "Not Found");
+        return;
+      }
+    }
+    if (descriptor === undefined) {
       plain(response, 404, "Not Found");
       return;
     }
-
-    const entry = lstatSync(candidate);
-    if (entry.isSymbolicLink() || !entry.isFile()) {
-      plain(response, 404, "Not Found");
-      return;
-    }
-    const canonical = realpathSync(candidate);
-    if (!isWithin(root, canonical)) {
-      plain(response, 404, "Not Found");
-      return;
-    }
-    const contentType = MIME_TYPES[extname(canonical).toLowerCase()];
+    const contentType = MIME_TYPES[extname(candidate).toLowerCase()];
     if (contentType === undefined) {
+      closeSecureFile(descriptor);
       plain(response, 415, "Unsupported Media Type");
       return;
     }
-    const size = statSync(canonical).size;
-    response.writeHead(200, {
-      "Content-Type": contentType,
-      "Content-Length": size,
-      "Cache-Control": extname(canonical) === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
-      "X-Content-Type-Options": "nosniff",
-    });
-    if (request.method === "HEAD") response.end();
-    else createReadStream(canonical).on("error", () => response.destroy()).pipe(response);
+    try {
+      const size = fstatSync(descriptor).size;
+      response.writeHead(200, {
+        "Content-Type": contentType,
+        "Content-Length": size,
+        "Cache-Control": extname(candidate) === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+      });
+      if (request.method === "HEAD") {
+        response.end();
+      } else {
+        const stream = createReadStream(candidate, { fd: descriptor, autoClose: true });
+        descriptor = undefined;
+        response.once("close", () => stream.destroy());
+        stream.on("error", () => response.destroy()).pipe(response);
+      }
+    } finally {
+      if (descriptor !== undefined) closeSecureFile(descriptor);
+    }
   };
 }

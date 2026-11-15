@@ -1,8 +1,9 @@
-import { closeSync, constants, createReadStream, fstatSync, openSync, readSync } from "node:fs";
+import { createReadStream, fstatSync, readSync } from "node:fs";
 import type { ServerResponse } from "node:http";
 import { extname, isAbsolute } from "node:path";
 import { ValidationError } from "../errors";
 import { resolveWorkspacePath } from "../tools/filesystem";
+import { closeSecureFile, openSecureFileRead } from "../tools/secure-fs";
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_TYPES: Readonly<Record<string, string>> = {
@@ -29,7 +30,7 @@ export function serveWorkspaceImage(response: ServerResponse, workspace: string,
     const path = resolveWorkspacePath(workspace, requestedPath);
     const contentType = IMAGE_TYPES[extname(path).toLowerCase()];
     if (contentType === undefined) throw new ValidationError("workspace image type is not supported");
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    descriptor = openSecureFileRead(workspace, path);
     const entry = fstatSync(descriptor);
     if (!entry.isFile()) throw new ValidationError("workspace image is not a regular file");
     if (entry.size > MAX_IMAGE_BYTES) throw new ValidationError("workspace image exceeds the size limit");
@@ -42,9 +43,10 @@ export function serveWorkspaceImage(response: ServerResponse, workspace: string,
     });
     const stream = createReadStream(path, { fd: descriptor, autoClose: true });
     descriptor = undefined;
+    response.once("close", () => stream.destroy());
     stream.on("error", () => response.destroy()).pipe(response);
   } catch (error) {
-    if (descriptor !== undefined) closeSync(descriptor);
+    if (descriptor !== undefined) closeSecureFile(descriptor);
     if (response.headersSent) {
       response.destroy();
       return;

@@ -136,11 +136,16 @@ function requireConversation(repository: StoreRepository, conversationId: string
   return conversation;
 }
 
+function requireRun(repository: StoreRepository, runId: string) {
+  const run = repository.getRun(runId);
+  if (run === null) throw new ApiError(404, "RUN_NOT_FOUND", "run was not found");
+  return run;
+}
+
 function requireOwnedRun(repository: StoreRepository, conversationId: string, runId: string) {
   requireConversation(repository, conversationId);
-  const run = repository.getRun(runId);
+  const run = requireRun(repository, runId);
   if (
-    run === null ||
     !repository.listConversationTasks(conversationId, 1_000).some((task) => task.id === run.taskId)
   ) {
     throw new ApiError(404, "RUN_NOT_FOUND", "run was not found for this conversation");
@@ -233,6 +238,24 @@ export function createApiRouter(dependencies: ApiRouterDependencies) {
         workspace,
       });
       sendJson(response, 201, { conversation });
+      return;
+    }
+
+    const directEventsMatch = /^\/api\/runs\/([^/]+)\/events$/u.exec(url.pathname);
+    if (directEventsMatch !== null && request.method === "GET") {
+      if (url.search.length > 0) throw new ApiError(400, "INVALID_REQUEST", "event stream does not accept query parameters");
+      const runId = pathSegment(directEventsMatch[1]!);
+      requireRun(repository, runId);
+      await streamRunEvents(request, response, repository, runId);
+      return;
+    }
+
+    if (url.pathname === "/api/workspace/image" && request.method === "GET") {
+      const paths = url.searchParams.getAll("path");
+      if (paths.length !== 1 || [...url.searchParams.keys()].some((key) => key !== "path") || paths[0]!.length === 0) {
+        throw new ApiError(400, "INVALID_REQUEST", "one workspace-relative image path is required");
+      }
+      serveWorkspaceImage(response, workspace, paths[0]!);
       return;
     }
 
