@@ -1,43 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, WrapText } from "lucide-react";
-import { bundledLanguages, createHighlighter, type BundledLanguage } from "shiki";
+import { highlightCode, normalizeLanguage } from "./code-highlighter";
 
-type HighlightedCode = ReturnType<Awaited<ReturnType<typeof createHighlighter>>["codeToTokens"]>;
-
-const LANGUAGE_ALIASES: Readonly<Record<string, string>> = {
-  cjs: "javascript",
-  js: "javascript",
-  jsx: "jsx",
-  md: "markdown",
-  mjs: "javascript",
-  py: "python",
-  rb: "ruby",
-  sh: "bash",
-  shell: "bash",
-  ts: "typescript",
-  tsx: "tsx",
-  yml: "yaml",
-};
-
-let highlighterPromise: ReturnType<typeof createHighlighter> | undefined;
-
-function highlighter() {
-  highlighterPromise ??= createHighlighter({ themes: ["github-dark"], langs: [] });
-  return highlighterPromise;
-}
-
-function normalizedLanguage(language: string | undefined): BundledLanguage | null {
-  if (language === undefined || language.trim().length === 0) return null;
-  const requested = language.trim().toLowerCase();
-  const normalized = LANGUAGE_ALIASES[requested] ?? requested;
-  return normalized in bundledLanguages ? normalized as BundledLanguage : null;
-}
+type HighlightedCode = Awaited<ReturnType<typeof highlightCode>>;
 
 export function CodeBlock({ code, language }: Readonly<{ code: string; language?: string }>) {
   const [highlighted, setHighlighted] = useState<HighlightedCode | null>(null);
   const [wrap, setWrap] = useState(false);
   const [copied, setCopied] = useState(false);
-  const normalized = useMemo(() => normalizedLanguage(language), [language]);
+  const normalized = useMemo(() => normalizeLanguage(language), [language]);
 
   useEffect(() => {
     let active = true;
@@ -45,9 +16,7 @@ export function CodeBlock({ code, language }: Readonly<{ code: string; language?
     if (normalized === null) return () => { active = false; };
     void (async () => {
       try {
-        const instance = await highlighter();
-        await instance.loadLanguage(normalized);
-        const tokens = instance.codeToTokens(code, { lang: normalized, theme: "github-dark" });
+        const tokens = await highlightCode(code, normalized);
         if (active) setHighlighted(tokens);
       } catch {
         // A readable plain-text block remains visible when a grammar cannot load.
