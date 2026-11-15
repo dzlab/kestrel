@@ -20,6 +20,8 @@ import type {
 
 const DEFAULT_MAX_STEPS = 12;
 const MAX_CONVERSATION_RECORDS = 1_000;
+const RECOVERY_PAGE_SIZE = 100;
+const RECOVERY_CONCURRENCY = 4;
 
 export type ConversationServiceDependencies = {
   repository: StoreRepository;
@@ -224,12 +226,10 @@ export class ConversationService {
     return result;
   }
 
-  async recoverAll(limit = 100): Promise<(ConversationTurnResult | null)[]> {
+  async recoverAll(pageSize = RECOVERY_PAGE_SIZE): Promise<(ConversationTurnResult | null)[]> {
     this.assertAcceptingWork();
     if (this.recoveryPromise !== undefined) return this.recoveryPromise;
-    const recovery = Promise.all(
-      this.repository.listConversations(limit).map((conversation) => this.recoverConversation(conversation.id)),
-    ).finally(() => {
+    const recovery = this.recoverDurableConversations(pageSize).finally(() => {
       if (this.recoveryPromise === recovery) this.recoveryPromise = undefined;
     });
     this.recoveryPromise = recovery;
@@ -250,6 +250,42 @@ export class ConversationService {
 
   private assertAcceptingWork(): void {
     if (this.shuttingDown) throw new ValidationError("conversation service is shutting down");
+  }
+
+  private async recoverDurableConversations(pageSize: number): Promise<(ConversationTurnResult | null)[]> {
+    const conversationIds: string[] = [];
+    let cursor: string | null = null;
+    while (true) {
+      const page = this.repository.listRecoverableConversationIds(cursor, pageSize);
+      conversationIds.push(...page);
+      if (page.length < pageSize) break;
+      cursor = page[page.length - 1]!;
+    }
+
+    const results = new Array<ConversationTurnResult | null>(conversationIds.length).fill(null);
+    let nextIndex = 0;
+    let firstError: unknown;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const conversationId = conversationIds[index];
+        if (conversationId === undefined) return;
+        try {
+          results[index] = await this.recoverConversation(conversationId);
+        } catch (error) {
+          firstError ??= error;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(RECOVERY_CONCURRENCY, conversationIds.length) },
+        () => worker(),
+      ),
+    );
+    if (firstError !== undefined) throw firstError;
+    return results;
   }
 
   private assertConversationAvailable(conversationId: string): void {

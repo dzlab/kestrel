@@ -474,6 +474,28 @@ export class StoreRepository {
     return rows.map(conversationFromRow);
   }
 
+  listRecoverableConversationIds(
+    afterConversationId: string | null = null,
+    limit = MAX_CONVERSATION_LIST_LIMIT,
+  ): string[] {
+    requireLimit(limit, "recoverable conversation limit", MAX_CONVERSATION_LIST_LIMIT);
+    if (afterConversationId !== null && afterConversationId.length === 0) {
+      throw new ValidationError("recoverable conversation cursor must be non-empty");
+    }
+    const rows = this.database
+      .query(
+        `SELECT DISTINCT conversation_tasks.conversation_id
+         FROM conversation_tasks
+         INNER JOIN tasks ON tasks.id = conversation_tasks.task_id
+         WHERE (? IS NULL OR conversation_tasks.conversation_id > ?)
+           AND tasks.status IN ('pending', 'running', 'blocked_on_approval')
+         ORDER BY conversation_tasks.conversation_id ASC
+         LIMIT ?`,
+      )
+      .all(afterConversationId, afterConversationId, limit) as { conversation_id: string }[];
+    return rows.map((row) => String(row.conversation_id));
+  }
+
   getConversation(conversationId: string): ConversationRecord | null {
     const row = this.database.query("SELECT * FROM conversations WHERE id = ?").get(conversationId) as Row | null;
     return row === null ? null : conversationFromRow(row);
