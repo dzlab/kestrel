@@ -351,6 +351,8 @@ const versionElevenSql = `
         ON conversation_messages(conversation_id, sequence_number);
       CREATE INDEX idx_conversation_tasks_conversation
         ON conversation_tasks(conversation_id, created_at, task_id);
+      CREATE INDEX idx_events_run_id
+        ON events(run_id, id);
     `;
 
 // This is the immutable v1 SQL from 0fed501.  The 0084a0f v1 SQL is retained
@@ -711,6 +713,13 @@ const requiredIndexes = [
     unique: false,
     columns: ["conversation_id", "created_at", "task_id"],
     sql: "create index idx_conversation_tasks_conversation on conversation_tasks(conversation_id, created_at, task_id)",
+  },
+  {
+    name: "idx_events_run_id",
+    table: "events",
+    unique: false,
+    columns: ["run_id", "id"],
+    sql: "create index idx_events_run_id on events(run_id, id)",
   },
 ] as const;
 
